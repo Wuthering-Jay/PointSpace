@@ -8,6 +8,7 @@ exp
 weights
 data
 *log*
+!logger.py
 outputs/
 .vscode
 .idea

@@ -5,13 +5,13 @@ Author: Xiaoyang Wu (xiaoyang.wu.cs@gmail.com)
 Please cite our work if the code is helpful to you.
 """
 
-from pointcept.engines.defaults import (
+from pointspace.engines.defaults import (
     default_argument_parser,
     default_config_parser,
     default_setup,
 )
-from pointcept.engines.test import TESTERS
-from pointcept.engines.launch import launch
+from pointspace.engines.test import TESTERS
+from pointspace.engines.launch import launch
 
 
 def main_worker(cfg):

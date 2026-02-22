@@ -20,7 +20,7 @@ import os
 import torch
 import numpy as np
 import glob
-from pointcept.utils.logger import get_root_logger
+from pointspace.utils.logger import get_root_logger
 
 CLASS_NAMES = [
     "ceiling",
