@@ -20,6 +20,8 @@ from .defaults import create_ddp_model
 import pointspace.utils.comm as comm
 from pointspace.datasets import build_dataset, collate_fn
 from pointspace.models import build_model
+from pointspace.writers import build_writer
+from pointspace.writers.benchmark import create_benchmark_writer
 from pointspace.utils.logger import get_root_logger
 from pointspace.utils.registry import Registry
 from pointspace.utils.misc import (
@@ -123,8 +125,10 @@ class TesterBase:
 class SemSegTester(TesterBase):
     def test(self):
         assert self.test_loader.batch_size == 1
+        fragment_batch_size = getattr(self.cfg, "fragment_batch_size", 1)
         logger = get_root_logger()
         logger.info(">>>>>>>>>>>>>>>> Start Evaluation >>>>>>>>>>>>>>>>")
+        logger.info(f"Fragment batch size: {fragment_batch_size}")
 
         batch_time = AverageMeter()
         intersection_meter = AverageMeter()
@@ -134,35 +138,19 @@ class SemSegTester(TesterBase):
 
         save_path = os.path.join(self.cfg.save_path, "result")
         make_dirs(save_path)
-        # create submit folder only on main process
-        if (
-            self.cfg.data.test.type == "ScanNetDataset"
-            or self.cfg.data.test.type == "ScanNet200Dataset"
-            or self.cfg.data.test.type == "ScanNetPPDataset"
-        ) and comm.is_main_process():
-            make_dirs(os.path.join(save_path, "submit"))
-        elif (
-            self.cfg.data.test.type == "SemanticKITTIDataset" and comm.is_main_process()
-        ):
-            make_dirs(os.path.join(save_path, "submit"))
-        elif self.cfg.data.test.type == "NuScenesDataset" and comm.is_main_process():
-            import json
-
-            make_dirs(os.path.join(save_path, "submit", "lidarseg", "test"))
-            make_dirs(os.path.join(save_path, "submit", "test"))
-            submission = dict(
-                meta=dict(
-                    use_camera=False,
-                    use_lidar=True,
-                    use_radar=False,
-                    use_map=False,
-                    use_external=False,
-                )
-            )
-            with open(
-                os.path.join(save_path, "submit", "test", "submission.json"), "w"
-            ) as f:
-                json.dump(submission, f, indent=4)
+        # 创建 benchmark writer（用于竞赛提交格式，根据数据集类型自动选择）
+        benchmark_writer = create_benchmark_writer(
+            dataset_type=self.cfg.data.test.type,
+            save_dir=save_path,
+            dataset=self.test_loader.dataset,
+        )
+        if benchmark_writer is not None and comm.is_main_process():
+            benchmark_writer.setup()
+        # 创建通用 writer（用于 LAS/PLY/PCD 等实际生产输出，可选）
+        general_writer = None
+        writer_cfg = getattr(self.cfg, "writer", None)
+        if writer_cfg is not None:
+            general_writer = build_writer(writer_cfg)
         comm.synchronize()
         record = {}
         # fragment inference
@@ -184,11 +172,11 @@ class SemSegTester(TesterBase):
                     segment = data_dict["origin_segment"]
             else:
                 pred = torch.zeros((segment.size, self.cfg.data.num_classes)).cuda()
-                for i in range(len(fragment_list)):
-                    fragment_batch_size = 1
-                    s_i, e_i = i * fragment_batch_size, min(
-                        (i + 1) * fragment_batch_size, len(fragment_list)
-                    )
+                num_fragments = len(fragment_list)
+                batch_num = int(np.ceil(num_fragments / fragment_batch_size))
+                for i in range(batch_num):
+                    s_i = i * fragment_batch_size
+                    e_i = min((i + 1) * fragment_batch_size, num_fragments)
                     input_dict = collate_fn(fragment_list[s_i:e_i])
                     for key in input_dict.keys():
                         if isinstance(input_dict[key], torch.Tensor):
@@ -205,16 +193,16 @@ class SemSegTester(TesterBase):
                             bs = be
 
                     logger.info(
-                        "Test: {}/{}-{data_name}, Batch: {batch_idx}/{batch_num}".format(
+                        "Test: {}/{}-{data_name}, Fragment: {frag_end}/{frag_total}".format(
                             idx + 1,
                             len(self.test_loader),
                             data_name=data_name,
-                            batch_idx=i,
-                            batch_num=len(fragment_list),
+                            frag_end=e_i,
+                            frag_total=num_fragments,
                         )
                     )
-                if self.cfg.data.test.type == "ScanNetPPDataset":
-                    pred = pred.topk(3, dim=1)[1].data.cpu().numpy()
+                if benchmark_writer is not None and benchmark_writer.topk > 1:
+                    pred = pred.topk(benchmark_writer.topk, dim=1)[1].data.cpu().numpy()
                 else:
                     pred = pred.max(1)[1].data.cpu().numpy()
                 if "origin_segment" in data_dict.keys():
@@ -222,56 +210,13 @@ class SemSegTester(TesterBase):
                     pred = pred[data_dict["inverse"]]
                     segment = data_dict["origin_segment"]
                 np.save(pred_save_path, pred)
-            if (
-                self.cfg.data.test.type == "ScanNetDataset"
-                or self.cfg.data.test.type == "ScanNet200Dataset"
-            ):
-                np.savetxt(
-                    os.path.join(save_path, "submit", "{}.txt".format(data_name)),
-                    self.test_loader.dataset.class2id[pred].reshape([-1, 1]),
-                    fmt="%d",
-                )
-            elif self.cfg.data.test.type == "ScanNetPPDataset":
-                np.savetxt(
-                    os.path.join(save_path, "submit", "{}.txt".format(data_name)),
-                    pred.astype(np.int32),
-                    delimiter=",",
-                    fmt="%d",
-                )
-                pred = pred[:, 0]  # for mIoU, TODO: support top3 mIoU
-            elif self.cfg.data.test.type == "SemanticKITTIDataset":
-                # 00_000000 -> 00, 000000
-                sequence_name, frame_name = data_name.split("_")
-                os.makedirs(
-                    os.path.join(
-                        save_path, "submit", "sequences", sequence_name, "predictions"
-                    ),
-                    exist_ok=True,
-                )
-                submit = pred.astype(np.uint32)
-                submit = np.vectorize(
-                    self.test_loader.dataset.learning_map_inv.__getitem__
-                )(submit).astype(np.uint32)
-                submit.tofile(
-                    os.path.join(
-                        save_path,
-                        "submit",
-                        "sequences",
-                        sequence_name,
-                        "predictions",
-                        f"{frame_name}.label",
-                    )
-                )
-            elif self.cfg.data.test.type == "NuScenesDataset":
-                np.array(pred + 1).astype(np.uint8).tofile(
-                    os.path.join(
-                        save_path,
-                        "submit",
-                        "lidarseg",
-                        "test",
-                        "{}_lidarseg.bin".format(data_name),
-                    )
-                )
+            # 写入 benchmark 提交文件
+            if benchmark_writer is not None:
+                benchmark_writer.write(data_name, pred)
+                pred = benchmark_writer.pred_for_eval(pred)
+            # 写入通用格式文件（可选）
+            if general_writer is not None:
+                general_writer.write(data_name, pred_sem=pred)
 
             intersection, union, target = intersection_and_union(
                 pred, segment, self.cfg.data.num_classes, self.cfg.data.ignore_index
@@ -325,10 +270,9 @@ class SemSegTester(TesterBase):
             union = np.sum([meters["union"] for _, meters in record.items()], axis=0)
             target = np.sum([meters["target"] for _, meters in record.items()], axis=0)
 
-            if self.cfg.data.test.type == "S3DISDataset":
-                torch.save(
-                    dict(intersection=intersection, union=union, target=target),
-                    os.path.join(save_path, f"{self.test_loader.dataset.split}.pth"),
+            if benchmark_writer is not None:
+                benchmark_writer.finalize(
+                    intersection=intersection, union=union, target=target
                 )
 
             iou_class = intersection / (union + 1e-10)
@@ -362,8 +306,10 @@ class SemSegTester(TesterBase):
 class DINOSemSegTester(TesterBase):
     def test(self):
         assert self.test_loader.batch_size == 1
+        fragment_batch_size = getattr(self.cfg, "fragment_batch_size", 1)
         logger = get_root_logger()
         logger.info(">>>>>>>>>>>>>>>> Start Evaluation >>>>>>>>>>>>>>>>")
+        logger.info(f"Fragment batch size: {fragment_batch_size}")
 
         batch_time = AverageMeter()
         intersection_meter = AverageMeter()
@@ -373,35 +319,19 @@ class DINOSemSegTester(TesterBase):
 
         save_path = os.path.join(self.cfg.save_path, "result")
         make_dirs(save_path)
-        # create submit folder only on main process
-        if (
-            self.cfg.data.test.type == "ScanNetDataset"
-            or self.cfg.data.test.type == "ScanNet200Dataset"
-            or self.cfg.data.test.type == "ScanNetPPDataset"
-        ) and comm.is_main_process():
-            make_dirs(os.path.join(save_path, "submit"))
-        elif (
-            self.cfg.data.test.type == "SemanticKITTIDataset" and comm.is_main_process()
-        ):
-            make_dirs(os.path.join(save_path, "submit"))
-        elif self.cfg.data.test.type == "NuScenesDataset" and comm.is_main_process():
-            import json
-
-            make_dirs(os.path.join(save_path, "submit", "lidarseg", "test"))
-            make_dirs(os.path.join(save_path, "submit", "test"))
-            submission = dict(
-                meta=dict(
-                    use_camera=False,
-                    use_lidar=True,
-                    use_radar=False,
-                    use_map=False,
-                    use_external=False,
-                )
-            )
-            with open(
-                os.path.join(save_path, "submit", "test", "submission.json"), "w"
-            ) as f:
-                json.dump(submission, f, indent=4)
+        # 创建 benchmark writer（用于竞赛提交格式，根据数据集类型自动选择）
+        benchmark_writer = create_benchmark_writer(
+            dataset_type=self.cfg.data.test.type,
+            save_dir=save_path,
+            dataset=self.test_loader.dataset,
+        )
+        if benchmark_writer is not None and comm.is_main_process():
+            benchmark_writer.setup()
+        # 创建通用 writer（用于 LAS/PLY/PCD 等实际生产输出，可选）
+        general_writer = None
+        writer_cfg = getattr(self.cfg, "writer", None)
+        if writer_cfg is not None:
+            general_writer = build_writer(writer_cfg)
         comm.synchronize()
         record = {}
         # fragment inference
@@ -426,11 +356,11 @@ class DINOSemSegTester(TesterBase):
                     segment = data_dict["origin_segment"]
             else:
                 pred = torch.zeros((segment.size, self.cfg.data.num_classes)).cuda()
-                for i in range(len(fragment_list)):
-                    fragment_batch_size = 1
-                    s_i, e_i = i * fragment_batch_size, min(
-                        (i + 1) * fragment_batch_size, len(fragment_list)
-                    )
+                num_fragments = len(fragment_list)
+                batch_num = int(np.ceil(num_fragments / fragment_batch_size))
+                for i in range(batch_num):
+                    s_i = i * fragment_batch_size
+                    e_i = min((i + 1) * fragment_batch_size, num_fragments)
                     input_dict = collate_fn(fragment_list[s_i:e_i])
                     for key in input_dict.keys():
                         if isinstance(input_dict[key], torch.Tensor):
@@ -450,16 +380,16 @@ class DINOSemSegTester(TesterBase):
                             bs = be
 
                     logger.info(
-                        "Test: {}/{}-{data_name}, Batch: {batch_idx}/{batch_num}".format(
+                        "Test: {}/{}-{data_name}, Fragment: {frag_end}/{frag_total}".format(
                             idx + 1,
                             len(self.test_loader),
                             data_name=data_name,
-                            batch_idx=i,
-                            batch_num=len(fragment_list),
+                            frag_end=e_i,
+                            frag_total=num_fragments,
                         )
                     )
-                if self.cfg.data.test.type == "ScanNetPPDataset":
-                    pred = pred.topk(3, dim=1)[1].data.cpu().numpy()
+                if benchmark_writer is not None and benchmark_writer.topk > 1:
+                    pred = pred.topk(benchmark_writer.topk, dim=1)[1].data.cpu().numpy()
                 else:
                     pred = pred.max(1)[1].data.cpu().numpy()
                 if "origin_segment" in data_dict.keys():
@@ -467,56 +397,13 @@ class DINOSemSegTester(TesterBase):
                     pred = pred[data_dict["inverse"]]
                     segment = data_dict["origin_segment"]
                 np.save(pred_save_path, pred)
-            if (
-                self.cfg.data.test.type == "ScanNetDataset"
-                or self.cfg.data.test.type == "ScanNet200Dataset"
-            ):
-                np.savetxt(
-                    os.path.join(save_path, "submit", "{}.txt".format(data_name)),
-                    self.test_loader.dataset.class2id[pred].reshape([-1, 1]),
-                    fmt="%d",
-                )
-            elif self.cfg.data.test.type == "ScanNetPPDataset":
-                np.savetxt(
-                    os.path.join(save_path, "submit", "{}.txt".format(data_name)),
-                    pred.astype(np.int32),
-                    delimiter=",",
-                    fmt="%d",
-                )
-                pred = pred[:, 0]  # for mIoU, TODO: support top3 mIoU
-            elif self.cfg.data.test.type == "SemanticKITTIDataset":
-                # 00_000000 -> 00, 000000
-                sequence_name, frame_name = data_name.split("_")
-                os.makedirs(
-                    os.path.join(
-                        save_path, "submit", "sequences", sequence_name, "predictions"
-                    ),
-                    exist_ok=True,
-                )
-                submit = pred.astype(np.uint32)
-                submit = np.vectorize(
-                    self.test_loader.dataset.learning_map_inv.__getitem__
-                )(submit).astype(np.uint32)
-                submit.tofile(
-                    os.path.join(
-                        save_path,
-                        "submit",
-                        "sequences",
-                        sequence_name,
-                        "predictions",
-                        f"{frame_name}.label",
-                    )
-                )
-            elif self.cfg.data.test.type == "NuScenesDataset":
-                np.array(pred + 1).astype(np.uint8).tofile(
-                    os.path.join(
-                        save_path,
-                        "submit",
-                        "lidarseg",
-                        "test",
-                        "{}_lidarseg.bin".format(data_name),
-                    )
-                )
+            # 写入 benchmark 提交文件
+            if benchmark_writer is not None:
+                benchmark_writer.write(data_name, pred)
+                pred = benchmark_writer.pred_for_eval(pred)
+            # 写入通用格式文件（可选）
+            if general_writer is not None:
+                general_writer.write(data_name, pred_sem=pred)
 
             intersection, union, target = intersection_and_union(
                 pred, segment, self.cfg.data.num_classes, self.cfg.data.ignore_index
@@ -570,10 +457,9 @@ class DINOSemSegTester(TesterBase):
             union = np.sum([meters["union"] for _, meters in record.items()], axis=0)
             target = np.sum([meters["target"] for _, meters in record.items()], axis=0)
 
-            if self.cfg.data.test.type == "S3DISDataset":
-                torch.save(
-                    dict(intersection=intersection, union=union, target=target),
-                    os.path.join(save_path, f"{self.test_loader.dataset.split}.pth"),
+            if benchmark_writer is not None:
+                benchmark_writer.finalize(
+                    intersection=intersection, union=union, target=target
                 )
 
             iou_class = intersection / (union + 1e-10)

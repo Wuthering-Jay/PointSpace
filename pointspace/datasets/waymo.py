@@ -83,10 +83,10 @@ class WaymoDataset(DefaultDataset):
                 )
 
             if self.timing_embedding:
-                refer_frame["strength"] = np.hstack(
+                refer_frame["intensity"] = np.hstack(
                     (
-                        refer_frame["strength"],
-                        np.ones_like(refer_frame["strength"]) * timestamp,
+                        refer_frame["intensity"],
+                        np.ones_like(refer_frame["intensity"]) * timestamp,
                     )
                 )
 
@@ -184,10 +184,10 @@ class WaymoColorNormalDataset(WaymoDataset):
                 )
 
             if self.timing_embedding:
-                refer_frame["strength"] = np.hstack(
+                refer_frame["intensity"] = np.hstack(
                     (
-                        refer_frame["strength"],
-                        np.ones_like(refer_frame["strength"]) * timestamp,
+                        refer_frame["intensity"],
+                        np.ones_like(refer_frame["intensity"]) * timestamp,
                     )
                 )
 
@@ -295,10 +295,10 @@ class WaymoImagePointDataset(DefaultImagePointDataset):
                 )
 
             if self.timing_embedding:
-                refer_frame["strength"] = np.hstack(
+                refer_frame["intensity"] = np.hstack(
                     (
-                        refer_frame["strength"],
-                        np.ones_like(refer_frame["strength"]) * timestamp,
+                        refer_frame["intensity"],
+                        np.ones_like(refer_frame["intensity"]) * timestamp,
                     )
                 )
 

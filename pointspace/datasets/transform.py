@@ -30,7 +30,9 @@ def index_operator(data_dict, index, duplicate=False):
             "color",
             "normal",
             "superpoint",
-            "strength",
+            "intensity",
+            "hag",
+            "echo",
             "segment",
             "instance",
         ]

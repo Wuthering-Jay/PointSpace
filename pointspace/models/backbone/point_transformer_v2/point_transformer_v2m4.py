@@ -1,5 +1,9 @@
 """
 Point Transformer V2 Mode 4
+
+Backbone only (符合 DefaultSegmentorV2 规范):
+  - 输入: data_dict 或 Point 对象
+  - 输出: Point 对象 (feat 为解码器最终输出特征)
 """
 
 from copy import deepcopy
@@ -16,6 +20,8 @@ import pointops
 
 from pointspace.models.builder import MODELS
 from pointspace.models.utils import offset2batch, batch2offset
+from pointspace.models.utils.structure import Point
+from pointspace.models.modules import PointModule
 
 
 class PointBatchNorm(nn.Module):
@@ -616,16 +622,17 @@ class GVAPatchEmbed(nn.Module):
 
 
 @MODELS.register_module("PT-v2m4")
-class PointTransformerV2(nn.Module):
+class PointTransformerV2(PointModule):
     """
-    Point Transformer V2
-    
-    When num_classes > 0: outputs seg_logits (with internal head)
-    When num_classes = 0 or None: outputs features only (for external head)
-    
+    Point Transformer V2 Backbone
+
+    作为纯 backbone 使用，不包含 seg_head。
+    输入: data_dict (dict) 或 Point 对象，需包含 coord, feat, offset。
+    输出: Point 对象，feat 为解码器最终输出特征，维度 dec_channels[0]。
+    通过 DefaultSegmentorV2 + seg_head 接入分割任务。
+
     Args:
-        in_channels: 输入维度
-        num_classes: 输出维度，设为0或None时只输出特征
+        in_channels: 输入特征维度
         patch_embed_depth: Patch Embedding深度
         patch_embed_channels: Patch Embedding输出维度
         patch_embed_groups: Patch Embedding分组数量
@@ -639,10 +646,10 @@ class PointTransformerV2(nn.Module):
         dec_groups: 解码器分组数量
         dec_neighbours: 解码器邻域大小
         grid_sizes: 体素大小
-        attn_qkv_bias: 无用
+        attn_qkv_bias: QKV 偏置
         pe_multiplier: 位置编码乘性因子
         pe_bias: 位置编码偏置因子
-        attn_drop_rate: drop比例
+        attn_drop_rate: Attention drop比例
         drop_path_rate: BottleNeck的drop比例
         enable_checkpoint: checkpoint机制，以时间换空间
         unpool_backend: 上采样方式，'map' or 'interp'
@@ -650,7 +657,6 @@ class PointTransformerV2(nn.Module):
     def __init__(
         self,
         in_channels,
-        num_classes=0,
         patch_embed_depth=1,
         patch_embed_channels=48,
         patch_embed_groups=6,
@@ -674,7 +680,6 @@ class PointTransformerV2(nn.Module):
     ):
         super(PointTransformerV2, self).__init__()
         self.in_channels = in_channels
-        self.num_classes = num_classes if num_classes is not None else 0
         self.num_stages = len(enc_depths)
         assert self.num_stages == len(dec_depths)
         assert self.num_stages == len(enc_channels)
@@ -684,9 +689,6 @@ class PointTransformerV2(nn.Module):
         assert self.num_stages == len(enc_neighbours)
         assert self.num_stages == len(dec_neighbours)
         assert self.num_stages == len(grid_sizes)
-        
-        # Store output feature channels for external head
-        self._out_channels = dec_channels[0]
         # 点云嵌入层
         self.patch_embed = GVAPatchEmbed(
             in_channels=in_channels,
@@ -749,52 +751,37 @@ class PointTransformerV2(nn.Module):
             )
             self.enc_stages.append(enc)
             self.dec_stages.append(dec)
-        # 分割头 (only when num_classes > 0)
-        self.seg_head = (
-            nn.Sequential(
-                nn.Linear(dec_channels[0], dec_channels[0]),
-                PointBatchNorm(dec_channels[0]),
-                nn.ReLU(inplace=True),
-                nn.Linear(dec_channels[0], self.num_classes),
-            )
-            if self.num_classes > 0
-            else None
-        )
-    
-    @property
-    def out_channels(self):
-        """Return output feature channels (for external head)"""
-        return self._out_channels
 
     def forward(self, data_dict):
         """
-        input: data_dict: {"coord": [n, 3], "feat": [n, c], "offset": [b]}
-        output: seg_logits: [n, num_classes]
+        input: data_dict (dict 或 Point): 需包含 "coord" [n, 3], "feat" [n, c], "offset" [b]
+        output: Point 对象, feat 为解码器最终输出特征 [n, dec_channels[0]]
         """
-        coord = data_dict["coord"]
-        feat = data_dict["feat"]
-        offset = data_dict["offset"].int()
+        # 兼容 dict 和 Point 两种输入
+        if not isinstance(data_dict, Point):
+            point = Point(data_dict)
+        else:
+            point = data_dict
+
+        coord = point.coord
+        feat = point.feat
+        offset = point.offset.int()
 
         # a batch of point cloud is a list of coord, feat and offset
         points = [coord, feat, offset]
         points = self.patch_embed(points)
-        skips = [[points]] # 便于添加cluster
+        skips = [[points]]  # 便于添加cluster
         for i in range(self.num_stages):
             points, cluster = self.enc_stages[i](points)
-            skips[-1].append(cluster)  # record grid cluster of pooling, 记录池化时的格网索引
-            skips.append([points])  # record points info of current stage, 记录池化后的当前点云信息
-        # 此时skips共五层，最后一层不带有cluster信息
+            skips[-1].append(cluster)  # record grid cluster of pooling
+            skips.append([points])  # record points info of current stage
         # 取出最后一层的点云信息
         points = skips.pop(-1)[0]  # unpooling points info in the last enc stage
         for i in reversed(range(self.num_stages)):
             skip_points, cluster = skips.pop(-1)
-            points = self.dec_stages[i](points, skip_points, cluster) # 上采样
+            points = self.dec_stages[i](points, skip_points, cluster)
         coord, feat, offset = points
-        
-        # Return seg_logits if internal head exists, otherwise return features
-        if self.seg_head is not None:
-            seg_logits = self.seg_head(feat)  # [n, num_classes]
-            return seg_logits
-        else:
-            # Return features for external head
-            return feat  # [n, out_channels]
+
+        # 将输出包装为 Point 对象返回
+        point.feat = feat
+        return point
