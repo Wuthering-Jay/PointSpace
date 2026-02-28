@@ -44,7 +44,6 @@ class DefaultDataset(Dataset):
         "segment",
         "instance",
         "pose",
-        "regression_target",
     ]
 
     def __init__(
@@ -57,6 +56,7 @@ class DefaultDataset(Dataset):
         cache=False,
         ignore_index=-1,
         loop=1,
+        target_key=None,
     ):
         super(DefaultDataset, self).__init__()
         self.data_root = data_root
@@ -64,6 +64,7 @@ class DefaultDataset(Dataset):
         self.transform = Compose(transform)
         self.cache = cache
         self.ignore_index = ignore_index
+        self.target_key = target_key
         self.loop = (
             loop if not test_mode else 1
         )  # force make loop = 1 while in test mode
@@ -171,6 +172,14 @@ class DefaultDataset(Dataset):
             assert "inverse" in data_dict
             result_dict["origin_segment"] = data_dict.pop("origin_segment")
             result_dict["inverse"] = data_dict.pop("inverse")
+
+        # Pop regression target (if configured) so the tester can evaluate
+        target_key = getattr(self, "target_key", None)
+        if target_key and target_key in data_dict:
+            result_dict["regression_target"] = data_dict.pop(target_key)
+            origin_key = f"origin_{target_key}"
+            if origin_key in data_dict:
+                result_dict["origin_regression_target"] = data_dict.pop(origin_key)
 
         data_dict_list = []
         for aug in self.aug_transform:

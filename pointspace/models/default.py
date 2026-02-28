@@ -346,9 +346,13 @@ class DefaultRegressor(nn.Module):
     input point.  Uses the same backbone → Point → pooling_parent
     unwinding logic as ``DefaultSegmentorV2``.
 
+    The regression target is read from an **existing data field**
+    (e.g. ``"hag"``, ``"intensity"``) rather than a dedicated key,
+    eliminating the need for a purpose-built ``regression_target`` asset.
+
     Convention:
-        - Input target key : ``"regression_target"``  (float32, shape N or N×D)
-        - Output key        : ``"reg_pred"``           (float32, shape N or N×D)
+        - Input target key : configurable via ``target_key`` (default ``"hag"``)
+        - Output key        : ``"reg_pred"``  (float32, shape N or N×D)
 
     Args:
         num_targets (int): Number of regression targets per point.
@@ -359,6 +363,8 @@ class DefaultRegressor(nn.Module):
         criteria (list[dict] | None): Loss config(s) for
             ``build_criteria``. Typical choices: ``MSELoss``,
             ``L1Loss``, ``SmoothL1Loss``, ``HuberLoss``.
+        target_key (str): Key in ``input_dict`` used as the regression
+            ground-truth (e.g. ``"hag"``, ``"intensity"``).
         freeze_backbone (bool): Freeze backbone parameters.
     """
 
@@ -368,6 +374,7 @@ class DefaultRegressor(nn.Module):
         backbone_out_channels=64,
         backbone=None,
         criteria=None,
+        target_key="hag",
         freeze_backbone=False,
     ):
         super().__init__()
@@ -375,6 +382,7 @@ class DefaultRegressor(nn.Module):
         self.backbone = build_model(backbone)
         self.criteria = build_criteria(criteria)
         self.num_targets = num_targets
+        self.target_key = target_key
         self.freeze_backbone = freeze_backbone
         if self.freeze_backbone:
             for p in self.backbone.parameters():
@@ -404,14 +412,126 @@ class DefaultRegressor(nn.Module):
         return_dict = dict()
         # train
         if self.training:
-            loss = self.criteria(reg_pred, input_dict["regression_target"])
+            loss = self.criteria(reg_pred, input_dict[self.target_key])
             return_dict["loss"] = loss
         # eval
-        elif "regression_target" in input_dict.keys():
-            loss = self.criteria(reg_pred, input_dict["regression_target"])
+        elif self.target_key in input_dict.keys():
+            loss = self.criteria(reg_pred, input_dict[self.target_key])
             return_dict["loss"] = loss
             return_dict["reg_pred"] = reg_pred
         # test
         else:
+            return_dict["reg_pred"] = reg_pred
+        return return_dict
+
+
+@MODELS.register_module()
+class DefaultSemSegRegressor(nn.Module):
+    """Joint semantic-segmentation + per-point regression head.
+
+    Shares a single backbone and splits into two independent heads:
+
+    * ``seg_head`` – linear projection → ``(N, num_classes)`` logits
+    * ``reg_head`` – linear projection → ``(N,)`` or ``(N, num_targets)``
+
+    Each head has its own loss (``seg_criteria`` / ``reg_criteria``) and a
+    scalar weight (``seg_weight`` / ``reg_weight``).  The total training
+    loss is ``seg_weight * seg_loss + reg_weight * reg_loss``.
+
+    Convention (output keys):
+        - ``"seg_logits"`` : semantic segmentation logits
+        - ``"reg_pred"``   : regression prediction
+        - ``"loss"``       : weighted sum of seg and reg losses
+        - ``"seg_loss"``   : individual seg loss (eval only)
+        - ``"reg_loss"``   : individual reg loss (eval only)
+
+    Args:
+        num_classes (int): Number of semantic classes.
+        num_targets (int): Number of regression targets per point (default 1).
+        backbone_out_channels (int): Feature dim from backbone.
+        backbone (dict | None): Backbone config.
+        seg_criteria (list[dict] | None): Loss configs for segmentation.
+        reg_criteria (list[dict] | None): Loss configs for regression.
+        seg_weight (float): Weight applied to seg loss.
+        reg_weight (float): Weight applied to reg loss.
+        target_key (str): Key in ``input_dict`` for regression ground-truth.
+        freeze_backbone (bool): Freeze backbone parameters.
+    """
+
+    def __init__(
+        self,
+        num_classes,
+        num_targets=1,
+        backbone_out_channels=64,
+        backbone=None,
+        seg_criteria=None,
+        reg_criteria=None,
+        seg_weight=1.0,
+        reg_weight=1.0,
+        target_key="hag",
+        freeze_backbone=False,
+    ):
+        super().__init__()
+        self.seg_head = (
+            nn.Linear(backbone_out_channels, num_classes)
+            if num_classes > 0
+            else nn.Identity()
+        )
+        self.reg_head = nn.Linear(backbone_out_channels, num_targets)
+        self.backbone = build_model(backbone)
+        self.seg_criteria = build_criteria(seg_criteria)
+        self.reg_criteria = build_criteria(reg_criteria)
+        self.num_classes = num_classes
+        self.num_targets = num_targets
+        self.seg_weight = seg_weight
+        self.reg_weight = reg_weight
+        self.target_key = target_key
+        self.freeze_backbone = freeze_backbone
+        if self.freeze_backbone:
+            for p in self.backbone.parameters():
+                p.requires_grad = False
+
+    def forward(self, input_dict):
+        point = Point(input_dict)
+        point = self.backbone(point)
+
+        # Unwind pooling_parent hierarchy (same as DefaultSegmentorV2)
+        if isinstance(point, Point):
+            while "pooling_parent" in point.keys():
+                assert "pooling_inverse" in point.keys()
+                parent = point.pop("pooling_parent")
+                inverse = point.pop("pooling_inverse")
+                parent.feat = torch.cat([parent.feat, point.feat[inverse]], dim=-1)
+                point = parent
+            feat = point.feat
+        else:
+            feat = point
+
+        seg_logits = self.seg_head(feat)
+        reg_pred = self.reg_head(feat)
+        if self.num_targets == 1:
+            reg_pred = reg_pred.squeeze(-1)
+
+        return_dict = dict()
+        has_seg_target = "segment" in input_dict.keys()
+        has_reg_target = self.target_key in input_dict.keys()
+
+        # train: only return combined loss
+        if self.training:
+            seg_loss = self.seg_criteria(seg_logits, input_dict["segment"])
+            reg_loss = self.reg_criteria(reg_pred, input_dict[self.target_key])
+            return_dict["loss"] = self.seg_weight * seg_loss + self.reg_weight * reg_loss
+        # eval: return combined loss + individual losses + predictions
+        elif has_seg_target and has_reg_target:
+            seg_loss = self.seg_criteria(seg_logits, input_dict["segment"])
+            reg_loss = self.reg_criteria(reg_pred, input_dict[self.target_key])
+            return_dict["loss"] = self.seg_weight * seg_loss + self.reg_weight * reg_loss
+            return_dict["seg_loss"] = seg_loss
+            return_dict["reg_loss"] = reg_loss
+            return_dict["seg_logits"] = seg_logits
+            return_dict["reg_pred"] = reg_pred
+        # test: predictions only
+        else:
+            return_dict["seg_logits"] = seg_logits
             return_dict["reg_pred"] = reg_pred
         return return_dict

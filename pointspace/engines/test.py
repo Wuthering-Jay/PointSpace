@@ -1216,8 +1216,9 @@ class RegressionTester(TesterBase):
     values are divided by a per-point count to obtain the final
     averaged prediction.
 
-    If the dataset supplies ``regression_target``, MAE / RMSE / R² are
-    computed and logged.
+    If the dataset supplies the regression target (popped into
+    ``"regression_target"`` by ``prepare_test_data``), MAE / RMSE / R²
+    are computed and logged.
 
     Results are saved as ``<data_name>_pred_reg.npy`` and optionally
     written via a general writer (``pred_reg`` kwarg).
@@ -1252,6 +1253,7 @@ class RegressionTester(TesterBase):
             start = time.time()
             data_dict = data_dict[0]  # bs == 1
             fragment_list = data_dict.pop("fragment_list")
+            # The target is popped by prepare_test_data into "regression_target"
             regression_target = data_dict.pop("regression_target", None)
             data_name = data_dict.pop("name")
 
@@ -1319,7 +1321,7 @@ class RegressionTester(TesterBase):
                     assert "inverse" in data_dict.keys()
                     pred = pred[data_dict["inverse"]]
                     if regression_target is not None and "origin_regression_target" in data_dict:
-                        regression_target = data_dict["origin_regression_target"]
+                        regression_target = data_dict.pop("origin_regression_target")
 
                 np.save(pred_save_path, pred)
 
@@ -1391,6 +1393,323 @@ class RegressionTester(TesterBase):
                     )
                 )
             logger.info("<<<<<<<<<<<<<<<<< End Regression Evaluation <<<<<<<<<<<<<<<<<")
+
+    @staticmethod
+    def collate_fn(batch):
+        return batch
+
+
+@TESTERS.register_module()
+class SemSegRegressionTester(TesterBase):
+    """Test-time evaluator for joint semantic-segmentation + regression.
+
+    Combines the fragment-based inference of ``SemSegTester`` and
+    ``RegressionTester`` in a single pass: each fragment is forwarded
+    through the model once, and both ``seg_logits`` and ``reg_pred``
+    are accumulated.
+
+    Outputs per scene:
+        * ``<name>_pred.npy``     – semantic prediction (int)
+        * ``<name>_pred_reg.npy`` – regression prediction (float)
+
+    If ground-truth is available (``segment`` / ``regression_target``),
+    mIoU and MAE / RMSE / R² are computed and logged.
+    """
+
+    def test(self):
+        assert self.test_loader.batch_size == 1
+        batch_size_test = self.cfg.batch_size_test_per_gpu
+        logger = get_root_logger()
+        logger.info(
+            ">>>>>>>>>>>>>>>> Start SemSeg-Regression Evaluation >>>>>>>>>>>>>>>>"
+        )
+        logger.info(f"Fragment batch size: {batch_size_test}")
+
+        batch_time = AverageMeter()
+        intersection_meter = AverageMeter()
+        union_meter = AverageMeter()
+        target_meter = AverageMeter()
+        self.model.eval()
+
+        save_path = os.path.join(self.cfg.save_path, "result")
+        make_dirs(save_path)
+
+        # Benchmark writer (seg only)
+        benchmark_writer = create_benchmark_writer(
+            dataset_type=self.cfg.data.test.type,
+            save_dir=save_path,
+            dataset=self.test_loader.dataset,
+        )
+        if benchmark_writer is not None and comm.is_main_process():
+            benchmark_writer.setup()
+
+        # General writer (LAS / PLY / …)
+        general_writer = None
+        writer_cfg = getattr(self.cfg, "writer", None)
+        if writer_cfg is not None:
+            general_writer = build_writer(writer_cfg)
+
+        comm.synchronize()
+        record = {}
+        num_targets = getattr(self.cfg.data, "num_targets", 1)
+
+        for idx, data_dict in enumerate(self.test_loader):
+            start = time.time()
+            data_dict = data_dict[0]  # bs == 1
+            fragment_list = data_dict.pop("fragment_list")
+            segment = data_dict.pop("segment")
+            regression_target = data_dict.pop("regression_target", None)
+            data_name = data_dict.pop("name")
+
+            seg_save_path = os.path.join(save_path, "{}_pred.npy".format(data_name))
+            reg_save_path = os.path.join(
+                save_path, "{}_pred_reg.npy".format(data_name)
+            )
+
+            if os.path.isfile(seg_save_path) and os.path.isfile(reg_save_path):
+                logger.info(
+                    "{}/{}: {}, loaded pred and reg.".format(
+                        idx + 1, len(self.test_loader), data_name
+                    )
+                )
+                seg_pred = np.load(seg_save_path)
+                reg_pred = np.load(reg_save_path)
+                if "origin_segment" in data_dict.keys():
+                    segment = data_dict["origin_segment"]
+            else:
+                # --- seg accumulator ---
+                seg_collect = torch.zeros(
+                    (segment.size, self.cfg.data.num_classes)
+                ).cuda()
+                # --- reg accumulator ---
+                n_points = (
+                    regression_target.shape[0]
+                    if regression_target is not None
+                    else segment.size
+                )
+                if num_targets > 1:
+                    reg_sum = torch.zeros((n_points, num_targets)).cuda()
+                else:
+                    reg_sum = torch.zeros(n_points).cuda()
+                reg_count = torch.zeros(n_points, dtype=torch.long).cuda()
+
+                num_fragments = len(fragment_list)
+                batch_num = int(np.ceil(num_fragments / batch_size_test))
+                for i in range(batch_num):
+                    s_i = i * batch_size_test
+                    e_i = min((i + 1) * batch_size_test, num_fragments)
+                    input_dict = collate_fn(fragment_list[s_i:e_i])
+                    for key in input_dict.keys():
+                        if isinstance(input_dict[key], torch.Tensor):
+                            input_dict[key] = input_dict[key].cuda(non_blocking=True)
+                    idx_part = input_dict["index"]
+                    with torch.no_grad():
+                        output = self.model(input_dict)
+                        seg_part = output["seg_logits"]   # (n, k)
+                        seg_part = F.softmax(seg_part, -1)
+                        reg_part = output["reg_pred"]      # (n,) or (n, D)
+
+                    bs = 0
+                    for be in input_dict["offset"]:
+                        seg_collect[idx_part[bs:be], :] += seg_part[bs:be]
+                        reg_sum[idx_part[bs:be]] += reg_part[bs:be]
+                        reg_count[idx_part[bs:be]] += 1
+                        bs = be
+
+                    logger.info(
+                        "Test: {}/{}-{data_name}, Fragment: {frag_end}/{frag_total}".format(
+                            idx + 1,
+                            len(self.test_loader),
+                            data_name=data_name,
+                            frag_end=e_i,
+                            frag_total=num_fragments,
+                        )
+                    )
+
+                # --- seg finalize ---
+                if benchmark_writer is not None and benchmark_writer.topk > 1:
+                    seg_pred = (
+                        seg_collect.topk(benchmark_writer.topk, dim=1)[1]
+                        .data.cpu()
+                        .numpy()
+                    )
+                else:
+                    seg_pred = seg_collect.max(1)[1].data.cpu().numpy()
+
+                # --- reg finalize ---
+                reg_count = reg_count.clamp(min=1)
+                if num_targets > 1:
+                    reg_pred = (reg_sum / reg_count.unsqueeze(-1)).cpu().numpy()
+                else:
+                    reg_pred = (reg_sum / reg_count.float()).cpu().numpy()
+
+                # Handle origin mapping
+                if "origin_segment" in data_dict.keys():
+                    assert "inverse" in data_dict.keys()
+                    seg_pred = seg_pred[data_dict["inverse"]]
+                    reg_pred = reg_pred[data_dict["inverse"]]
+                    segment = data_dict["origin_segment"]
+                    if (
+                        regression_target is not None
+                        and "origin_regression_target" in data_dict
+                    ):
+                        regression_target = data_dict.pop("origin_regression_target")
+
+                np.save(seg_save_path, seg_pred)
+                np.save(reg_save_path, reg_pred)
+
+            # Benchmark writer (seg)
+            if benchmark_writer is not None:
+                benchmark_writer.write(data_name, seg_pred)
+                seg_pred = benchmark_writer.pred_for_eval(seg_pred)
+            # General writer (seg + reg)
+            if general_writer is not None:
+                general_writer.write(data_name, pred_sem=seg_pred, pred_reg=reg_pred)
+
+            # --- seg metrics ---
+            intersection, union, target_seg = intersection_and_union(
+                seg_pred,
+                segment,
+                self.cfg.data.num_classes,
+                self.cfg.data.ignore_index,
+            )
+            intersection_meter.update(intersection)
+            union_meter.update(union)
+            target_meter.update(target_seg)
+
+            # --- reg metrics ---
+            reg_info = dict(mae=None, rmse=None, r2=None, n=reg_pred.shape[0])
+            if regression_target is not None:
+                if isinstance(regression_target, torch.Tensor):
+                    regression_target = regression_target.numpy()
+                rt = regression_target.astype(np.float64).reshape(-1)
+                rp = reg_pred.astype(np.float64).reshape(-1)
+                diff = rp - rt
+                reg_info["mae"] = np.mean(np.abs(diff))
+                reg_info["rmse"] = np.sqrt(np.mean(diff ** 2))
+                ss_res = np.sum(diff ** 2)
+                ss_tot = np.sum((rt - rt.mean()) ** 2)
+                reg_info["r2"] = 1.0 - ss_res / max(ss_tot, 1e-10)
+            record[data_name] = dict(
+                intersection=intersection,
+                union=union,
+                target=target_seg,
+                **reg_info,
+            )
+
+            mask = union != 0
+            iou_class = intersection / (union + 1e-10)
+            iou = np.mean(iou_class[mask])
+            acc = sum(intersection) / (sum(target_seg) + 1e-10)
+            m_iou = np.mean(intersection_meter.sum / (union_meter.sum + 1e-10))
+            m_acc = np.mean(intersection_meter.sum / (target_meter.sum + 1e-10))
+
+            batch_time.update(time.time() - start)
+            info = (
+                "Test: {} [{}/{}]-{} "
+                "Batch {batch_time.val:.3f} ({batch_time.avg:.3f}) "
+                "Acc {acc:.4f} ({m_acc:.4f}) "
+                "mIoU {iou:.4f} ({m_iou:.4f})".format(
+                    data_name,
+                    idx + 1,
+                    len(self.test_loader),
+                    segment.size,
+                    batch_time=batch_time,
+                    acc=acc,
+                    m_acc=m_acc,
+                    iou=iou,
+                    m_iou=m_iou,
+                )
+            )
+            if reg_info["mae"] is not None:
+                info += " MAE {:.6f} R² {:.6f}".format(
+                    reg_info["mae"], reg_info["r2"]
+                )
+            logger.info(info)
+
+        logger.info("Syncing ...")
+        comm.synchronize()
+        record_sync = comm.gather(record, dst=0)
+
+        if comm.is_main_process():
+            record = {}
+            for _ in range(len(record_sync)):
+                r = record_sync.pop()
+                record.update(r)
+                del r
+
+            # --- seg summary ---
+            intersection = np.sum(
+                [m["intersection"] for m in record.values()], axis=0
+            )
+            union = np.sum([m["union"] for m in record.values()], axis=0)
+            target_seg = np.sum([m["target"] for m in record.values()], axis=0)
+
+            if benchmark_writer is not None:
+                benchmark_writer.finalize(
+                    intersection=intersection, union=union, target=target_seg
+                )
+
+            iou_class = intersection / (union + 1e-10)
+            accuracy_class = intersection / (target_seg + 1e-10)
+            mIoU = np.mean(iou_class)
+            mAcc = np.mean(accuracy_class)
+            allAcc = sum(intersection) / (sum(target_seg) + 1e-10)
+
+            logger.info(
+                "Val result: mIoU/mAcc/allAcc {:.4f}/{:.4f}/{:.4f}".format(
+                    mIoU, mAcc, allAcc
+                )
+            )
+            for i in range(self.cfg.data.num_classes):
+                logger.info(
+                    "Class_{idx} - {name} Result: iou/accuracy {iou:.4f}/{accuracy:.4f}".format(
+                        idx=i,
+                        name=self.cfg.data.names[i],
+                        iou=iou_class[i],
+                        accuracy=accuracy_class[i],
+                    )
+                )
+
+            # --- reg summary ---
+            has_reg = any(v["mae"] is not None for v in record.values())
+            if has_reg:
+                total_n = sum(
+                    v["n"] for v in record.values() if v["mae"] is not None
+                )
+                w_mae = (
+                    sum(
+                        v["mae"] * v["n"]
+                        for v in record.values()
+                        if v["mae"] is not None
+                    )
+                    / max(total_n, 1)
+                )
+                w_rmse = (
+                    sum(
+                        v["rmse"] * v["n"]
+                        for v in record.values()
+                        if v["rmse"] is not None
+                    )
+                    / max(total_n, 1)
+                )
+                w_r2 = (
+                    sum(
+                        v["r2"] * v["n"]
+                        for v in record.values()
+                        if v["r2"] is not None
+                    )
+                    / max(total_n, 1)
+                )
+                logger.info(
+                    "Regression result: MAE {:.6f} | RMSE {:.6f} | R² {:.6f}".format(
+                        w_mae, w_rmse, w_r2
+                    )
+                )
+
+            logger.info(
+                "<<<<<<<<<<<<<<<<< End SemSeg-Regression Evaluation <<<<<<<<<<<<<<<<<"
+            )
 
     @staticmethod
     def collate_fn(batch):

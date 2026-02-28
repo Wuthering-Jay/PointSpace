@@ -301,7 +301,7 @@ class TestDefaultRegressor(unittest.TestCase):
             "offset": torch.tensor([n], dtype=torch.long),
         }
         if with_target:
-            input_dict["regression_target"] = torch.randn(n)
+            input_dict["hag"] = torch.randn(n)
         return input_dict
 
     def _build_model(self, num_targets=1, freeze_backbone=False):
@@ -361,7 +361,7 @@ class TestDefaultRegressor(unittest.TestCase):
         model.train()
         input_dict = self._make_input(with_target=True)
         # For multi-target training, target shape must match pred
-        input_dict["regression_target"] = torch.randn(64, 3)
+        input_dict["hag"] = torch.randn(64, 3)
         out = model(input_dict)
         self.assertIn("loss", out)
 
@@ -455,12 +455,12 @@ class TestRegressionEvaluator(unittest.TestCase):
         from pointspace.engines.hooks.evaluator import RegressionEvaluator
 
         target = torch.tensor([1.0, 2.0, 3.0, 4.0])
-        val_data = [{"regression_target": target}]
+        val_data = [{"hag": target}]
         model_outputs = [
             {"reg_pred": target.clone().cuda(), "loss": torch.tensor(0.0)}
         ]
 
-        evaluator = RegressionEvaluator(log_interval=1)
+        evaluator = RegressionEvaluator(target_key="hag", log_interval=1)
         trainer = self._make_trainer(val_data, model_outputs)
         evaluator.trainer = trainer
         evaluator.eval()
@@ -474,10 +474,10 @@ class TestRegressionEvaluator(unittest.TestCase):
 
         target = torch.tensor([0.0, 0.0, 0.0, 0.0])
         pred = torch.tensor([1.0, 1.0, 1.0, 1.0]).cuda()
-        val_data = [{"regression_target": target}]
+        val_data = [{"hag": target}]
         model_outputs = [{"reg_pred": pred, "loss": torch.tensor(1.0)}]
 
-        evaluator = RegressionEvaluator()
+        evaluator = RegressionEvaluator(target_key="hag")
         trainer = self._make_trainer(val_data, model_outputs)
         evaluator.trainer = trainer
         evaluator.eval()
@@ -491,10 +491,10 @@ class TestRegressionEvaluator(unittest.TestCase):
         from pointspace.engines.hooks.evaluator import RegressionEvaluator
 
         target = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0])
-        val_data = [{"regression_target": target}]
+        val_data = [{"hag": target}]
         model_outputs = [{"reg_pred": target.clone().cuda(), "loss": torch.tensor(0.0)}]
 
-        evaluator = RegressionEvaluator()
+        evaluator = RegressionEvaluator(target_key="hag")
         trainer = self._make_trainer(val_data, model_outputs)
         evaluator.trainer = trainer
 
@@ -662,9 +662,11 @@ class TestLASWriterRegression(unittest.TestCase):
 
 
 class TestDatasetValidAssets(unittest.TestCase):
-    def test_regression_target_in_valid_assets(self):
+    def test_regression_target_not_in_valid_assets(self):
+        """regression_target is no longer a dedicated asset; target comes from
+        an existing field (e.g. 'hag') configured via target_key."""
         from pointspace.datasets.defaults import DefaultDataset
-        self.assertIn("regression_target", DefaultDataset.VALID_ASSETS)
+        self.assertNotIn("regression_target", DefaultDataset.VALID_ASSETS)
 
 
 # ===========================================================================

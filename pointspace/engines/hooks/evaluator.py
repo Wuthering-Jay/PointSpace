@@ -274,18 +274,21 @@ class RegressionEvaluator(HookBase):
     """Validation evaluator for per-point regression tasks.
 
     Computes MAE, RMSE and R² over the entire validation set each epoch.
-    Uses ``"reg_pred"`` from model output and ``"regression_target"`` from
-    the input dict.
+    Uses ``"reg_pred"`` from model output and reads the ground-truth from
+    a configurable ``target_key`` field in the input dict (e.g. ``"hag"``).
 
     The *best-model* metric tracked is **negative MAE** (higher is better)
     so that the existing ``CheckpointSaver`` logic (which keeps the model
     with the highest ``current_metric_value``) works correctly.
 
     Args:
+        target_key (str): Key in ``input_dict`` that holds the regression
+            ground-truth (e.g. ``"hag"``, ``"intensity"``).
         log_interval (int): Log progress every *log_interval* batches.
     """
 
-    def __init__(self, log_interval=1):
+    def __init__(self, target_key="hag", log_interval=1):
+        self.target_key = target_key
         self.log_interval = max(1, log_interval)
 
     def before_train(self):
@@ -319,7 +322,7 @@ class RegressionEvaluator(HookBase):
             with torch.no_grad():
                 output_dict = self.trainer.model(input_dict)
             pred = output_dict["reg_pred"].detach().float().reshape(-1)
-            target = input_dict["regression_target"].float().reshape(-1)
+            target = input_dict[self.target_key].float().reshape(-1)
             loss = output_dict["loss"]
 
             diff = pred - target
@@ -401,6 +404,206 @@ class RegressionEvaluator(HookBase):
     def after_train(self):
         self.trainer.logger.info(
             "Best {}: {:.6f}".format("neg_MAE", self.trainer.best_metric_value)
+        )
+
+
+@HOOKS.register_module()
+class SemSegRegressionEvaluator(HookBase):
+    """Validation evaluator for joint semantic-segmentation + regression.
+
+    Computes **both** sets of metrics in one pass:
+
+    * Segmentation: mIoU / mAcc / allAcc (same as ``SemSegEvaluator``)
+    * Regression  : MAE / RMSE / R²      (same as ``RegressionEvaluator``)
+
+    ``primary_metric`` controls which metric is used for best-model
+    selection via ``current_metric_value`` (default ``"mIoU"``).
+
+    Args:
+        target_key (str): Key in ``input_dict`` for regression ground-truth.
+        primary_metric (str): ``"mIoU"`` or ``"neg_MAE"``.
+        log_interval (int): Log every *n* batches.
+    """
+
+    def __init__(self, target_key="hag", primary_metric="mIoU", log_interval=1):
+        self.target_key = target_key
+        self.primary_metric = primary_metric
+        self.log_interval = max(1, log_interval)
+
+    def before_train(self):
+        if self.trainer.writer is not None and self.trainer.cfg.enable_wandb:
+            wandb.define_metric("val/*", step_metric="Epoch")
+
+    def after_epoch(self):
+        if self.trainer.cfg.evaluate:
+            self.eval()
+
+    def eval(self):
+        self.trainer.logger.info(">>>>>>>>>>>>>>>> Start Evaluation >>>>>>>>>>>>>>>>")
+        self.trainer.model.eval()
+        from pointspace.engines.hooks.misc import CacheCleaner
+
+        _cache_cleaner = next(
+            (h for h in self.trainer.hooks if isinstance(h, CacheCleaner)), None
+        )
+
+        # --- regression accumulators ---
+        sum_abs_err = 0.0
+        sum_sq_err = 0.0
+        sum_target = 0.0
+        sum_target_sq = 0.0
+        total_reg_count = 0
+
+        for i, input_dict in enumerate(self.trainer.val_loader):
+            _iter_start = time.perf_counter()
+            for key in input_dict.keys():
+                if isinstance(input_dict[key], torch.Tensor):
+                    input_dict[key] = input_dict[key].cuda(non_blocking=True)
+            with torch.no_grad():
+                output_dict = self.trainer.model(input_dict)
+
+            loss = output_dict["loss"]
+
+            # --- segmentation ---
+            seg_output = output_dict["seg_logits"]
+            seg_pred = seg_output.max(1)[1]
+            segment = input_dict["segment"]
+            if "inverse" in input_dict.keys():
+                assert "origin_segment" in input_dict.keys()
+                seg_pred = seg_pred[input_dict["inverse"]]
+                segment = input_dict["origin_segment"]
+            intersection, union, target_seg = intersection_and_union_gpu(
+                seg_pred,
+                segment,
+                self.trainer.cfg.data.num_classes,
+                self.trainer.cfg.data.ignore_index,
+            )
+            if comm.get_world_size() > 1:
+                dist.all_reduce(intersection)
+                dist.all_reduce(union)
+                dist.all_reduce(target_seg)
+            intersection, union, target_seg = (
+                intersection.cpu().numpy(),
+                union.cpu().numpy(),
+                target_seg.cpu().numpy(),
+            )
+            self.trainer.storage.put_scalar("val_intersection", intersection)
+            self.trainer.storage.put_scalar("val_union", union)
+            self.trainer.storage.put_scalar("val_target", target_seg)
+
+            # --- regression ---
+            reg_pred = output_dict["reg_pred"].detach().float().reshape(-1)
+            reg_target = input_dict[self.target_key].float().reshape(-1)
+            diff = reg_pred - reg_target
+            n = reg_pred.numel()
+            sum_abs_err += diff.abs().sum().item()
+            sum_sq_err += (diff ** 2).sum().item()
+            sum_target += reg_target.sum().item()
+            sum_target_sq += (reg_target ** 2).sum().item()
+            total_reg_count += n
+
+            self.trainer.storage.put_scalar("val_loss", loss.item())
+
+            if (i + 1) % self.log_interval == 0 or (i + 1) == len(
+                self.trainer.val_loader
+            ):
+                self.trainer.logger.info(
+                    "Test: [{iter}/{max_iter}] Loss {loss:.4f}".format(
+                        iter=i + 1,
+                        max_iter=len(self.trainer.val_loader),
+                        loss=loss.item(),
+                    )
+                )
+            if _cache_cleaner is not None:
+                _cache_cleaner.check_and_clean(
+                    time.perf_counter() - _iter_start,
+                    f"val iter {i + 1}/{len(self.trainer.val_loader)}",
+                )
+
+        # ---- aggregate segmentation ----
+        loss_avg = self.trainer.storage.history("val_loss").avg
+        intersection = self.trainer.storage.history("val_intersection").total
+        union = self.trainer.storage.history("val_union").total
+        target_seg = self.trainer.storage.history("val_target").total
+        iou_class = intersection / (union + 1e-10)
+        acc_class = intersection / (target_seg + 1e-10)
+        m_iou = np.mean(iou_class)
+        m_acc = np.mean(acc_class)
+        all_acc = sum(intersection) / (sum(target_seg) + 1e-10)
+
+        # ---- aggregate regression (DDP) ----
+        if comm.get_world_size() > 1:
+            stats = torch.tensor(
+                [sum_abs_err, sum_sq_err, sum_target, sum_target_sq, total_reg_count],
+                dtype=torch.float64,
+                device="cuda",
+            )
+            dist.all_reduce(stats)
+            sum_abs_err, sum_sq_err, sum_target, sum_target_sq, total_reg_count = (
+                stats.tolist()
+            )
+        total_reg_count = max(total_reg_count, 1)
+        mae = sum_abs_err / total_reg_count
+        rmse = (sum_sq_err / total_reg_count) ** 0.5
+        mean_t = sum_target / total_reg_count
+        ss_tot = sum_target_sq - total_reg_count * mean_t ** 2
+        r2 = 1.0 - sum_sq_err / max(ss_tot, 1e-10)
+
+        # ---- logging ----
+        self.trainer.logger.info(
+            "Val result: mIoU/mAcc/allAcc {:.4f}/{:.4f}/{:.4f} "
+            "| MAE {:.6f} | RMSE {:.6f} | R² {:.6f}".format(
+                m_iou, m_acc, all_acc, mae, rmse, r2
+            )
+        )
+        for i in range(self.trainer.cfg.data.num_classes):
+            self.trainer.logger.info(
+                "Class_{idx}-{name} Result: iou/accuracy {iou:.4f}/{accuracy:.4f}".format(
+                    idx=i,
+                    name=self.trainer.cfg.data.names[i],
+                    iou=iou_class[i],
+                    accuracy=acc_class[i],
+                )
+            )
+
+        current_epoch = self.trainer.epoch + 1
+        if self.trainer.writer is not None:
+            self.trainer.writer.add_scalar("val/loss", loss_avg, current_epoch)
+            self.trainer.writer.add_scalar("val/mIoU", m_iou, current_epoch)
+            self.trainer.writer.add_scalar("val/mAcc", m_acc, current_epoch)
+            self.trainer.writer.add_scalar("val/allAcc", all_acc, current_epoch)
+            self.trainer.writer.add_scalar("val/MAE", mae, current_epoch)
+            self.trainer.writer.add_scalar("val/RMSE", rmse, current_epoch)
+            self.trainer.writer.add_scalar("val/R2", r2, current_epoch)
+            if self.trainer.cfg.enable_wandb:
+                wandb.log(
+                    {
+                        "Epoch": current_epoch,
+                        "val/loss": loss_avg,
+                        "val/mIoU": m_iou,
+                        "val/mAcc": m_acc,
+                        "val/allAcc": all_acc,
+                        "val/MAE": mae,
+                        "val/RMSE": rmse,
+                        "val/R2": r2,
+                    },
+                    step=wandb.run.step,
+                )
+
+        self.trainer.logger.info("<<<<<<<<<<<<<<<<< End Evaluation <<<<<<<<<<<<<<<<<")
+
+        # ---- best-model metric ----
+        if self.primary_metric == "mIoU":
+            self.trainer.comm_info["current_metric_value"] = m_iou
+            self.trainer.comm_info["current_metric_name"] = "mIoU"
+        else:
+            self.trainer.comm_info["current_metric_value"] = -mae
+            self.trainer.comm_info["current_metric_name"] = "neg_MAE"
+
+    def after_train(self):
+        name = "mIoU" if self.primary_metric == "mIoU" else "neg_MAE"
+        self.trainer.logger.info(
+            "Best {}: {:.4f}".format(name, self.trainer.best_metric_value)
         )
 
 

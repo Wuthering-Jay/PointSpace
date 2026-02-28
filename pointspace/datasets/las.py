@@ -75,6 +75,7 @@ class LasDataset(DefaultDataset):
         class_weight=None,
         weight_sample=0.2,
         weighted_sampler=False,
+        target_key=None,
     ):
         self.required_class = required_class
         self.remap_class = remap_class
@@ -105,6 +106,7 @@ class LasDataset(DefaultDataset):
             cache=False,
             ignore_index=ignore_index,
             loop=loop,
+            target_key=target_key,
         )
 
         # Restore real test_mode and enforce loop=1 in test mode
@@ -601,16 +603,6 @@ class LasDataset(DefaultDataset):
                     except (AttributeError, KeyError):
                         pass  # HAG not available
 
-            # Extract regression target if available as an extra dimension
-            if "regression_target" in las.point_format.dimension_names:
-                try:
-                    reg_target = np.array(
-                        las["regression_target"], dtype=np.float32
-                    )
-                    data_dict["regression_target"] = reg_target
-                except (AttributeError, KeyError):
-                    pass  # regression_target not available
-
         except Exception as e:
             logger = get_root_logger()
             logger.error(f"Error reading {data_path}: {e}")
@@ -650,6 +642,11 @@ class LasDataset(DefaultDataset):
         # Save original segment BEFORE transform (GridSample will modify it)
         original_segment = data_dict.get("segment").copy() if "segment" in data_dict else None
         original_name = data_dict.get("name", self.get_data_name(idx))
+        # Save original regression target BEFORE transform
+        target_key = getattr(self, "target_key", None)
+        original_regression_target = (
+            data_dict[target_key].copy() if target_key and target_key in data_dict else None
+        )
         
         transform_result = self.transform(data_dict)
         
@@ -661,6 +658,9 @@ class LasDataset(DefaultDataset):
                 segment=original_segment,  # Use original segment (size matches index range)
                 name=original_name
             )
+            # Attach regression target for the tester
+            if original_regression_target is not None:
+                result_dict["regression_target"] = original_regression_target
             
             # Pop segment from fragments (not needed in result since we use original)
             for frag in transform_result:
@@ -693,6 +693,12 @@ class LasDataset(DefaultDataset):
                 result_dict["origin_segment"] = data_dict.pop("origin_segment")
             if "inverse" in data_dict:
                 result_dict["inverse"] = data_dict.pop("inverse")
+            # Pop regression target for the tester
+            if target_key and target_key in data_dict:
+                result_dict["regression_target"] = data_dict.pop(target_key)
+                origin_key = f"origin_{target_key}"
+                if origin_key in data_dict:
+                    result_dict["origin_regression_target"] = data_dict.pop(origin_key)
             
             # Apply aug_transform and post_transform
             fragment_list = []
