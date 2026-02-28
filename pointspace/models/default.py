@@ -336,3 +336,82 @@ class DefaultClassifier(nn.Module):
             return dict(loss=loss, cls_logits=cls_logits)
         else:
             return dict(cls_logits=cls_logits)
+
+
+@MODELS.register_module()
+class DefaultRegressor(nn.Module):
+    """Per-point regression head following the DefaultSegmentorV2 pattern.
+
+    Produces a scalar (or multi-target) regression prediction for every
+    input point.  Uses the same backbone → Point → pooling_parent
+    unwinding logic as ``DefaultSegmentorV2``.
+
+    Convention:
+        - Input target key : ``"regression_target"``  (float32, shape N or N×D)
+        - Output key        : ``"reg_pred"``           (float32, shape N or N×D)
+
+    Args:
+        num_targets (int): Number of regression targets per point.
+            Default 1 (scalar regression).
+        backbone_out_channels (int): Feature dimension produced by the
+            backbone (or concatenated after pooling_parent unwinding).
+        backbone (dict | None): Backbone config to build.
+        criteria (list[dict] | None): Loss config(s) for
+            ``build_criteria``. Typical choices: ``MSELoss``,
+            ``L1Loss``, ``SmoothL1Loss``, ``HuberLoss``.
+        freeze_backbone (bool): Freeze backbone parameters.
+    """
+
+    def __init__(
+        self,
+        num_targets=1,
+        backbone_out_channels=64,
+        backbone=None,
+        criteria=None,
+        freeze_backbone=False,
+    ):
+        super().__init__()
+        self.reg_head = nn.Linear(backbone_out_channels, num_targets)
+        self.backbone = build_model(backbone)
+        self.criteria = build_criteria(criteria)
+        self.num_targets = num_targets
+        self.freeze_backbone = freeze_backbone
+        if self.freeze_backbone:
+            for p in self.backbone.parameters():
+                p.requires_grad = False
+
+    def forward(self, input_dict):
+        point = Point(input_dict)
+        point = self.backbone(point)
+
+        # Unwind pooling_parent hierarchy (same as DefaultSegmentorV2)
+        if isinstance(point, Point):
+            while "pooling_parent" in point.keys():
+                assert "pooling_inverse" in point.keys()
+                parent = point.pop("pooling_parent")
+                inverse = point.pop("pooling_inverse")
+                parent.feat = torch.cat([parent.feat, point.feat[inverse]], dim=-1)
+                point = parent
+            feat = point.feat
+        else:
+            feat = point
+
+        reg_pred = self.reg_head(feat)  # (N, num_targets)
+        # Squeeze to (N,) when single target for easier downstream use
+        if self.num_targets == 1:
+            reg_pred = reg_pred.squeeze(-1)
+
+        return_dict = dict()
+        # train
+        if self.training:
+            loss = self.criteria(reg_pred, input_dict["regression_target"])
+            return_dict["loss"] = loss
+        # eval
+        elif "regression_target" in input_dict.keys():
+            loss = self.criteria(reg_pred, input_dict["regression_target"])
+            return_dict["loss"] = loss
+            return_dict["reg_pred"] = reg_pred
+        # test
+        else:
+            return_dict["reg_pred"] = reg_pred
+        return return_dict

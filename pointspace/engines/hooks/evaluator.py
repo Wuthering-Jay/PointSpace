@@ -6,6 +6,7 @@ Please cite our work if the code is helpful to you.
 """
 
 import numpy as np
+import time
 import wandb
 import torch
 import torch.distributed as dist
@@ -21,6 +22,9 @@ from .builder import HOOKS
 
 @HOOKS.register_module()
 class ClsEvaluator(HookBase):
+    def __init__(self, log_interval=1):
+        self.log_interval = max(1, log_interval)
+
     def after_epoch(self):
         if self.trainer.cfg.evaluate:
             self.eval()
@@ -28,7 +32,12 @@ class ClsEvaluator(HookBase):
     def eval(self):
         self.trainer.logger.info(">>>>>>>>>>>>>>>> Start Evaluation >>>>>>>>>>>>>>>>")
         self.trainer.model.eval()
+        from pointspace.engines.hooks.misc import CacheCleaner
+        _cache_cleaner = next(
+            (h for h in self.trainer.hooks if isinstance(h, CacheCleaner)), None
+        )
         for i, input_dict in enumerate(self.trainer.val_loader):
+            _iter_start = time.perf_counter()
             for key in input_dict.keys():
                 if isinstance(input_dict[key], torch.Tensor):
                     input_dict[key] = input_dict[key].cuda(non_blocking=True)
@@ -58,12 +67,18 @@ class ClsEvaluator(HookBase):
             self.trainer.storage.put_scalar("val_union", union)
             self.trainer.storage.put_scalar("val_target", target)
             self.trainer.storage.put_scalar("val_loss", loss.item())
-            self.trainer.logger.info(
-                "Test: [{iter}/{max_iter}] "
-                "Loss {loss:.4f} ".format(
-                    iter=i + 1, max_iter=len(self.trainer.val_loader), loss=loss.item()
+            if (i + 1) % self.log_interval == 0 or (i + 1) == len(self.trainer.val_loader):
+                self.trainer.logger.info(
+                    "Test: [{iter}/{max_iter}] "
+                    "Loss {loss:.4f} ".format(
+                        iter=i + 1, max_iter=len(self.trainer.val_loader), loss=loss.item()
+                    )
                 )
-            )
+            if _cache_cleaner is not None:
+                _cache_cleaner.check_and_clean(
+                    time.perf_counter() - _iter_start,
+                    f"val iter {i + 1}/{len(self.trainer.val_loader)}",
+                )
         loss_avg = self.trainer.storage.history("val_loss").avg
         intersection = self.trainer.storage.history("val_intersection").total
         union = self.trainer.storage.history("val_union").total
@@ -116,8 +131,9 @@ class ClsEvaluator(HookBase):
 
 @HOOKS.register_module()
 class SemSegEvaluator(HookBase):
-    def __init__(self, write_cls_iou=False):
+    def __init__(self, write_cls_iou=False, log_interval=1):
         self.write_cls_iou = write_cls_iou
+        self.log_interval = max(1, log_interval)
 
     def before_train(self):
         if self.trainer.writer is not None and self.trainer.cfg.enable_wandb:
@@ -130,7 +146,12 @@ class SemSegEvaluator(HookBase):
     def eval(self):
         self.trainer.logger.info(">>>>>>>>>>>>>>>> Start Evaluation >>>>>>>>>>>>>>>>")
         self.trainer.model.eval()
+        from pointspace.engines.hooks.misc import CacheCleaner
+        _cache_cleaner = next(
+            (h for h in self.trainer.hooks if isinstance(h, CacheCleaner)), None
+        )
         for i, input_dict in enumerate(self.trainer.val_loader):
+            _iter_start = time.perf_counter()
             for key in input_dict.keys():
                 if isinstance(input_dict[key], torch.Tensor):
                     input_dict[key] = input_dict[key].cuda(non_blocking=True)
@@ -164,17 +185,22 @@ class SemSegEvaluator(HookBase):
             self.trainer.storage.put_scalar("val_union", union)
             self.trainer.storage.put_scalar("val_target", target)
             self.trainer.storage.put_scalar("val_loss", loss.item())
-            info = "Test: [{iter}/{max_iter}] ".format(
-                iter=i + 1, max_iter=len(self.trainer.val_loader)
-            )
-            if "origin_coord" in input_dict.keys():
-                info = "Interp. " + info
-            self.trainer.logger.info(
-                info
-                + "Loss {loss:.4f} ".format(
-                    iter=i + 1, max_iter=len(self.trainer.val_loader), loss=loss.item()
+            # Log only every log_interval iterations (always log the last one)
+            if (i + 1) % self.log_interval == 0 or (i + 1) == len(self.trainer.val_loader):
+                info = "Test: [{iter}/{max_iter}] ".format(
+                    iter=i + 1, max_iter=len(self.trainer.val_loader)
                 )
-            )
+                if "origin_coord" in input_dict.keys():
+                    info = "Interp. " + info
+                self.trainer.logger.info(
+                    info + "Loss {loss:.4f} ".format(loss=loss.item())
+                )
+            # Delegate cache cleaning to CacheCleaner hook if present
+            if _cache_cleaner is not None:
+                _cache_cleaner.check_and_clean(
+                    time.perf_counter() - _iter_start,
+                    f"val iter {i + 1}/{len(self.trainer.val_loader)}",
+                )
         loss_avg = self.trainer.storage.history("val_loss").avg
         intersection = self.trainer.storage.history("val_intersection").total
         union = self.trainer.storage.history("val_union").total
@@ -240,6 +266,141 @@ class SemSegEvaluator(HookBase):
     def after_train(self):
         self.trainer.logger.info(
             "Best {}: {:.4f}".format("mIoU", self.trainer.best_metric_value)
+        )
+
+
+@HOOKS.register_module()
+class RegressionEvaluator(HookBase):
+    """Validation evaluator for per-point regression tasks.
+
+    Computes MAE, RMSE and R² over the entire validation set each epoch.
+    Uses ``"reg_pred"`` from model output and ``"regression_target"`` from
+    the input dict.
+
+    The *best-model* metric tracked is **negative MAE** (higher is better)
+    so that the existing ``CheckpointSaver`` logic (which keeps the model
+    with the highest ``current_metric_value``) works correctly.
+
+    Args:
+        log_interval (int): Log progress every *log_interval* batches.
+    """
+
+    def __init__(self, log_interval=1):
+        self.log_interval = max(1, log_interval)
+
+    def before_train(self):
+        if self.trainer.writer is not None and self.trainer.cfg.enable_wandb:
+            wandb.define_metric("val/*", step_metric="Epoch")
+
+    def after_epoch(self):
+        if self.trainer.cfg.evaluate:
+            self.eval()
+
+    def eval(self):
+        self.trainer.logger.info(">>>>>>>>>>>>>>>> Start Evaluation >>>>>>>>>>>>>>>>")
+        self.trainer.model.eval()
+        from pointspace.engines.hooks.misc import CacheCleaner
+
+        _cache_cleaner = next(
+            (h for h in self.trainer.hooks if isinstance(h, CacheCleaner)), None
+        )
+
+        sum_abs_err = 0.0
+        sum_sq_err = 0.0
+        sum_target = 0.0
+        sum_target_sq = 0.0
+        total_count = 0
+
+        for i, input_dict in enumerate(self.trainer.val_loader):
+            _iter_start = time.perf_counter()
+            for key in input_dict.keys():
+                if isinstance(input_dict[key], torch.Tensor):
+                    input_dict[key] = input_dict[key].cuda(non_blocking=True)
+            with torch.no_grad():
+                output_dict = self.trainer.model(input_dict)
+            pred = output_dict["reg_pred"].detach().float().reshape(-1)
+            target = input_dict["regression_target"].float().reshape(-1)
+            loss = output_dict["loss"]
+
+            diff = pred - target
+            n = pred.numel()
+            sum_abs_err += diff.abs().sum().item()
+            sum_sq_err += (diff ** 2).sum().item()
+            sum_target += target.sum().item()
+            sum_target_sq += (target ** 2).sum().item()
+            total_count += n
+
+            self.trainer.storage.put_scalar("val_loss", loss.item())
+
+            if (i + 1) % self.log_interval == 0 or (i + 1) == len(
+                self.trainer.val_loader
+            ):
+                self.trainer.logger.info(
+                    "Test: [{iter}/{max_iter}] Loss {loss:.4f}".format(
+                        iter=i + 1,
+                        max_iter=len(self.trainer.val_loader),
+                        loss=loss.item(),
+                    )
+                )
+            if _cache_cleaner is not None:
+                _cache_cleaner.check_and_clean(
+                    time.perf_counter() - _iter_start,
+                    f"val iter {i + 1}/{len(self.trainer.val_loader)}",
+                )
+
+        loss_avg = self.trainer.storage.history("val_loss").avg
+
+        # Aggregate across ranks for DDP
+        if comm.get_world_size() > 1:
+            stats = torch.tensor(
+                [sum_abs_err, sum_sq_err, sum_target, sum_target_sq, total_count],
+                dtype=torch.float64,
+                device="cuda",
+            )
+            dist.all_reduce(stats)
+            sum_abs_err, sum_sq_err, sum_target, sum_target_sq, total_count = (
+                stats.tolist()
+            )
+
+        total_count = max(total_count, 1)
+        mae = sum_abs_err / total_count
+        rmse = (sum_sq_err / total_count) ** 0.5
+        # R² = 1 - SS_res / SS_tot
+        mean_target = sum_target / total_count
+        ss_tot = sum_target_sq - total_count * mean_target ** 2
+        ss_res = sum_sq_err
+        r2 = 1.0 - ss_res / max(ss_tot, 1e-10)
+
+        self.trainer.logger.info(
+            "Val result: MAE {:.6f} | RMSE {:.6f} | R² {:.6f}".format(mae, rmse, r2)
+        )
+
+        current_epoch = self.trainer.epoch + 1
+        if self.trainer.writer is not None:
+            self.trainer.writer.add_scalar("val/loss", loss_avg, current_epoch)
+            self.trainer.writer.add_scalar("val/MAE", mae, current_epoch)
+            self.trainer.writer.add_scalar("val/RMSE", rmse, current_epoch)
+            self.trainer.writer.add_scalar("val/R2", r2, current_epoch)
+            if self.trainer.cfg.enable_wandb:
+                wandb.log(
+                    {
+                        "Epoch": current_epoch,
+                        "val/loss": loss_avg,
+                        "val/MAE": mae,
+                        "val/RMSE": rmse,
+                        "val/R2": r2,
+                    },
+                    step=wandb.run.step,
+                )
+
+        self.trainer.logger.info("<<<<<<<<<<<<<<<<< End Evaluation <<<<<<<<<<<<<<<<<")
+        # Use negative MAE as metric (higher is better → compatible with Saver)
+        self.trainer.comm_info["current_metric_value"] = -mae
+        self.trainer.comm_info["current_metric_name"] = "neg_MAE"
+
+    def after_train(self):
+        self.trainer.logger.info(
+            "Best {}: {:.6f}".format("neg_MAE", self.trainer.best_metric_value)
         )
 
 

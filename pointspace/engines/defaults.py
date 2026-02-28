@@ -133,10 +133,20 @@ def default_setup(cfg):
     world_size = comm.get_world_size()
     cfg.num_worker = cfg.num_worker if cfg.num_worker is not None else mp.cpu_count()
     cfg.num_worker_per_gpu = cfg.num_worker // world_size
-    assert cfg.batch_size % world_size == 0
+
+    # ---- batch size: support both legacy `batch_size` and new `batch_size_train` ----
+    # 优先使用 batch_size_train；若未设置，则回退到 batch_size（向后兼容）
+    if getattr(cfg, "batch_size_train", None) is not None:
+        _bs_train = cfg.batch_size_train
+    else:
+        _bs_train = cfg.batch_size  # legacy name
+    assert _bs_train % world_size == 0
+    cfg.batch_size_train_per_gpu = _bs_train // world_size
+    # 保留旧名称以兼容未更新的代码
+    cfg.batch_size_per_gpu = cfg.batch_size_train_per_gpu
+
     assert cfg.batch_size_val is None or cfg.batch_size_val % world_size == 0
     assert cfg.batch_size_test is None or cfg.batch_size_test % world_size == 0
-    cfg.batch_size_per_gpu = cfg.batch_size // world_size
     cfg.batch_size_val_per_gpu = (
         cfg.batch_size_val // world_size if cfg.batch_size_val is not None else 1
     )

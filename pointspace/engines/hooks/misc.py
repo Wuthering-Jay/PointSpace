@@ -79,7 +79,8 @@ class IterationTimer(HookBase):
 
 @HOOKS.register_module()
 class InformationWriter(HookBase):
-    def __init__(self):
+    def __init__(self, interval=1):
+        self.interval = interval
         self.curr_iter = 0
         self.model_output_keys = []
 
@@ -107,6 +108,11 @@ class InformationWriter(HookBase):
             self.model_output_keys = model_output_dict.keys()
             for key in self.model_output_keys:
                 self.trainer.storage.put_scalar(key, model_output_dict[key].item())
+
+        # Only log every `interval` steps; always accumulate storage for correct avg
+        if self.curr_iter % self.interval != 0:
+            self.trainer.comm_info["iter_info"] = ""
+            return
 
         for key in self.model_output_keys:
             self.trainer.comm_info["iter_info"] += "{key}: {value:.4f} ".format(
@@ -551,3 +557,157 @@ class GarbageHandler(HookBase):
     def after_train(self):
         gc.collect()
         torch.cuda.empty_cache()
+
+
+@HOOKS.register_module()
+class CacheCleaner(HookBase):
+    """Adaptive GPU/CPU cache cleaner hook.
+
+    自动缓存清理策略:
+    - **固定清理点**: after_epoch (每个 epoch 结束)、after_train (训练→测试过渡)
+      始终执行 ``gc.collect()`` + ``torch.cuda.empty_cache()`` 释放碎片。
+    - **自适应 step 级清理**: 统计每个 step 的耗时，当某个 step 耗时超过
+      ``mean × time_multiplier`` 或超过 ``abs_threshold_sec`` 绝对阈值时，
+      执行清理以缓解显存震荡导致的卡顿。
+    - **warmup**: 前 ``warmup_steps`` 步只收集统计，不触发清理。
+
+    每次清理都会在日志中输出原因和耗时信息。
+
+    Args:
+        warmup_steps (int): 热身步数，期间只统计不清理。默认 10。
+        time_multiplier (float): 相对阈值倍数。step 耗时 > mean × multiplier 时触发。默认 2.0。
+        abs_threshold_sec (float): 绝对阈值秒数。step 耗时 > 该值时触发。
+            设为 0 或 None 禁用。默认 None。
+        window_size (int): 滑动窗口大小，用于计算均值。默认 50。
+        enable_step_clean (bool): 是否启用 step 级自适应清理。默认 True。
+    """
+
+    def __init__(
+        self,
+        warmup_steps=10,
+        time_multiplier=2.0,
+        abs_threshold_sec=None,
+        window_size=50,
+        enable_step_clean=True,
+    ):
+        self.warmup_steps = warmup_steps
+        self.time_multiplier = time_multiplier
+        self.abs_threshold_sec = abs_threshold_sec
+        self.window_size = window_size
+        self.enable_step_clean = enable_step_clean
+
+        # runtime state
+        self._step_times = []   # recent step durations (sliding window, train)
+        self._step_count = 0
+        self._step_start = None
+        self._clean_count = 0   # total adaptive cleans
+        # separate window for val iterations (so train times don't distort val stats)
+        self._val_times = []
+        self._val_count = 0
+
+    # ------ helpers ------
+
+    def _clean(self, reason: str):
+        """Execute gc + cuda empty_cache and log the event."""
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        self._clean_count += 1
+        self.trainer.logger.info(
+            f"[CacheCleaner] cache cleared (#{self._clean_count}) — {reason}"
+        )
+
+    def check_and_clean(self, elapsed: float, context: str = "val") -> bool:
+        """Adaptive clean check for external callers (e.g. val loops).
+
+        Uses a separate sliding window from the train-step window so that
+        validation timing statistics are independent of training timing.
+
+        Args:
+            elapsed: Wall-clock seconds for this iteration.
+            context: Label used in log messages (e.g. "val iter 42/200").
+
+        Returns:
+            True if a clean was triggered, False otherwise.
+        """
+        if not self.enable_step_clean:
+            return False
+
+        self._val_count += 1
+        self._val_times.append(elapsed)
+        if len(self._val_times) > self.window_size:
+            self._val_times.pop(0)
+
+        # Honour the same warmup_steps before triggering
+        if self._val_count <= self.warmup_steps:
+            return False
+
+        mean_time = sum(self._val_times) / len(self._val_times)
+
+        if elapsed > mean_time * self.time_multiplier:
+            self._clean(
+                f"{context} took {elapsed:.3f}s "
+                f"(val mean {mean_time:.3f}s × {self.time_multiplier} = "
+                f"{mean_time * self.time_multiplier:.3f}s)"
+            )
+            return True
+
+        if self.abs_threshold_sec and elapsed > self.abs_threshold_sec:
+            self._clean(
+                f"{context} took {elapsed:.3f}s "
+                f"(abs threshold {self.abs_threshold_sec:.3f}s)"
+            )
+            return True
+
+        return False
+
+    # ------ fixed cleaning points ------
+
+    def after_epoch(self):
+        # Reset val window each epoch so statistics stay fresh
+        self._val_times.clear()
+        self._val_count = 0
+        self._clean(f"end of epoch {self.trainer.epoch}")
+
+    def after_train(self):
+        self._clean("training finished, preparing for test")
+
+    # ------ adaptive step-level cleaning ------
+
+    def before_step(self):
+        if self.enable_step_clean:
+            self._step_start = time.perf_counter()
+
+    def after_step(self):
+        if not self.enable_step_clean or self._step_start is None:
+            return
+
+        elapsed = time.perf_counter() - self._step_start
+        self._step_count += 1
+
+        # update sliding window
+        self._step_times.append(elapsed)
+        if len(self._step_times) > self.window_size:
+            self._step_times.pop(0)
+
+        # skip warmup phase
+        if self._step_count <= self.warmup_steps:
+            return
+
+        mean_time = sum(self._step_times) / len(self._step_times)
+
+        # check relative threshold
+        if elapsed > mean_time * self.time_multiplier:
+            self._clean(
+                f"step {self._step_count} took {elapsed:.3f}s "
+                f"(mean {mean_time:.3f}s × {self.time_multiplier} = "
+                f"{mean_time * self.time_multiplier:.3f}s)"
+            )
+            return
+
+        # check absolute threshold
+        if self.abs_threshold_sec and elapsed > self.abs_threshold_sec:
+            self._clean(
+                f"step {self._step_count} took {elapsed:.3f}s "
+                f"(abs threshold {self.abs_threshold_sec:.3f}s)"
+            )

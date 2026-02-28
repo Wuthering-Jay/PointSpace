@@ -86,7 +86,8 @@ def get_logger(name, log_file=None, log_level=logging.INFO, file_mode="a", color
         handlers.append(file_handler)
 
     plain_formatter = logging.Formatter(
-        "[%(asctime)s %(levelname)s %(filename)s line %(lineno)d %(process)d] %(message)s"
+        "[%(asctime)s %(levelname)s] %(message)s",
+        datefmt="%m/%d %H:%M:%S"
     )
     if color:
         formatter = _ColorfulFormatter(
@@ -159,7 +160,7 @@ def get_root_logger(log_file=None, log_level=logging.INFO, file_mode="a"):
         logging.Logger: The root logger.
     """
     logger = get_logger(
-        name="pointcept", log_file=log_file, log_level=log_level, file_mode=file_mode
+        name="pointspace", log_file=log_file, log_level=log_level, file_mode=file_mode
     )
     return logger
 
@@ -169,4 +170,4 @@ def _log_api_usage(identifier: str):
     Internal function used to log the usage of different detectron2 components
     inside facebook's infra.
     """
-    torch._C._log_api_usage_once("pointcept." + identifier)
+    torch._C._log_api_usage_once("pointspace." + identifier)

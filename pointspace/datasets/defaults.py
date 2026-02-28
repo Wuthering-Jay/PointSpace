@@ -44,6 +44,7 @@ class DefaultDataset(Dataset):
         "segment",
         "instance",
         "pose",
+        "regression_target",
     ]
 
     def __init__(

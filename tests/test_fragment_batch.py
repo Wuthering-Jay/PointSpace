@@ -355,19 +355,20 @@ class TestLoggingFormat(unittest.TestCase):
 
 class TestGetAttrFallback(unittest.TestCase):
     """
-    Verify that fragment_batch_size defaults to 1 when not in config,
+    Verify that batch_size_test_per_gpu defaults to 1 when not in config,
     preserving backward compatibility.
+    (Previously this was fragment_batch_size; now unified into batch_size_test.)
     """
 
     def test_default_value(self):
         cfg = MagicMock(spec=[])  # empty spec, no attributes
-        result = getattr(cfg, "fragment_batch_size", 1)
+        result = getattr(cfg, "batch_size_test_per_gpu", 1)
         self.assertEqual(result, 1)
 
     def test_custom_value(self):
         cfg = MagicMock()
-        cfg.fragment_batch_size = 4
-        result = getattr(cfg, "fragment_batch_size", 1)
+        cfg.batch_size_test_per_gpu = 4
+        result = getattr(cfg, "batch_size_test_per_gpu", 1)
         self.assertEqual(result, 4)
 
 

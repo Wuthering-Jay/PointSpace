@@ -15,6 +15,7 @@ from .aeo import AEODataset
 from .semantic_kitti import SemanticKITTIDataset
 from .nuscenes import NuScenesDataset
 from .waymo import WaymoDataset
+from .las import LasDataset
 
 # object
 from .modelnet import ModelNetDataset

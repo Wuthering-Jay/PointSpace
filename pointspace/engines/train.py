@@ -26,6 +26,7 @@ from .defaults import create_ddp_model, worker_init_fn
 from .hooks import HookBase, build_hooks
 import pointspace.utils.comm as comm
 from pointspace.datasets import build_dataset, point_collate_fn, collate_fn
+from pointspace.datasets.sampler import DistributedWeightedSampler
 from pointspace.models import build_model
 from pointspace.utils.logger import get_root_logger
 from pointspace.utils.optimizer import build_optimizer
@@ -143,6 +144,7 @@ class Trainer(TrainerBase):
         self.writer = self.build_writer()
         self.logger.info("=> Building train dataset & dataloader ...")
         self.train_loader = self.build_train_loader()
+        self._inject_class_weights()
         self.logger.info("=> Building val dataset & dataloader ...")
         self.val_loader = self.build_val_loader()
         self.logger.info("=> Building optimize, scheduler, scaler(amp) ...")
@@ -240,16 +242,12 @@ class Trainer(TrainerBase):
             # Reset grad accumulation counter
             self._gradient_accumulation_counter = 0
 
-        if self.cfg.empty_cache:
-            torch.cuda.empty_cache()
         self.comm_info["model_output_dict"] = output_dict
 
     def after_epoch(self):
         for h in self.hooks:
             h.after_epoch()
         self.storage.reset_histories()
-        if self.cfg.empty_cache_per_epoch:
-            torch.cuda.empty_cache()
 
     def build_model(self):
         model = build_model(self.cfg.model)
@@ -283,10 +281,51 @@ class Trainer(TrainerBase):
     def build_train_loader(self):
         train_data = build_dataset(self.cfg.data.train)
 
+        # --- Sampler selection ---
+        sample_weights = getattr(train_data, "sample_weights", None)
+        use_weighted = (
+            getattr(train_data, "weighted_sampler", False)
+            and sample_weights is not None
+        )
+
         if comm.get_world_size() > 1:
-            train_sampler = torch.utils.data.distributed.DistributedSampler(train_data)
+            if use_weighted:
+                import numpy as np
+
+                # Tile weights to match len(dataset) which includes loop
+                loop = getattr(train_data, "loop", 1)
+                weights = np.tile(sample_weights, loop)
+                train_sampler = DistributedWeightedSampler(
+                    weights=weights,
+                    dataset=train_data,
+                    num_replicas=comm.get_world_size(),
+                    rank=comm.get_rank(),
+                )
+                self.logger.info(
+                    f"Using DistributedWeightedSampler "
+                    f"({len(weights)} weights, loop={loop})"
+                )
+            else:
+                train_sampler = torch.utils.data.distributed.DistributedSampler(
+                    train_data
+                )
         else:
-            train_sampler = None
+            if use_weighted:
+                import numpy as np
+
+                loop = getattr(train_data, "loop", 1)
+                weights = np.tile(sample_weights, loop).tolist()
+                train_sampler = torch.utils.data.WeightedRandomSampler(
+                    weights=weights,
+                    num_samples=len(train_data),
+                    replacement=True,
+                )
+                self.logger.info(
+                    f"Using WeightedRandomSampler "
+                    f"({len(weights)} weights, loop={loop})"
+                )
+            else:
+                train_sampler = None
 
         init_fn = (
             partial(
@@ -308,10 +347,36 @@ class Trainer(TrainerBase):
             collate_fn=partial(point_collate_fn, mix_prob=self.cfg.mix_prob),
             pin_memory=True,
             worker_init_fn=init_fn,
-            drop_last=len(train_data) > self.cfg.batch_size,
+            drop_last=len(train_data) > self.cfg.batch_size_train,
             persistent_workers=True,
         )
         return train_loader
+
+    def _inject_class_weights(self):
+        """Inject dataset-computed class weights into the model's criteria.
+
+        Only affects loss functions with ``auto_class_weight=True``.
+        Works for any model that exposes a ``criteria`` attribute (e.g.
+        ``DefaultSegmentor``, ``DefaultSegmentorV2``), so the mechanism is
+        not tied to a specific task.
+        """
+        train_data = self.train_loader.dataset
+        class_weight = getattr(train_data, "class_weight", None)
+        if class_weight is None:
+            return
+
+        # Unwrap DDP to reach the real model
+        model = self.model.module if hasattr(self.model, "module") else self.model
+        criteria = getattr(model, "criteria", None)
+        if criteria is None:
+            return
+
+        if hasattr(criteria, "set_class_weight"):
+            criteria.set_class_weight(class_weight)
+            self.logger.info(
+                f"Injected dataset class_weight "
+                f"(len={len(class_weight)}) into criteria"
+            )
 
     def build_val_loader(self):
         val_loader = None

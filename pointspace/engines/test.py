@@ -41,7 +41,7 @@ TESTERS = Registry("testers")
 
 
 class TesterBase:
-    def __init__(self, cfg, model=None, test_loader=None, verbose=False) -> None:
+    def __init__(self, cfg, model=None, test_loader=None, verbose=True) -> None:
         torch.multiprocessing.set_sharing_strategy("file_system")
         self.logger = get_root_logger(
             log_file=os.path.join(cfg.save_path, "test.log"),
@@ -125,10 +125,10 @@ class TesterBase:
 class SemSegTester(TesterBase):
     def test(self):
         assert self.test_loader.batch_size == 1
-        fragment_batch_size = getattr(self.cfg, "fragment_batch_size", 1)
+        batch_size_test = self.cfg.batch_size_test_per_gpu
         logger = get_root_logger()
         logger.info(">>>>>>>>>>>>>>>> Start Evaluation >>>>>>>>>>>>>>>>")
-        logger.info(f"Fragment batch size: {fragment_batch_size}")
+        logger.info(f"Fragment batch size: {batch_size_test}")
 
         batch_time = AverageMeter()
         intersection_meter = AverageMeter()
@@ -173,10 +173,10 @@ class SemSegTester(TesterBase):
             else:
                 pred = torch.zeros((segment.size, self.cfg.data.num_classes)).cuda()
                 num_fragments = len(fragment_list)
-                batch_num = int(np.ceil(num_fragments / fragment_batch_size))
+                batch_num = int(np.ceil(num_fragments / batch_size_test))
                 for i in range(batch_num):
-                    s_i = i * fragment_batch_size
-                    e_i = min((i + 1) * fragment_batch_size, num_fragments)
+                    s_i = i * batch_size_test
+                    e_i = min((i + 1) * batch_size_test, num_fragments)
                     input_dict = collate_fn(fragment_list[s_i:e_i])
                     for key in input_dict.keys():
                         if isinstance(input_dict[key], torch.Tensor):
@@ -185,8 +185,6 @@ class SemSegTester(TesterBase):
                     with torch.no_grad():
                         pred_part = self.model(input_dict)["seg_logits"]  # (n, k)
                         pred_part = F.softmax(pred_part, -1)
-                        if self.cfg.empty_cache:
-                            torch.cuda.empty_cache()
                         bs = 0
                         for be in input_dict["offset"]:
                             pred[idx_part[bs:be], :] += pred_part[bs:be]
@@ -306,10 +304,10 @@ class SemSegTester(TesterBase):
 class DINOSemSegTester(TesterBase):
     def test(self):
         assert self.test_loader.batch_size == 1
-        fragment_batch_size = getattr(self.cfg, "fragment_batch_size", 1)
+        batch_size_test = self.cfg.batch_size_test_per_gpu
         logger = get_root_logger()
         logger.info(">>>>>>>>>>>>>>>> Start Evaluation >>>>>>>>>>>>>>>>")
-        logger.info(f"Fragment batch size: {fragment_batch_size}")
+        logger.info(f"Fragment batch size: {batch_size_test}")
 
         batch_time = AverageMeter()
         intersection_meter = AverageMeter()
@@ -357,10 +355,10 @@ class DINOSemSegTester(TesterBase):
             else:
                 pred = torch.zeros((segment.size, self.cfg.data.num_classes)).cuda()
                 num_fragments = len(fragment_list)
-                batch_num = int(np.ceil(num_fragments / fragment_batch_size))
+                batch_num = int(np.ceil(num_fragments / batch_size_test))
                 for i in range(batch_num):
-                    s_i = i * fragment_batch_size
-                    e_i = min((i + 1) * fragment_batch_size, num_fragments)
+                    s_i = i * batch_size_test
+                    e_i = min((i + 1) * batch_size_test, num_fragments)
                     input_dict = collate_fn(fragment_list[s_i:e_i])
                     for key in input_dict.keys():
                         if isinstance(input_dict[key], torch.Tensor):
@@ -372,8 +370,6 @@ class DINOSemSegTester(TesterBase):
                     with torch.no_grad():
                         pred_part = self.model(input_dict)["seg_logits"]  # (n, k)
                         pred_part = F.softmax(pred_part, -1)
-                        if self.cfg.empty_cache:
-                            torch.cuda.empty_cache()
                         bs = 0
                         for be in input_dict["offset"]:
                             pred[idx_part[bs:be], :] += pred_part[bs:be]
@@ -720,8 +716,6 @@ class PartSegTester(TesterBase):
                 with torch.no_grad():
                     pred_part = self.model(input_dict)["cls_logits"]
                     pred_part = F.softmax(pred_part, -1)
-                if self.cfg.empty_cache:
-                    torch.cuda.empty_cache()
                 pred_part = pred_part.reshape(-1, label.size, self.cfg.data.num_classes)
                 pred = pred + pred_part.total(dim=0)
                 logger.info(
@@ -1208,3 +1202,196 @@ class InsSegTester(TesterBase):
     def collate_fn(batch):
         # Restrict to bs 1
         return batch[0]
+
+
+@TESTERS.register_module()
+class RegressionTester(TesterBase):
+    """Test-time evaluator for per-point regression tasks.
+
+    Follows the same fragment-based inference pattern as ``SemSegTester``:
+    for every scene the test dataset yields a ``fragment_list``; each
+    fragment is fed through the model and the raw ``reg_pred`` outputs
+    are *summed* into an accumulator of shape ``(N,)`` (or ``(N, D)``
+    for multi-target). After processing all fragments the accumulated
+    values are divided by a per-point count to obtain the final
+    averaged prediction.
+
+    If the dataset supplies ``regression_target``, MAE / RMSE / R² are
+    computed and logged.
+
+    Results are saved as ``<data_name>_pred_reg.npy`` and optionally
+    written via a general writer (``pred_reg`` kwarg).
+    """
+
+    def test(self):
+        assert self.test_loader.batch_size == 1
+        batch_size_test = self.cfg.batch_size_test_per_gpu
+        logger = get_root_logger()
+        logger.info(">>>>>>>>>>>>>>>> Start Regression Evaluation >>>>>>>>>>>>>>>>")
+        logger.info(f"Fragment batch size: {batch_size_test}")
+
+        batch_time = AverageMeter()
+        self.model.eval()
+
+        save_path = os.path.join(self.cfg.save_path, "result")
+        make_dirs(save_path)
+
+        # Optional general writer (LAS / PLY / …)
+        general_writer = None
+        writer_cfg = getattr(self.cfg, "writer", None)
+        if writer_cfg is not None:
+            general_writer = build_writer(writer_cfg)
+
+        comm.synchronize()
+        record = {}
+
+        # Determine number of regression targets
+        num_targets = getattr(self.cfg.data, "num_targets", 1)
+
+        for idx, data_dict in enumerate(self.test_loader):
+            start = time.time()
+            data_dict = data_dict[0]  # bs == 1
+            fragment_list = data_dict.pop("fragment_list")
+            regression_target = data_dict.pop("regression_target", None)
+            data_name = data_dict.pop("name")
+
+            pred_save_path = os.path.join(
+                save_path, "{}_pred_reg.npy".format(data_name)
+            )
+
+            if os.path.isfile(pred_save_path):
+                logger.info(
+                    "{}/{}: {}, loaded pred.".format(
+                        idx + 1, len(self.test_loader), data_name
+                    )
+                )
+                pred = np.load(pred_save_path)
+            else:
+                n_points = (
+                    regression_target.shape[0]
+                    if regression_target is not None
+                    else data_dict.get("origin_coord", data_dict.get("coord")).shape[0]
+                )
+                if num_targets > 1:
+                    pred_sum = torch.zeros((n_points, num_targets)).cuda()
+                else:
+                    pred_sum = torch.zeros(n_points).cuda()
+                pred_count = torch.zeros(n_points, dtype=torch.long).cuda()
+
+                num_fragments = len(fragment_list)
+                batch_num = int(np.ceil(num_fragments / batch_size_test))
+                for i in range(batch_num):
+                    s_i = i * batch_size_test
+                    e_i = min((i + 1) * batch_size_test, num_fragments)
+                    input_dict = collate_fn(fragment_list[s_i:e_i])
+                    for key in input_dict.keys():
+                        if isinstance(input_dict[key], torch.Tensor):
+                            input_dict[key] = input_dict[key].cuda(non_blocking=True)
+                    idx_part = input_dict["index"]
+                    with torch.no_grad():
+                        pred_part = self.model(input_dict)["reg_pred"]  # (n,) or (n,D)
+                    # Accumulate by offset segments
+                    bs = 0
+                    for be in input_dict["offset"]:
+                        pred_sum[idx_part[bs:be]] += pred_part[bs:be]
+                        pred_count[idx_part[bs:be]] += 1
+                        bs = be
+
+                    logger.info(
+                        "Test: {}/{}-{data_name}, Fragment: {frag_end}/{frag_total}".format(
+                            idx + 1,
+                            len(self.test_loader),
+                            data_name=data_name,
+                            frag_end=e_i,
+                            frag_total=num_fragments,
+                        )
+                    )
+
+                # Average over fragments
+                pred_count = pred_count.clamp(min=1)
+                if num_targets > 1:
+                    pred = (pred_sum / pred_count.unsqueeze(-1)).cpu().numpy()
+                else:
+                    pred = (pred_sum / pred_count.float()).cpu().numpy()
+
+                # Handle origin mapping (grid-subsampled back to original)
+                if "origin_coord" in data_dict.keys():
+                    assert "inverse" in data_dict.keys()
+                    pred = pred[data_dict["inverse"]]
+                    if regression_target is not None and "origin_regression_target" in data_dict:
+                        regression_target = data_dict["origin_regression_target"]
+
+                np.save(pred_save_path, pred)
+
+            # Writer output
+            if general_writer is not None:
+                general_writer.write(data_name, pred_reg=pred)
+
+            # Metrics (if target available)
+            if regression_target is not None:
+                if isinstance(regression_target, torch.Tensor):
+                    regression_target = regression_target.numpy()
+                regression_target = regression_target.astype(np.float64).reshape(-1)
+                pred_flat = pred.astype(np.float64).reshape(-1)
+                diff = pred_flat - regression_target
+                mae = np.mean(np.abs(diff))
+                rmse = np.sqrt(np.mean(diff ** 2))
+                ss_res = np.sum(diff ** 2)
+                ss_tot = np.sum((regression_target - regression_target.mean()) ** 2)
+                r2 = 1.0 - ss_res / max(ss_tot, 1e-10)
+                record[data_name] = dict(mae=mae, rmse=rmse, r2=r2, n=len(pred_flat))
+            else:
+                record[data_name] = dict(mae=None, rmse=None, r2=None, n=pred.shape[0])
+
+            batch_time.update(time.time() - start)
+            info = "Test: {} [{}/{}]-{} Batch {batch_time.val:.3f} ({batch_time.avg:.3f})".format(
+                data_name,
+                idx + 1,
+                len(self.test_loader),
+                pred.shape[0],
+                batch_time=batch_time,
+            )
+            if record[data_name]["mae"] is not None:
+                info += " MAE {:.6f} RMSE {:.6f} R² {:.6f}".format(
+                    record[data_name]["mae"],
+                    record[data_name]["rmse"],
+                    record[data_name]["r2"],
+                )
+            logger.info(info)
+
+        logger.info("Syncing ...")
+        comm.synchronize()
+        record_sync = comm.gather(record, dst=0)
+
+        if comm.is_main_process():
+            record = {}
+            for _ in range(len(record_sync)):
+                r = record_sync.pop()
+                record.update(r)
+                del r
+
+            has_targets = any(v["mae"] is not None for v in record.values())
+            if has_targets:
+                total_n = sum(v["n"] for v in record.values() if v["mae"] is not None)
+                # Weighted average by point count
+                w_mae = sum(
+                    v["mae"] * v["n"] for v in record.values() if v["mae"] is not None
+                ) / max(total_n, 1)
+                w_rmse = sum(
+                    v["rmse"] * v["n"]
+                    for v in record.values()
+                    if v["rmse"] is not None
+                ) / max(total_n, 1)
+                w_r2 = sum(
+                    v["r2"] * v["n"] for v in record.values() if v["r2"] is not None
+                ) / max(total_n, 1)
+                logger.info(
+                    "Val result: MAE {:.6f} | RMSE {:.6f} | R² {:.6f}".format(
+                        w_mae, w_rmse, w_r2
+                    )
+                )
+            logger.info("<<<<<<<<<<<<<<<<< End Regression Evaluation <<<<<<<<<<<<<<<<<")
+
+    @staticmethod
+    def collate_fn(batch):
+        return batch

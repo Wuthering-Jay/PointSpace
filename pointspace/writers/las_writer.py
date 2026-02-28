@@ -269,11 +269,34 @@ class LASWriter(BaseWriter):
             pass  # 预留: 未来实现 3D 检测框结果写入
 
         # ========== 回归任务 (Regression) ==========
-        # TODO: 逐点回归值可以作为额外的 float64 维度写入 LAS，
-        #       例如 height_pred, curvature 等。
         pred_reg = kwargs.get("pred_reg", None)
         if pred_reg is not None:
-            pass  # 预留: 未来实现回归结果写入
+            pred_reg = np.asarray(pred_reg, dtype=np.float64)
+            if pred_reg.ndim == 1:
+                # Single-target: write as one extra dimension
+                if pred_reg.shape[0] != n_points:
+                    raise ValueError(
+                        f"pred_reg 长度 ({pred_reg.shape[0]}) 与点数 ({n_points}) 不匹配"
+                    )
+                self._add_extra_dim(las, "reg_pred", pred_reg, np.float64)
+                logger.debug("  -> reg_pred 字段已写入 (scalar)")
+            elif pred_reg.ndim == 2:
+                # Multi-target: write each column as reg_pred_0, reg_pred_1, …
+                if pred_reg.shape[0] != n_points:
+                    raise ValueError(
+                        f"pred_reg 行数 ({pred_reg.shape[0]}) 与点数 ({n_points}) 不匹配"
+                    )
+                for d in range(pred_reg.shape[1]):
+                    dim_name = f"reg_pred_{d}"
+                    self._add_extra_dim(las, dim_name, pred_reg[:, d], np.float64)
+                logger.debug(
+                    f"  -> reg_pred_0..{pred_reg.shape[1]-1} 字段已写入 "
+                    f"(multi-target, D={pred_reg.shape[1]})"
+                )
+            else:
+                raise ValueError(
+                    f"pred_reg 维度不合法: ndim={pred_reg.ndim}, 期望 1 或 2"
+                )
 
         # ========== 通用自定义维度 (Extra Dimensions) ==========
         # 允许用户直接指定 {字段名: (数据数组, dtype)} 的字典来写入任意维度

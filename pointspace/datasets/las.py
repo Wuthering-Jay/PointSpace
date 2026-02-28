@@ -4,11 +4,10 @@ import laspy
 from copy import deepcopy
 
 from pointspace.utils.logger import get_root_logger
-from pointspace.utils.cache import shared_dict
 
 from .builder import DATASETS
 from .defaults import DefaultDataset
-
+from .transform import Compose
 
 @DATASETS.register_module()
 class LasDataset(DefaultDataset):
@@ -40,6 +39,13 @@ class LasDataset(DefaultDataset):
                       - int > 1: number of samples
                       - 0 < float <= 1: ratio of dataset
                       (default: 0.1, i.e., 10% of data)
+
+    Note:
+        ``test_cfg`` and ``cache`` from ``DefaultDataset`` are intentionally
+        absent here.  ``LasDataset`` manages its own ``transform``,
+        ``post_transform`` and ``aug_transform`` pipelines directly, so
+        ``test_cfg`` is not needed.  Shared-memory caching (``cache``) is also
+        not used; LAS files are read directly via laspy every time.
     """
     
     VALID_ASSETS = [
@@ -62,8 +68,6 @@ class LasDataset(DefaultDataset):
         post_transform=None,
         aug_transform=None,
         test_mode=False,
-        test_cfg=None,
-        cache=False,
         ignore_index=-1,
         loop=1,
         required_class=None,
@@ -77,34 +81,50 @@ class LasDataset(DefaultDataset):
         self.class_weight_mode = class_weight
         self.weight_sample = weight_sample
         self.weighted_sampler = weighted_sampler
-        
+
         # Class mapping will be initialized in get_data_list
         self.class2id = None  # Original class -> remapped ID
         self.id2class = None  # Remapped ID -> original class
         self.class_weight = None  # Computed class weights
         self.sample_weights = None  # Weights for WeightedRandomSampler
-        
-        # Call parent init (which calls get_data_list)
+
+        # Store optional override params for potential use in get_data_list
+        self._data_path = data_path
+        self._data_list_input = data_list
+
+        # Always pass test_mode=False so the base class does NOT try to build
+        # transforms from test_cfg (which we don't use).  We restore the real
+        # test_mode on self right after.  cache=False is also always enforced
+        # because LasDataset reads LAS files directly via laspy.
         super().__init__(
             split=split,
             data_root=data_root,
-            data_path=data_path,
-            data_list=data_list,
             transform=transform,
-            post_transform=post_transform,
-            aug_transform=aug_transform,
-            test_mode=test_mode,
-            test_cfg=test_cfg,
-            cache=cache,
+            test_mode=False,
+            test_cfg=None,
+            cache=False,
             ignore_index=ignore_index,
             loop=loop,
         )
-        
-        # Compute class weights after data_list is initialized
+
+        # Restore real test_mode and enforce loop=1 in test mode
+        self.test_mode = test_mode
+        if test_mode:
+            self.loop = 1
+
+        # Set post_transform and aug_transform explicitly (the base class only
+        # sets these when test_mode=True via test_cfg, which we bypass above).
+        # Compose(None) is a transparent no-op, so None is safe here.
+        self.post_transform = Compose(post_transform)
+        self.aug_transform = [Compose(aug) for aug in (aug_transform or [])]
+
+        # Compute class weights after data_list is initialized.
+        # Skipped in test mode: weights are only used for loss / sampling during
+        # training, and scanning the dataset would waste time at inference.
         if self.class_weight_mode is not None and not test_mode:
             self._compute_class_weights()
-        
-        # Compute sample weights for WeightedRandomSampler
+
+        # Compute sample weights for WeightedRandomSampler (train only)
         if self.weighted_sampler and not test_mode:
             self._compute_sample_weights()
     
@@ -117,7 +137,11 @@ class LasDataset(DefaultDataset):
         
         all_classes = set()
         n_samples = len(self.data_list)
-        
+
+        if n_samples == 0:
+            logger.warning("No files in data_list — cannot scan classes")
+            return []
+
         # Determine sample size
         if isinstance(self.weight_sample, float) and 0 < self.weight_sample <= 1:
             n_scan = max(1, int(n_samples * self.weight_sample))
@@ -125,7 +149,7 @@ class LasDataset(DefaultDataset):
             n_scan = min(self.weight_sample, n_samples)
         else:
             n_scan = n_samples
-        
+
         # Random sample indices
         scan_indices = np.random.choice(n_samples, n_scan, replace=False) if n_scan < n_samples else range(n_samples)
         
@@ -236,9 +260,13 @@ class LasDataset(DefaultDataset):
             beta = self.class_weight_mode.get('beta', 0.9999)
         
         logger.info(f"Computing class weights using '{weight_method}' method...")
-        
+
         n_samples = len(self.data_list)
-        
+        if n_samples == 0:
+            logger.warning("No files in data_list — skipping class weight computation")
+            self.class_weight = None
+            return
+
         # Determine sample size
         if isinstance(self.weight_sample, float) and 0 < self.weight_sample <= 1:
             n_compute = max(1, int(n_samples * self.weight_sample))
@@ -246,7 +274,7 @@ class LasDataset(DefaultDataset):
             n_compute = min(self.weight_sample, n_samples)
         else:
             n_compute = n_samples
-        
+
         logger.info(f"  Sampling {n_compute}/{n_samples} files ({n_compute/n_samples*100:.1f}%)")
         
         # Random sample indices
@@ -348,6 +376,10 @@ class LasDataset(DefaultDataset):
         logger.info("Computing sample weights for WeightedRandomSampler...")
         
         n_samples = len(self.data_list)
+        if n_samples == 0:
+            logger.warning("No files in data_list — skipping sample weight computation")
+            self.sample_weight = None
+            return
         sample_weights = np.zeros(n_samples, dtype=np.float64)
         sample_class_sets = []  # Cache class sets for each sample
         
@@ -445,39 +477,69 @@ class LasDataset(DefaultDataset):
         return mapped
     
     def get_data_list(self):
-        """Override to initialize class mapping and filter LAS/LAZ files only"""
-        data_list = super().get_data_list()
-        
-        # Filter to only include LAS/LAZ files (ignore JSON, TXT, and other files)
-        valid_extensions = {'.las', '.laz'}
-        original_count = len(data_list)
-        data_list = [f for f in data_list if os.path.splitext(f)[1].lower() in valid_extensions]
-        
-        if len(data_list) < original_count:
-            logger = get_root_logger()
-            filtered_count = original_count - len(data_list)
-            logger.info(f"Filtered {filtered_count} non-LAS files from data list")
-        
-        # Initialize class mapping after data_list is available
-        # Note: We need to set data_list first for _scan_classes to work
+        """Override to resolve files from ``data_path`` (preferred) or fall
+        back to the base-class ``data_root`` + ``split`` logic, then filter to
+        LAS/LAZ only and initialise the class mapping."""
+        import glob as _glob
+
+        logger = get_root_logger()
+
+        # --- resolve raw file list ---
+        if self._data_path is not None:
+            # data_path points directly at a directory of LAS/LAZ files
+            path = self._data_path
+            if os.path.isdir(path):
+                data_list = sorted(
+                    f for f in _glob.glob(os.path.join(path, "*"))
+                    if os.path.splitext(f)[1].lower() in {".las", ".laz"}
+                )
+                logger.info(
+                    f"LasDataset: found {len(data_list)} LAS/LAZ files "
+                    f"in data_path='{path}'"
+                )
+            else:
+                raise FileNotFoundError(
+                    f"LasDataset: data_path='{path}' is not a directory"
+                )
+        elif self._data_list_input is not None:
+            # Caller supplied an explicit file list
+            data_list = list(self._data_list_input)
+        else:
+            # Fall back to DefaultDataset logic (data_root + split)
+            data_list = super().get_data_list()
+            # Filter to only LAS/LAZ
+            valid_extensions = {'.las', '.laz'}
+            original_count = len(data_list)
+            data_list = [
+                f for f in data_list
+                if os.path.splitext(f)[1].lower() in valid_extensions
+            ]
+            if len(data_list) < original_count:
+                filtered = original_count - len(data_list)
+                logger.info(
+                    f"Filtered {filtered} non-LAS files from data list"
+                )
+
+        if len(data_list) == 0:
+            logger.warning(
+                "LasDataset: data_list is empty — no LAS/LAZ files found. "
+                "Check data_path / data_root + split settings."
+            )
+
+        # Publish so _scan_classes / _init_class_mapping can access it
         self.data_list = data_list
-        
+
         if self.required_class is not None or self.remap_class:
             self._init_class_mapping()
-        
+
         return data_list
 
     def get_data(self, idx):
         data_path = self.data_list[idx % len(self.data_list)]
         name = self.get_data_name(idx)
-        
-        # Use cached data if enabled
-        if self.cache:
-            cache_name = f"pointcept-{name}"
-            return shared_dict(cache_name)
 
         data_dict = {}
-        
+
         # Read LAS/LAZ file (supports LAS 1.1, 1.2, 1.3, 1.4)
         try:
             las = laspy.read(data_path)
@@ -539,6 +601,16 @@ class LasDataset(DefaultDataset):
                     except (AttributeError, KeyError):
                         pass  # HAG not available
 
+            # Extract regression target if available as an extra dimension
+            if "regression_target" in las.point_format.dimension_names:
+                try:
+                    reg_target = np.array(
+                        las["regression_target"], dtype=np.float32
+                    )
+                    data_dict["regression_target"] = reg_target
+                except (AttributeError, KeyError):
+                    pass  # regression_target not available
+
         except Exception as e:
             logger = get_root_logger()
             logger.error(f"Error reading {data_path}: {e}")
@@ -567,9 +639,8 @@ class LasDataset(DefaultDataset):
         # load data
         data_dict = self.get_data(idx)
         data_dict = self.transform(data_dict)
-        # Apply post_transform if provided (ToTensor, Collect)
-        if hasattr(self, 'post_transform') and self.post_transform is not None:
-            data_dict = self.post_transform(data_dict)
+        # post_transform is always a Compose (possibly no-op when None was given)
+        data_dict = self.post_transform(data_dict)
         return data_dict
 
     def prepare_test_data(self, idx):
@@ -631,12 +702,9 @@ class LasDataset(DefaultDataset):
                     aug_data = self.post_transform(aug_data)
                 fragment_list.append(aug_data)
             
-            # If no aug_transform, just apply post_transform
+            # If no aug_transform, just apply post_transform (no-op if empty)
             if len(fragment_list) == 0:
-                if self.post_transform is not None:
-                    fragment_list.append(self.post_transform(data_dict))
-                else:
-                    fragment_list.append(data_dict)
+                fragment_list.append(self.post_transform(data_dict))
             
             result_dict["fragment_list"] = fragment_list
             return result_dict
