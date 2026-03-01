@@ -404,6 +404,7 @@ class TestRegressionEvaluator(unittest.TestCase):
         trainer = MagicMock()
         trainer.cfg.evaluate = True
         trainer.cfg.enable_wandb = False
+        trainer.cfg.enable_amp = False
         trainer.epoch = 0
         trainer.writer = None
         trainer.hooks = []  # no CacheCleaner

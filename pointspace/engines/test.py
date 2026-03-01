@@ -11,6 +11,8 @@ import os
 import time
 import numpy as np
 from collections import OrderedDict
+from functools import partial
+from packaging import version
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -38,6 +40,29 @@ except:
 
 
 TESTERS = Registry("testers")
+
+AMP_DTYPE = dict(
+    float16=torch.float16,
+    bfloat16=torch.bfloat16,
+)
+
+
+def _build_autocast(cfg):
+    """Return a context-manager factory matching the AMP setup used in training.
+
+    Usage inside eval / test loops::
+
+        auto_cast = _build_autocast(self.cfg)
+        with torch.no_grad(), auto_cast():
+            output = self.model(input_dict)
+    """
+    enable = getattr(cfg, "enable_amp", False)
+    dtype_key = getattr(cfg, "amp_dtype", "float16")
+    dtype = AMP_DTYPE.get(dtype_key, torch.float16)
+    if version.parse(torch.__version__) >= version.parse("2.4"):
+        return partial(torch.amp.autocast, device_type="cuda", enabled=enable, dtype=dtype)
+    else:
+        return partial(torch.cuda.amp.autocast, enabled=enable, dtype=dtype)
 
 
 class TesterBase:
@@ -104,9 +129,9 @@ class TesterBase:
             test_sampler = None
         test_loader = torch.utils.data.DataLoader(
             test_dataset,
-            batch_size=self.cfg.batch_size_test_per_gpu,
+            batch_size=1,
             shuffle=False,
-            num_workers=self.cfg.batch_size_test_per_gpu,
+            num_workers=self.cfg.num_worker_per_gpu,
             pin_memory=True,
             sampler=test_sampler,
             collate_fn=self.__class__.collate_fn,
@@ -124,8 +149,8 @@ class TesterBase:
 @TESTERS.register_module()
 class SemSegTester(TesterBase):
     def test(self):
-        assert self.test_loader.batch_size == 1
         batch_size_test = self.cfg.batch_size_test_per_gpu
+        auto_cast = _build_autocast(self.cfg)
         logger = get_root_logger()
         logger.info(">>>>>>>>>>>>>>>> Start Evaluation >>>>>>>>>>>>>>>>")
         logger.info(f"Fragment batch size: {batch_size_test}")
@@ -182,7 +207,7 @@ class SemSegTester(TesterBase):
                         if isinstance(input_dict[key], torch.Tensor):
                             input_dict[key] = input_dict[key].cuda(non_blocking=True)
                     idx_part = input_dict["index"]
-                    with torch.no_grad():
+                    with torch.no_grad(), auto_cast():
                         pred_part = self.model(input_dict)["seg_logits"]  # (n, k)
                         pred_part = F.softmax(pred_part, -1)
                         bs = 0
@@ -303,8 +328,8 @@ class SemSegTester(TesterBase):
 @TESTERS.register_module()
 class DINOSemSegTester(TesterBase):
     def test(self):
-        assert self.test_loader.batch_size == 1
         batch_size_test = self.cfg.batch_size_test_per_gpu
+        auto_cast = _build_autocast(self.cfg)
         logger = get_root_logger()
         logger.info(">>>>>>>>>>>>>>>> Start Evaluation >>>>>>>>>>>>>>>>")
         logger.info(f"Fragment batch size: {batch_size_test}")
@@ -367,7 +392,7 @@ class DINOSemSegTester(TesterBase):
                     input_dict["dino_feat"] = dino_feat
                     input_dict["dino_offset"] = dino_offset
                     idx_part = input_dict["index"]
-                    with torch.no_grad():
+                    with torch.no_grad(), auto_cast():
                         pred_part = self.model(input_dict)["seg_logits"]  # (n, k)
                         pred_part = F.softmax(pred_part, -1)
                         bs = 0
@@ -495,13 +520,14 @@ class ClsTester(TesterBase):
         union_meter = AverageMeter()
         target_meter = AverageMeter()
         self.model.eval()
+        auto_cast = _build_autocast(self.cfg)
 
         for i, input_dict in enumerate(self.test_loader):
             for key in input_dict.keys():
                 if isinstance(input_dict[key], torch.Tensor):
                     input_dict[key] = input_dict[key].cuda(non_blocking=True)
             end = time.time()
-            with torch.no_grad():
+            with torch.no_grad(), auto_cast():
                 output_dict = self.model(input_dict)
             output = output_dict["cls_logits"]
             pred = output.max(1)[1]
@@ -600,6 +626,7 @@ class ClsVotingTester(TesterBase):
         target_meter = AverageMeter()
         record = {}
         self.model.eval()
+        auto_cast = _build_autocast(self.cfg)
 
         for idx, data_dict in enumerate(self.test_loader):
             end = time.time()
@@ -619,7 +646,7 @@ class ClsVotingTester(TesterBase):
             for key in input_dict.keys():
                 if isinstance(input_dict[key], torch.Tensor):
                     input_dict[key] = input_dict[key].cuda(non_blocking=True)
-            with torch.no_grad():
+            with torch.no_grad(), auto_cast():
                 pred = F.softmax(self.model(input_dict)["cls_logits"], -1).sum(
                     0, keepdim=True
                 )
@@ -692,6 +719,7 @@ class PartSegTester(TesterBase):
         num_categories = len(self.test_loader.dataset.categories)
         iou_category, iou_count = np.zeros(num_categories), np.zeros(num_categories)
         self.model.eval()
+        auto_cast = _build_autocast(self.cfg)
 
         save_path = os.path.join(
             self.cfg.save_path, "result", "test_epoch{}".format(self.cfg.test_epoch)
@@ -713,7 +741,7 @@ class PartSegTester(TesterBase):
                 for key in input_dict.keys():
                     if isinstance(input_dict[key], torch.Tensor):
                         input_dict[key] = input_dict[key].cuda(non_blocking=True)
-                with torch.no_grad():
+                with torch.no_grad(), auto_cast():
                     pred_part = self.model(input_dict)["cls_logits"]
                     pred_part = F.softmax(pred_part, -1)
                 pred_part = pred_part.reshape(-1, label.size, self.cfg.data.num_classes)
@@ -795,7 +823,7 @@ class InsSegTester(TesterBase):
         self.distance_confs = -float("inf")
 
     def test(self):
-        assert self.test_loader.batch_size == 1
+        auto_cast = _build_autocast(self.cfg)
         logger = get_root_logger()
         logger.info(">>>>>>>>>>>>>>>> Start Evaluation >>>>>>>>>>>>>>>>")
 
@@ -810,7 +838,7 @@ class InsSegTester(TesterBase):
             for key in data_dict.keys():
                 if isinstance(data_dict[key], torch.Tensor):
                     data_dict[key] = data_dict[key].cuda(non_blocking=True)
-            with torch.no_grad():
+            with torch.no_grad(), auto_cast():
                 output_dict = self.model(data_dict)
                 segment = data_dict["segment"]
                 instance = data_dict["instance"]
@@ -1225,8 +1253,8 @@ class RegressionTester(TesterBase):
     """
 
     def test(self):
-        assert self.test_loader.batch_size == 1
         batch_size_test = self.cfg.batch_size_test_per_gpu
+        auto_cast = _build_autocast(self.cfg)
         logger = get_root_logger()
         logger.info(">>>>>>>>>>>>>>>> Start Regression Evaluation >>>>>>>>>>>>>>>>")
         logger.info(f"Fragment batch size: {batch_size_test}")
@@ -1290,7 +1318,7 @@ class RegressionTester(TesterBase):
                         if isinstance(input_dict[key], torch.Tensor):
                             input_dict[key] = input_dict[key].cuda(non_blocking=True)
                     idx_part = input_dict["index"]
-                    with torch.no_grad():
+                    with torch.no_grad(), auto_cast():
                         pred_part = self.model(input_dict)["reg_pred"]  # (n,) or (n,D)
                     # Accumulate by offset segments
                     bs = 0
@@ -1417,8 +1445,8 @@ class SemSegRegressionTester(TesterBase):
     """
 
     def test(self):
-        assert self.test_loader.batch_size == 1
         batch_size_test = self.cfg.batch_size_test_per_gpu
+        auto_cast = _build_autocast(self.cfg)
         logger = get_root_logger()
         logger.info(
             ">>>>>>>>>>>>>>>> Start SemSeg-Regression Evaluation >>>>>>>>>>>>>>>>"
@@ -1503,7 +1531,7 @@ class SemSegRegressionTester(TesterBase):
                         if isinstance(input_dict[key], torch.Tensor):
                             input_dict[key] = input_dict[key].cuda(non_blocking=True)
                     idx_part = input_dict["index"]
-                    with torch.no_grad():
+                    with torch.no_grad(), auto_cast():
                         output = self.model(input_dict)
                         seg_part = output["seg_logits"]   # (n, k)
                         seg_part = F.softmax(seg_part, -1)

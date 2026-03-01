@@ -207,6 +207,7 @@ class TestSemSegRegressionEvaluator(unittest.TestCase):
         trainer = MagicMock()
         trainer.cfg.evaluate = True
         trainer.cfg.enable_wandb = False
+        trainer.cfg.enable_amp = False
         trainer.cfg.data.num_classes = self.NUM_CLASSES
         trainer.cfg.data.ignore_index = -1
         trainer.cfg.data.names = [f"cls_{i}" for i in range(self.NUM_CLASSES)]

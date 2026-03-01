@@ -12,12 +12,34 @@ import torch
 import torch.distributed as dist
 import pointops
 from uuid import uuid4
+from functools import partial
+from packaging import version
 
 import pointspace.utils.comm as comm
 from pointspace.utils.misc import intersection_and_union_gpu
 
 from .default import HookBase
 from .builder import HOOKS
+
+AMP_DTYPE = dict(
+    float16=torch.float16,
+    bfloat16=torch.bfloat16,
+)
+
+
+def _build_autocast(cfg):
+    """Return an AMP autocast context-manager factory.
+
+    Reads ``cfg.enable_amp`` and ``cfg.amp_dtype`` to match the
+    mixed-precision setup used during training.
+    """
+    enable = getattr(cfg, "enable_amp", False)
+    dtype_key = getattr(cfg, "amp_dtype", "float16")
+    dtype = AMP_DTYPE.get(dtype_key, torch.float16)
+    if version.parse(torch.__version__) >= version.parse("2.4"):
+        return partial(torch.amp.autocast, device_type="cuda", enabled=enable, dtype=dtype)
+    else:
+        return partial(torch.cuda.amp.autocast, enabled=enable, dtype=dtype)
 
 
 @HOOKS.register_module()
@@ -32,6 +54,7 @@ class ClsEvaluator(HookBase):
     def eval(self):
         self.trainer.logger.info(">>>>>>>>>>>>>>>> Start Evaluation >>>>>>>>>>>>>>>>")
         self.trainer.model.eval()
+        auto_cast = _build_autocast(self.trainer.cfg)
         from pointspace.engines.hooks.misc import CacheCleaner
         _cache_cleaner = next(
             (h for h in self.trainer.hooks if isinstance(h, CacheCleaner)), None
@@ -41,7 +64,7 @@ class ClsEvaluator(HookBase):
             for key in input_dict.keys():
                 if isinstance(input_dict[key], torch.Tensor):
                     input_dict[key] = input_dict[key].cuda(non_blocking=True)
-            with torch.no_grad():
+            with torch.no_grad(), auto_cast():
                 output_dict = self.trainer.model(input_dict)
             output = output_dict["cls_logits"]
             loss = output_dict["loss"]
@@ -146,6 +169,7 @@ class SemSegEvaluator(HookBase):
     def eval(self):
         self.trainer.logger.info(">>>>>>>>>>>>>>>> Start Evaluation >>>>>>>>>>>>>>>>")
         self.trainer.model.eval()
+        auto_cast = _build_autocast(self.trainer.cfg)
         from pointspace.engines.hooks.misc import CacheCleaner
         _cache_cleaner = next(
             (h for h in self.trainer.hooks if isinstance(h, CacheCleaner)), None
@@ -155,7 +179,7 @@ class SemSegEvaluator(HookBase):
             for key in input_dict.keys():
                 if isinstance(input_dict[key], torch.Tensor):
                     input_dict[key] = input_dict[key].cuda(non_blocking=True)
-            with torch.no_grad():
+            with torch.no_grad(), auto_cast():
                 output_dict = self.trainer.model(input_dict)
             output = output_dict["seg_logits"]
             loss = output_dict["loss"]
@@ -302,6 +326,7 @@ class RegressionEvaluator(HookBase):
     def eval(self):
         self.trainer.logger.info(">>>>>>>>>>>>>>>> Start Evaluation >>>>>>>>>>>>>>>>")
         self.trainer.model.eval()
+        auto_cast = _build_autocast(self.trainer.cfg)
         from pointspace.engines.hooks.misc import CacheCleaner
 
         _cache_cleaner = next(
@@ -319,7 +344,7 @@ class RegressionEvaluator(HookBase):
             for key in input_dict.keys():
                 if isinstance(input_dict[key], torch.Tensor):
                     input_dict[key] = input_dict[key].cuda(non_blocking=True)
-            with torch.no_grad():
+            with torch.no_grad(), auto_cast():
                 output_dict = self.trainer.model(input_dict)
             pred = output_dict["reg_pred"].detach().float().reshape(-1)
             target = input_dict[self.target_key].float().reshape(-1)
@@ -441,6 +466,7 @@ class SemSegRegressionEvaluator(HookBase):
     def eval(self):
         self.trainer.logger.info(">>>>>>>>>>>>>>>> Start Evaluation >>>>>>>>>>>>>>>>")
         self.trainer.model.eval()
+        auto_cast = _build_autocast(self.trainer.cfg)
         from pointspace.engines.hooks.misc import CacheCleaner
 
         _cache_cleaner = next(
@@ -459,7 +485,7 @@ class SemSegRegressionEvaluator(HookBase):
             for key in input_dict.keys():
                 if isinstance(input_dict[key], torch.Tensor):
                     input_dict[key] = input_dict[key].cuda(non_blocking=True)
-            with torch.no_grad():
+            with torch.no_grad(), auto_cast():
                 output_dict = self.trainer.model(input_dict)
 
             loss = output_dict["loss"]
@@ -912,6 +938,7 @@ class InsSegEvaluator(HookBase):
     def eval(self):
         self.trainer.logger.info(">>>>>>>>>>>>>>>> Start Evaluation >>>>>>>>>>>>>>>>")
         self.trainer.model.eval()
+        auto_cast = _build_autocast(self.trainer.cfg)
         scenes = {}
         for i, input_dict in enumerate(self.trainer.val_loader):
             assert (
@@ -921,7 +948,7 @@ class InsSegEvaluator(HookBase):
             for key in input_dict.keys():
                 if isinstance(input_dict[key], torch.Tensor):
                     input_dict[key] = input_dict[key].cuda(non_blocking=True)
-            with torch.no_grad():
+            with torch.no_grad(), auto_cast():
                 output_dict = self.trainer.model(input_dict)
 
             loss = output_dict["loss"]
