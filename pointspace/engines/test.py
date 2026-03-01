@@ -75,6 +75,8 @@ class TesterBase:
         self.logger.info("=> Loading config ...")
         self.cfg = cfg
         self.verbose = verbose
+        # Build CacheCleaner for test phase (reuse training hook config if available)
+        self.cache_cleaner = self._build_cache_cleaner()
         if self.verbose and model is None:
             # if model is not none, trigger tester with trainer, no need to print config
             self.logger.info(f"Save path: {cfg.save_path}")
@@ -117,9 +119,38 @@ class TesterBase:
                     self.cfg.weight, checkpoint["epoch"]
                 )
             )
+            # Restore class mapping saved at training time so the writer can
+            # inverse-map predicted remapped IDs back to original class IDs.
+            id2class = checkpoint.get("id2class", None)
+            self.id2class = id2class  # dict {remapped_id: original_id} or None
+            if id2class is not None:
+                self.logger.info(
+                    f"=> Loaded id2class mapping from checkpoint: {id2class}"
+                )
         else:
             raise RuntimeError("=> No checkpoint found at '{}'".format(self.cfg.weight))
         return model
+
+    def _remap_to_original(self, pred: np.ndarray) -> np.ndarray:
+        """Apply id2class to convert remapped IDs back to original class IDs.
+
+        Used only for file output (LAS writer etc.); metrics are always
+        computed in the remapped (contiguous) ID space.
+
+        Args:
+            pred: integer numpy array of remapped class IDs.
+
+        Returns:
+            Array with original class IDs, or the input unchanged if no
+            mapping is available.
+        """
+        id2class = getattr(self, "id2class", None)
+        if id2class is None:
+            return pred
+        out = np.empty_like(pred)
+        for remapped, original in id2class.items():
+            out[pred == remapped] = original
+        return out
 
     def build_test_loader(self):
         test_dataset = build_dataset(self.cfg.data.test)
@@ -141,6 +172,25 @@ class TesterBase:
     def test(self):
         raise NotImplementedError
 
+    def _build_cache_cleaner(self):
+        """Build a CacheCleaner for the test phase.
+
+        Looks for a CacheCleaner config in ``cfg.hooks`` (the same list used
+        during training) and reuses its parameters.  Falls back to a default
+        CacheCleaner if none is configured.
+        """
+        from pointspace.engines.hooks.misc import CacheCleaner
+
+        hooks_cfg = getattr(self.cfg, "hooks", None) or []
+        cc_cfg = {}
+        for h in hooks_cfg:
+            if isinstance(h, dict) and h.get("type") == "CacheCleaner":
+                cc_cfg = {k: v for k, v in h.items() if k != "type"}
+                break
+        cleaner = CacheCleaner(**cc_cfg)
+        cleaner.logger = self.logger
+        return cleaner
+
     @staticmethod
     def collate_fn(batch):
         raise collate_fn(batch)
@@ -161,12 +211,10 @@ class SemSegTester(TesterBase):
         target_meter = AverageMeter()
         self.model.eval()
 
-        save_path = os.path.join(self.cfg.save_path, "result")
-        make_dirs(save_path)
         # 创建 benchmark writer（用于竞赛提交格式，根据数据集类型自动选择）
         benchmark_writer = create_benchmark_writer(
             dataset_type=self.cfg.data.test.type,
-            save_dir=save_path,
+            save_dir=self.cfg.save_path,
             dataset=self.test_loader.dataset,
         )
         if benchmark_writer is not None and comm.is_main_process():
@@ -185,61 +233,49 @@ class SemSegTester(TesterBase):
             fragment_list = data_dict.pop("fragment_list")
             segment = data_dict.pop("segment")
             data_name = data_dict.pop("name")
-            pred_save_path = os.path.join(save_path, "{}_pred.npy".format(data_name))
-            if os.path.isfile(pred_save_path):
+            pred = torch.zeros((segment.size, self.cfg.data.num_classes)).cuda()
+            num_fragments = len(fragment_list)
+            batch_num = int(np.ceil(num_fragments / batch_size_test))
+            for i in range(batch_num):
+                s_i = i * batch_size_test
+                e_i = min((i + 1) * batch_size_test, num_fragments)
+                input_dict = collate_fn(fragment_list[s_i:e_i])
+                for key in input_dict.keys():
+                    if isinstance(input_dict[key], torch.Tensor):
+                        input_dict[key] = input_dict[key].cuda(non_blocking=True)
+                idx_part = input_dict["index"]
+                with torch.no_grad(), auto_cast():
+                    pred_part = self.model(input_dict)["seg_logits"]  # (n, k)
+                    pred_part = F.softmax(pred_part, -1)
+                    bs = 0
+                    for be in input_dict["offset"]:
+                        pred[idx_part[bs:be], :] += pred_part[bs:be]
+                        bs = be
+
                 logger.info(
-                    "{}/{}: {}, loaded pred and label.".format(
-                        idx + 1, len(self.test_loader), data_name
+                    "Test: {}/{}-{data_name}, Fragment: {frag_end}/{frag_total}".format(
+                        idx + 1,
+                        len(self.test_loader),
+                        data_name=data_name,
+                        frag_end=e_i,
+                        frag_total=num_fragments,
                     )
                 )
-                pred = np.load(pred_save_path)
-                if "origin_segment" in data_dict.keys():
-                    segment = data_dict["origin_segment"]
+            if benchmark_writer is not None and benchmark_writer.topk > 1:
+                pred = pred.topk(benchmark_writer.topk, dim=1)[1].data.cpu().numpy()
             else:
-                pred = torch.zeros((segment.size, self.cfg.data.num_classes)).cuda()
-                num_fragments = len(fragment_list)
-                batch_num = int(np.ceil(num_fragments / batch_size_test))
-                for i in range(batch_num):
-                    s_i = i * batch_size_test
-                    e_i = min((i + 1) * batch_size_test, num_fragments)
-                    input_dict = collate_fn(fragment_list[s_i:e_i])
-                    for key in input_dict.keys():
-                        if isinstance(input_dict[key], torch.Tensor):
-                            input_dict[key] = input_dict[key].cuda(non_blocking=True)
-                    idx_part = input_dict["index"]
-                    with torch.no_grad(), auto_cast():
-                        pred_part = self.model(input_dict)["seg_logits"]  # (n, k)
-                        pred_part = F.softmax(pred_part, -1)
-                        bs = 0
-                        for be in input_dict["offset"]:
-                            pred[idx_part[bs:be], :] += pred_part[bs:be]
-                            bs = be
-
-                    logger.info(
-                        "Test: {}/{}-{data_name}, Fragment: {frag_end}/{frag_total}".format(
-                            idx + 1,
-                            len(self.test_loader),
-                            data_name=data_name,
-                            frag_end=e_i,
-                            frag_total=num_fragments,
-                        )
-                    )
-                if benchmark_writer is not None and benchmark_writer.topk > 1:
-                    pred = pred.topk(benchmark_writer.topk, dim=1)[1].data.cpu().numpy()
-                else:
-                    pred = pred.max(1)[1].data.cpu().numpy()
-                if "origin_segment" in data_dict.keys():
-                    assert "inverse" in data_dict.keys()
-                    pred = pred[data_dict["inverse"]]
-                    segment = data_dict["origin_segment"]
-                np.save(pred_save_path, pred)
+                pred = pred.max(1)[1].data.cpu().numpy()
+            if "origin_segment" in data_dict.keys():
+                assert "inverse" in data_dict.keys()
+                pred = pred[data_dict["inverse"]]
+                segment = data_dict["origin_segment"]
             # 写入 benchmark 提交文件
             if benchmark_writer is not None:
                 benchmark_writer.write(data_name, pred)
                 pred = benchmark_writer.pred_for_eval(pred)
             # 写入通用格式文件（可选）
             if general_writer is not None:
-                general_writer.write(data_name, pred_sem=pred)
+                general_writer.write(data_name, pred_sem=self._remap_to_original(pred))
 
             intersection, union, target = intersection_and_union(
                 pred, segment, self.cfg.data.num_classes, self.cfg.data.ignore_index
@@ -276,6 +312,9 @@ class SemSegTester(TesterBase):
                     m_iou=m_iou,
                 )
             )
+            self.cache_cleaner.check_and_clean(
+                batch_time.val, f"test iter {idx + 1}/{len(self.test_loader)}"
+            )
 
         logger.info("Syncing ...")
         comm.synchronize()
@@ -305,20 +344,22 @@ class SemSegTester(TesterBase):
             allAcc = sum(intersection) / (sum(target) + 1e-10)
 
             logger.info(
-                "Val result: mIoU/mAcc/allAcc {:.4f}/{:.4f}/{:.4f}".format(
+                "Test result:  mIoU {:.4f}  mAcc {:.4f}  OA {:.4f}".format(
                     mIoU, mAcc, allAcc
                 )
             )
+            names = self.cfg.data.names
+            precision_class = intersection / (intersection + np.maximum(union - target, 0) + 1e-10)
+            f1_class = 2 * precision_class * accuracy_class / (precision_class + accuracy_class + 1e-10)
+            max_name_len = max(len(n) for n in names)
             for i in range(self.cfg.data.num_classes):
                 logger.info(
-                    "Class_{idx} - {name} Result: iou/accuracy {iou:.4f}/{accuracy:.4f}".format(
-                        idx=i,
-                        name=self.cfg.data.names[i],
-                        iou=iou_class[i],
-                        accuracy=accuracy_class[i],
+                    "  Class {:2d} - {:<{w}} | IoU {:.4f}  Prec {:.4f}  Recall {:.4f}  F1 {:.4f}".format(
+                        i, names[i], iou_class[i], precision_class[i], accuracy_class[i], f1_class[i],
+                        w=max_name_len,
                     )
                 )
-            logger.info("<<<<<<<<<<<<<<<<< End Evaluation <<<<<<<<<<<<<<<<<")
+            logger.info("<<<<<<<<<<<<<<<<< End Evaluation <<<<<<<<<<<<<<<<<<")
 
     @staticmethod
     def collate_fn(batch):
@@ -340,12 +381,10 @@ class DINOSemSegTester(TesterBase):
         target_meter = AverageMeter()
         self.model.eval()
 
-        save_path = os.path.join(self.cfg.save_path, "result")
-        make_dirs(save_path)
         # 创建 benchmark writer（用于竞赛提交格式，根据数据集类型自动选择）
         benchmark_writer = create_benchmark_writer(
             dataset_type=self.cfg.data.test.type,
-            save_dir=save_path,
+            save_dir=self.cfg.save_path,
             dataset=self.test_loader.dataset,
         )
         if benchmark_writer is not None and comm.is_main_process():
@@ -367,64 +406,52 @@ class DINOSemSegTester(TesterBase):
             dino_coord = data_dict.pop("dino_coord").cuda(non_blocking=True)
             dino_feat = data_dict.pop("dino_feat").cuda(non_blocking=True)
             dino_offset = data_dict.pop("dino_offset").cuda(non_blocking=True)
-            pred_save_path = os.path.join(save_path, "{}_pred.npy".format(data_name))
-            if os.path.isfile(pred_save_path):
+            pred = torch.zeros((segment.size, self.cfg.data.num_classes)).cuda()
+            num_fragments = len(fragment_list)
+            batch_num = int(np.ceil(num_fragments / batch_size_test))
+            for i in range(batch_num):
+                s_i = i * batch_size_test
+                e_i = min((i + 1) * batch_size_test, num_fragments)
+                input_dict = collate_fn(fragment_list[s_i:e_i])
+                for key in input_dict.keys():
+                    if isinstance(input_dict[key], torch.Tensor):
+                        input_dict[key] = input_dict[key].cuda(non_blocking=True)
+                input_dict["dino_coord"] = dino_coord
+                input_dict["dino_feat"] = dino_feat
+                input_dict["dino_offset"] = dino_offset
+                idx_part = input_dict["index"]
+                with torch.no_grad(), auto_cast():
+                    pred_part = self.model(input_dict)["seg_logits"]  # (n, k)
+                    pred_part = F.softmax(pred_part, -1)
+                    bs = 0
+                    for be in input_dict["offset"]:
+                        pred[idx_part[bs:be], :] += pred_part[bs:be]
+                        bs = be
+
                 logger.info(
-                    "{}/{}: {}, loaded pred and label.".format(
-                        idx + 1, len(self.test_loader), data_name
+                    "Test: {}/{}-{data_name}, Fragment: {frag_end}/{frag_total}".format(
+                        idx + 1,
+                        len(self.test_loader),
+                        data_name=data_name,
+                        frag_end=e_i,
+                        frag_total=num_fragments,
                     )
                 )
-                pred = np.load(pred_save_path)
-                if "origin_segment" in data_dict.keys():
-                    segment = data_dict["origin_segment"]
+            if benchmark_writer is not None and benchmark_writer.topk > 1:
+                pred = pred.topk(benchmark_writer.topk, dim=1)[1].data.cpu().numpy()
             else:
-                pred = torch.zeros((segment.size, self.cfg.data.num_classes)).cuda()
-                num_fragments = len(fragment_list)
-                batch_num = int(np.ceil(num_fragments / batch_size_test))
-                for i in range(batch_num):
-                    s_i = i * batch_size_test
-                    e_i = min((i + 1) * batch_size_test, num_fragments)
-                    input_dict = collate_fn(fragment_list[s_i:e_i])
-                    for key in input_dict.keys():
-                        if isinstance(input_dict[key], torch.Tensor):
-                            input_dict[key] = input_dict[key].cuda(non_blocking=True)
-                    input_dict["dino_coord"] = dino_coord
-                    input_dict["dino_feat"] = dino_feat
-                    input_dict["dino_offset"] = dino_offset
-                    idx_part = input_dict["index"]
-                    with torch.no_grad(), auto_cast():
-                        pred_part = self.model(input_dict)["seg_logits"]  # (n, k)
-                        pred_part = F.softmax(pred_part, -1)
-                        bs = 0
-                        for be in input_dict["offset"]:
-                            pred[idx_part[bs:be], :] += pred_part[bs:be]
-                            bs = be
-
-                    logger.info(
-                        "Test: {}/{}-{data_name}, Fragment: {frag_end}/{frag_total}".format(
-                            idx + 1,
-                            len(self.test_loader),
-                            data_name=data_name,
-                            frag_end=e_i,
-                            frag_total=num_fragments,
-                        )
-                    )
-                if benchmark_writer is not None and benchmark_writer.topk > 1:
-                    pred = pred.topk(benchmark_writer.topk, dim=1)[1].data.cpu().numpy()
-                else:
-                    pred = pred.max(1)[1].data.cpu().numpy()
-                if "origin_segment" in data_dict.keys():
-                    assert "inverse" in data_dict.keys()
-                    pred = pred[data_dict["inverse"]]
-                    segment = data_dict["origin_segment"]
-                np.save(pred_save_path, pred)
+                pred = pred.max(1)[1].data.cpu().numpy()
+            if "origin_segment" in data_dict.keys():
+                assert "inverse" in data_dict.keys()
+                pred = pred[data_dict["inverse"]]
+                segment = data_dict["origin_segment"]
             # 写入 benchmark 提交文件
             if benchmark_writer is not None:
                 benchmark_writer.write(data_name, pred)
                 pred = benchmark_writer.pred_for_eval(pred)
             # 写入通用格式文件（可选）
             if general_writer is not None:
-                general_writer.write(data_name, pred_sem=pred)
+                general_writer.write(data_name, pred_sem=self._remap_to_original(pred))
 
             intersection, union, target = intersection_and_union(
                 pred, segment, self.cfg.data.num_classes, self.cfg.data.ignore_index
@@ -461,6 +488,9 @@ class DINOSemSegTester(TesterBase):
                     m_iou=m_iou,
                 )
             )
+            self.cache_cleaner.check_and_clean(
+                batch_time.val, f"test iter {idx + 1}/{len(self.test_loader)}"
+            )
 
         logger.info("Syncing ...")
         comm.synchronize()
@@ -490,20 +520,22 @@ class DINOSemSegTester(TesterBase):
             allAcc = sum(intersection) / (sum(target) + 1e-10)
 
             logger.info(
-                "Val result: mIoU/mAcc/allAcc {:.4f}/{:.4f}/{:.4f}".format(
+                "Test result:  mIoU {:.4f}  mAcc {:.4f}  OA {:.4f}".format(
                     mIoU, mAcc, allAcc
                 )
             )
+            names = self.cfg.data.names
+            precision_class = intersection / (intersection + np.maximum(union - target, 0) + 1e-10)
+            f1_class = 2 * precision_class * accuracy_class / (precision_class + accuracy_class + 1e-10)
+            max_name_len = max(len(n) for n in names)
             for i in range(self.cfg.data.num_classes):
                 logger.info(
-                    "Class_{idx} - {name} Result: iou/accuracy {iou:.4f}/{accuracy:.4f}".format(
-                        idx=i,
-                        name=self.cfg.data.names[i],
-                        iou=iou_class[i],
-                        accuracy=accuracy_class[i],
+                    "  Class {:2d} - {:<{w}} | IoU {:.4f}  Prec {:.4f}  Recall {:.4f}  F1 {:.4f}".format(
+                        i, names[i], iou_class[i], precision_class[i], accuracy_class[i], f1_class[i],
+                        w=max_name_len,
                     )
                 )
-            logger.info("<<<<<<<<<<<<<<<<< End Evaluation <<<<<<<<<<<<<<<<<")
+            logger.info("<<<<<<<<<<<<<<<<< End Evaluation <<<<<<<<<<<<<<<<<<")
 
     @staticmethod
     def collate_fn(batch):
@@ -560,6 +592,9 @@ class ClsTester(TesterBase):
                     batch_time=batch_time,
                     accuracy=accuracy,
                 )
+            )
+            self.cache_cleaner.check_and_clean(
+                batch_time.val, f"test iter {i + 1}/{len(self.test_loader)}"
             )
 
         iou_class = intersection_meter.sum / (union_meter.sum + 1e-10)
@@ -672,6 +707,9 @@ class ClsVotingTester(TesterBase):
                     m_acc=m_acc,
                 )
             )
+            self.cache_cleaner.check_and_clean(
+                batch_time.val, f"test iter {idx + 1}/{len(self.test_loader)}"
+            )
 
         logger.info("Syncing ...")
         comm.synchronize()
@@ -779,6 +817,9 @@ class PartSegTester(TesterBase):
                     data_name, idx + 1, len(self.test_loader), batch_time=batch_time
                 )
             )
+            self.cache_cleaner.check_and_clean(
+                batch_time.val, f"test iter {idx + 1}/{len(self.test_loader)}"
+            )
 
         ins_mIoU = iou_category.sum() / (iou_count.sum() + 1e-10)
         cat_mIoU = (iou_category / (iou_count + 1e-10)).mean()
@@ -878,6 +919,9 @@ class InsSegTester(TesterBase):
                     output_dict["pred_classes"],
                     data_name,
                 )
+            self.cache_cleaner.check_and_clean(
+                batch_time.val, f"test iter {idx + 1}/{len(self.test_loader)}"
+            )
 
         comm.synchronize()
         scenes_sync = comm.gather(scenes, dst=0)
@@ -1262,9 +1306,6 @@ class RegressionTester(TesterBase):
         batch_time = AverageMeter()
         self.model.eval()
 
-        save_path = os.path.join(self.cfg.save_path, "result")
-        make_dirs(save_path)
-
         # Optional general writer (LAS / PLY / …)
         general_writer = None
         writer_cfg = getattr(self.cfg, "writer", None)
@@ -1285,73 +1326,59 @@ class RegressionTester(TesterBase):
             regression_target = data_dict.pop("regression_target", None)
             data_name = data_dict.pop("name")
 
-            pred_save_path = os.path.join(
-                save_path, "{}_pred_reg.npy".format(data_name)
+            n_points = (
+                regression_target.shape[0]
+                if regression_target is not None
+                else data_dict.get("origin_coord", data_dict.get("coord")).shape[0]
             )
-
-            if os.path.isfile(pred_save_path):
-                logger.info(
-                    "{}/{}: {}, loaded pred.".format(
-                        idx + 1, len(self.test_loader), data_name
-                    )
-                )
-                pred = np.load(pred_save_path)
+            if num_targets > 1:
+                pred_sum = torch.zeros((n_points, num_targets)).cuda()
             else:
-                n_points = (
-                    regression_target.shape[0]
-                    if regression_target is not None
-                    else data_dict.get("origin_coord", data_dict.get("coord")).shape[0]
-                )
-                if num_targets > 1:
-                    pred_sum = torch.zeros((n_points, num_targets)).cuda()
-                else:
-                    pred_sum = torch.zeros(n_points).cuda()
-                pred_count = torch.zeros(n_points, dtype=torch.long).cuda()
+                pred_sum = torch.zeros(n_points).cuda()
+            pred_count = torch.zeros(n_points, dtype=torch.long).cuda()
 
-                num_fragments = len(fragment_list)
-                batch_num = int(np.ceil(num_fragments / batch_size_test))
-                for i in range(batch_num):
-                    s_i = i * batch_size_test
-                    e_i = min((i + 1) * batch_size_test, num_fragments)
-                    input_dict = collate_fn(fragment_list[s_i:e_i])
-                    for key in input_dict.keys():
-                        if isinstance(input_dict[key], torch.Tensor):
-                            input_dict[key] = input_dict[key].cuda(non_blocking=True)
-                    idx_part = input_dict["index"]
-                    with torch.no_grad(), auto_cast():
-                        pred_part = self.model(input_dict)["reg_pred"]  # (n,) or (n,D)
-                    # Accumulate by offset segments
-                    bs = 0
-                    for be in input_dict["offset"]:
-                        pred_sum[idx_part[bs:be]] += pred_part[bs:be]
-                        pred_count[idx_part[bs:be]] += 1
-                        bs = be
+            num_fragments = len(fragment_list)
+            batch_num = int(np.ceil(num_fragments / batch_size_test))
+            for i in range(batch_num):
+                s_i = i * batch_size_test
+                e_i = min((i + 1) * batch_size_test, num_fragments)
+                input_dict = collate_fn(fragment_list[s_i:e_i])
+                for key in input_dict.keys():
+                    if isinstance(input_dict[key], torch.Tensor):
+                        input_dict[key] = input_dict[key].cuda(non_blocking=True)
+                idx_part = input_dict["index"]
+                with torch.no_grad(), auto_cast():
+                    pred_part = self.model(input_dict)["reg_pred"]  # (n,) or (n,D)
+                # Accumulate by offset segments
+                bs = 0
+                for be in input_dict["offset"]:
+                    pred_sum[idx_part[bs:be]] += pred_part[bs:be]
+                    pred_count[idx_part[bs:be]] += 1
+                    bs = be
 
-                    logger.info(
-                        "Test: {}/{}-{data_name}, Fragment: {frag_end}/{frag_total}".format(
-                            idx + 1,
-                            len(self.test_loader),
-                            data_name=data_name,
-                            frag_end=e_i,
-                            frag_total=num_fragments,
-                        )
+                logger.info(
+                    "Test: {}/{}-{data_name}, Fragment: {frag_end}/{frag_total}".format(
+                        idx + 1,
+                        len(self.test_loader),
+                        data_name=data_name,
+                        frag_end=e_i,
+                        frag_total=num_fragments,
                     )
+                )
 
-                # Average over fragments
-                pred_count = pred_count.clamp(min=1)
-                if num_targets > 1:
-                    pred = (pred_sum / pred_count.unsqueeze(-1)).cpu().numpy()
-                else:
-                    pred = (pred_sum / pred_count.float()).cpu().numpy()
+            # Average over fragments
+            pred_count = pred_count.clamp(min=1)
+            if num_targets > 1:
+                pred = (pred_sum / pred_count.unsqueeze(-1)).cpu().numpy()
+            else:
+                pred = (pred_sum / pred_count.float()).cpu().numpy()
 
-                # Handle origin mapping (grid-subsampled back to original)
-                if "origin_coord" in data_dict.keys():
-                    assert "inverse" in data_dict.keys()
-                    pred = pred[data_dict["inverse"]]
-                    if regression_target is not None and "origin_regression_target" in data_dict:
-                        regression_target = data_dict.pop("origin_regression_target")
-
-                np.save(pred_save_path, pred)
+            # Handle origin mapping (grid-subsampled back to original)
+            if "origin_coord" in data_dict.keys():
+                assert "inverse" in data_dict.keys()
+                pred = pred[data_dict["inverse"]]
+                if regression_target is not None and "origin_regression_target" in data_dict:
+                    regression_target = data_dict.pop("origin_regression_target")
 
             # Writer output
             if general_writer is not None:
@@ -1388,6 +1415,9 @@ class RegressionTester(TesterBase):
                     record[data_name]["r2"],
                 )
             logger.info(info)
+            self.cache_cleaner.check_and_clean(
+                batch_time.val, f"test iter {idx + 1}/{len(self.test_loader)}"
+            )
 
         logger.info("Syncing ...")
         comm.synchronize()
@@ -1459,13 +1489,10 @@ class SemSegRegressionTester(TesterBase):
         target_meter = AverageMeter()
         self.model.eval()
 
-        save_path = os.path.join(self.cfg.save_path, "result")
-        make_dirs(save_path)
-
         # Benchmark writer (seg only)
         benchmark_writer = create_benchmark_writer(
             dataset_type=self.cfg.data.test.type,
-            save_dir=save_path,
+            save_dir=self.cfg.save_path,
             dataset=self.test_loader.dataset,
         )
         if benchmark_writer is not None and comm.is_main_process():
@@ -1489,102 +1516,83 @@ class SemSegRegressionTester(TesterBase):
             regression_target = data_dict.pop("regression_target", None)
             data_name = data_dict.pop("name")
 
-            seg_save_path = os.path.join(save_path, "{}_pred.npy".format(data_name))
-            reg_save_path = os.path.join(
-                save_path, "{}_pred_reg.npy".format(data_name)
+            # --- seg accumulator ---
+            seg_collect = torch.zeros(
+                (segment.size, self.cfg.data.num_classes)
+            ).cuda()
+            # --- reg accumulator ---
+            n_points = (
+                regression_target.shape[0]
+                if regression_target is not None
+                else segment.size
             )
-
-            if os.path.isfile(seg_save_path) and os.path.isfile(reg_save_path):
-                logger.info(
-                    "{}/{}: {}, loaded pred and reg.".format(
-                        idx + 1, len(self.test_loader), data_name
-                    )
-                )
-                seg_pred = np.load(seg_save_path)
-                reg_pred = np.load(reg_save_path)
-                if "origin_segment" in data_dict.keys():
-                    segment = data_dict["origin_segment"]
+            if num_targets > 1:
+                reg_sum = torch.zeros((n_points, num_targets)).cuda()
             else:
-                # --- seg accumulator ---
-                seg_collect = torch.zeros(
-                    (segment.size, self.cfg.data.num_classes)
-                ).cuda()
-                # --- reg accumulator ---
-                n_points = (
-                    regression_target.shape[0]
-                    if regression_target is not None
-                    else segment.size
+                reg_sum = torch.zeros(n_points).cuda()
+            reg_count = torch.zeros(n_points, dtype=torch.long).cuda()
+
+            num_fragments = len(fragment_list)
+            batch_num = int(np.ceil(num_fragments / batch_size_test))
+            for i in range(batch_num):
+                s_i = i * batch_size_test
+                e_i = min((i + 1) * batch_size_test, num_fragments)
+                input_dict = collate_fn(fragment_list[s_i:e_i])
+                for key in input_dict.keys():
+                    if isinstance(input_dict[key], torch.Tensor):
+                        input_dict[key] = input_dict[key].cuda(non_blocking=True)
+                idx_part = input_dict["index"]
+                with torch.no_grad(), auto_cast():
+                    output = self.model(input_dict)
+                    seg_part = output["seg_logits"]   # (n, k)
+                    seg_part = F.softmax(seg_part, -1)
+                    reg_part = output["reg_pred"]      # (n,) or (n, D)
+
+                bs = 0
+                for be in input_dict["offset"]:
+                    seg_collect[idx_part[bs:be], :] += seg_part[bs:be]
+                    reg_sum[idx_part[bs:be]] += reg_part[bs:be]
+                    reg_count[idx_part[bs:be]] += 1
+                    bs = be
+
+                logger.info(
+                    "Test: {}/{}-{data_name}, Fragment: {frag_end}/{frag_total}".format(
+                        idx + 1,
+                        len(self.test_loader),
+                        data_name=data_name,
+                        frag_end=e_i,
+                        frag_total=num_fragments,
+                    )
                 )
-                if num_targets > 1:
-                    reg_sum = torch.zeros((n_points, num_targets)).cuda()
-                else:
-                    reg_sum = torch.zeros(n_points).cuda()
-                reg_count = torch.zeros(n_points, dtype=torch.long).cuda()
 
-                num_fragments = len(fragment_list)
-                batch_num = int(np.ceil(num_fragments / batch_size_test))
-                for i in range(batch_num):
-                    s_i = i * batch_size_test
-                    e_i = min((i + 1) * batch_size_test, num_fragments)
-                    input_dict = collate_fn(fragment_list[s_i:e_i])
-                    for key in input_dict.keys():
-                        if isinstance(input_dict[key], torch.Tensor):
-                            input_dict[key] = input_dict[key].cuda(non_blocking=True)
-                    idx_part = input_dict["index"]
-                    with torch.no_grad(), auto_cast():
-                        output = self.model(input_dict)
-                        seg_part = output["seg_logits"]   # (n, k)
-                        seg_part = F.softmax(seg_part, -1)
-                        reg_part = output["reg_pred"]      # (n,) or (n, D)
+            # --- seg finalize ---
+            if benchmark_writer is not None and benchmark_writer.topk > 1:
+                seg_pred = (
+                    seg_collect.topk(benchmark_writer.topk, dim=1)[1]
+                    .data.cpu()
+                    .numpy()
+                )
+            else:
+                seg_pred = seg_collect.max(1)[1].data.cpu().numpy()
 
-                    bs = 0
-                    for be in input_dict["offset"]:
-                        seg_collect[idx_part[bs:be], :] += seg_part[bs:be]
-                        reg_sum[idx_part[bs:be]] += reg_part[bs:be]
-                        reg_count[idx_part[bs:be]] += 1
-                        bs = be
+            # --- reg finalize ---
+            reg_count = reg_count.clamp(min=1)
+            if num_targets > 1:
+                reg_pred = (reg_sum / reg_count.unsqueeze(-1)).cpu().numpy()
+            else:
+                reg_pred = (reg_sum / reg_count.float()).cpu().numpy()
 
-                    logger.info(
-                        "Test: {}/{}-{data_name}, Fragment: {frag_end}/{frag_total}".format(
-                            idx + 1,
-                            len(self.test_loader),
-                            data_name=data_name,
-                            frag_end=e_i,
-                            frag_total=num_fragments,
-                        )
-                    )
-
-                # --- seg finalize ---
-                if benchmark_writer is not None and benchmark_writer.topk > 1:
-                    seg_pred = (
-                        seg_collect.topk(benchmark_writer.topk, dim=1)[1]
-                        .data.cpu()
-                        .numpy()
-                    )
-                else:
-                    seg_pred = seg_collect.max(1)[1].data.cpu().numpy()
-
-                # --- reg finalize ---
-                reg_count = reg_count.clamp(min=1)
-                if num_targets > 1:
-                    reg_pred = (reg_sum / reg_count.unsqueeze(-1)).cpu().numpy()
-                else:
-                    reg_pred = (reg_sum / reg_count.float()).cpu().numpy()
-
-                # Handle origin mapping
-                if "origin_segment" in data_dict.keys():
-                    assert "inverse" in data_dict.keys()
-                    seg_pred = seg_pred[data_dict["inverse"]]
-                    reg_pred = reg_pred[data_dict["inverse"]]
-                    segment = data_dict["origin_segment"]
-                    if (
-                        regression_target is not None
-                        and "origin_regression_target" in data_dict
-                    ):
-                        regression_target = data_dict.pop("origin_regression_target")
-
-                np.save(seg_save_path, seg_pred)
-                np.save(reg_save_path, reg_pred)
+            # Handle origin mapping
+            if "origin_segment" in data_dict.keys():
+                assert "inverse" in data_dict.keys()
+                seg_pred = seg_pred[data_dict["inverse"]]
+                reg_pred = reg_pred[data_dict["inverse"]]
+                segment = data_dict["origin_segment"]
+                if (
+                    regression_target is not None
+                    and "origin_regression_target" in data_dict
+                ):
+                    regression_target = data_dict.pop("origin_regression_target")
 
             # Benchmark writer (seg)
             if benchmark_writer is not None:
@@ -1592,7 +1600,11 @@ class SemSegRegressionTester(TesterBase):
                 seg_pred = benchmark_writer.pred_for_eval(seg_pred)
             # General writer (seg + reg)
             if general_writer is not None:
-                general_writer.write(data_name, pred_sem=seg_pred, pred_reg=reg_pred)
+                general_writer.write(
+                    data_name,
+                    pred_sem=self._remap_to_original(seg_pred),
+                    pred_reg=reg_pred,
+                )
 
             # --- seg metrics ---
             intersection, union, target_seg = intersection_and_union(
@@ -1654,6 +1666,9 @@ class SemSegRegressionTester(TesterBase):
                     reg_info["mae"], reg_info["r2"]
                 )
             logger.info(info)
+            self.cache_cleaner.check_and_clean(
+                batch_time.val, f"test iter {idx + 1}/{len(self.test_loader)}"
+            )
 
         logger.info("Syncing ...")
         comm.synchronize()
@@ -1685,17 +1700,19 @@ class SemSegRegressionTester(TesterBase):
             allAcc = sum(intersection) / (sum(target_seg) + 1e-10)
 
             logger.info(
-                "Val result: mIoU/mAcc/allAcc {:.4f}/{:.4f}/{:.4f}".format(
+                "Test result:  mIoU {:.4f}  mAcc {:.4f}  OA {:.4f}".format(
                     mIoU, mAcc, allAcc
                 )
             )
+            names = self.cfg.data.names
+            precision_class = intersection / (intersection + np.maximum(union - target_seg, 0) + 1e-10)
+            f1_class = 2 * precision_class * accuracy_class / (precision_class + accuracy_class + 1e-10)
+            max_name_len = max(len(n) for n in names)
             for i in range(self.cfg.data.num_classes):
                 logger.info(
-                    "Class_{idx} - {name} Result: iou/accuracy {iou:.4f}/{accuracy:.4f}".format(
-                        idx=i,
-                        name=self.cfg.data.names[i],
-                        iou=iou_class[i],
-                        accuracy=accuracy_class[i],
+                    "  Class {:2d} - {:<{w}} | IoU {:.4f}  Prec {:.4f}  Recall {:.4f}  F1 {:.4f}".format(
+                        i, names[i], iou_class[i], precision_class[i], accuracy_class[i], f1_class[i],
+                        w=max_name_len,
                     )
                 )
 

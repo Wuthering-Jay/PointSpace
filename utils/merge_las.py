@@ -166,7 +166,11 @@ class LASMerger:
         for vlr in src_header.vlrs:
             header.vlrs.append(vlr)
         for ed in extra_dims_to_keep:
-            header.add_extra_dim(ed)
+            header.add_extra_dim(laspy.ExtraBytesParams(
+                name=ed.name,
+                type=ed.dtype,
+                description=getattr(ed, 'description', ''),
+            ))
         
         # Determine output dimension names (what goes into the merged file)
         output_dim_names = set(header.point_format.dimension_names)
@@ -389,7 +393,7 @@ def merge_las_tiles(input_path: Union[str, Path],
     
 if __name__ == "__main__":
     
-    input_path = r"E:\data\DALES\dales_las\tile\test"
+    input_path = r"E:\data\DALES\dales_las\tile\pred"
     output_dir = r"E:\data\DALES\dales_las\tile\output"
     
     merge_las_tiles(

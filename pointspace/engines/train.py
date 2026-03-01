@@ -26,7 +26,10 @@ from .defaults import create_ddp_model, worker_init_fn
 from .hooks import HookBase, build_hooks
 import pointspace.utils.comm as comm
 from pointspace.datasets import build_dataset, point_collate_fn, collate_fn
-from pointspace.datasets.sampler import DistributedWeightedSampler
+from pointspace.datasets.sampler import (
+    DistributedGuaranteedWeightedSampler,
+    GuaranteedWeightedSampler,
+)
 from pointspace.models import build_model
 from pointspace.utils.logger import get_root_logger
 from pointspace.utils.optimizer import build_optimizer
@@ -128,7 +131,7 @@ class Trainer(TrainerBase):
         super(Trainer, self).__init__()
         self.epoch = 0
         self.start_epoch = 0
-        self.max_epoch = cfg.eval_epoch
+        self.max_epoch = cfg.epoch
         self.best_metric_value = -torch.inf
         self.logger = get_root_logger(
             log_file=os.path.join(cfg.save_path, "train.log"),
@@ -207,6 +210,13 @@ class Trainer(TrainerBase):
             loss = (
                 output_dict["loss"] / self.cfg.gradient_accumulation_steps
             )  # scale loss
+
+        # Inject per-criterion raw losses into output_dict for logging
+        _model = self.model.module if hasattr(self.model, "module") else self.model
+        _criteria = getattr(_model, "criteria", None)
+        if _criteria is not None and hasattr(_criteria, "_last_individual_losses"):
+            for name, raw in _criteria._last_individual_losses.items():
+                output_dict[f"loss/{name}"] = raw
 
         # Backward pass
         if self.cfg.enable_amp:
@@ -288,22 +298,21 @@ class Trainer(TrainerBase):
             and sample_weights is not None
         )
 
+        loop = getattr(train_data, "loop", 1)
+        num_base = len(train_data.data_list) if hasattr(train_data, "data_list") else len(train_data) // max(loop, 1)
+
         if comm.get_world_size() > 1:
             if use_weighted:
-                import numpy as np
-
-                # Tile weights to match len(dataset) which includes loop
-                loop = getattr(train_data, "loop", 1)
-                weights = np.tile(sample_weights, loop)
-                train_sampler = DistributedWeightedSampler(
-                    weights=weights,
-                    dataset=train_data,
+                train_sampler = DistributedGuaranteedWeightedSampler(
+                    weights=sample_weights,
+                    num_base_samples=num_base,
+                    loop=loop,
                     num_replicas=comm.get_world_size(),
                     rank=comm.get_rank(),
                 )
                 self.logger.info(
-                    f"Using DistributedWeightedSampler "
-                    f"({len(weights)} weights, loop={loop})"
+                    f"Using DistributedGuaranteedWeightedSampler "
+                    f"(base={num_base}, loop={loop}, total={num_base * loop})"
                 )
             else:
                 train_sampler = torch.utils.data.distributed.DistributedSampler(
@@ -311,18 +320,14 @@ class Trainer(TrainerBase):
                 )
         else:
             if use_weighted:
-                import numpy as np
-
-                loop = getattr(train_data, "loop", 1)
-                weights = np.tile(sample_weights, loop).tolist()
-                train_sampler = torch.utils.data.WeightedRandomSampler(
-                    weights=weights,
-                    num_samples=len(train_data),
-                    replacement=True,
+                train_sampler = GuaranteedWeightedSampler(
+                    weights=sample_weights,
+                    num_base_samples=num_base,
+                    loop=loop,
                 )
                 self.logger.info(
-                    f"Using WeightedRandomSampler "
-                    f"({len(weights)} weights, loop={loop})"
+                    f"Using GuaranteedWeightedSampler "
+                    f"(base={num_base}, loop={loop}, total={num_base * loop})"
                 )
             else:
                 train_sampler = None
@@ -348,8 +353,24 @@ class Trainer(TrainerBase):
             pin_memory=True,
             worker_init_fn=init_fn,
             drop_last=len(train_data) > self.cfg.batch_size_train,
-            persistent_workers=True,
+            persistent_workers=self.cfg.num_worker_per_gpu > 0,
         )
+
+        # Log batch-size breakdown
+        grad_accum = self.cfg.gradient_accumulation_steps
+        micro_bs = self.cfg.batch_size_per_gpu
+        effective_bs = micro_bs * grad_accum
+        self.logger.info(
+            f"Train DataLoader: micro_batch={micro_bs}, "
+            f"gradient_accumulation={grad_accum}, "
+            f"effective_batch_per_gpu={effective_bs}"
+        )
+        if effective_bs != self.cfg.batch_size_train_per_gpu:
+            self.logger.warning(
+                f"batch_size_train_per_gpu ({self.cfg.batch_size_train_per_gpu}) "
+                f"is not exactly divisible by gradient_accumulation_steps ({grad_accum}). "
+                f"Actual effective batch = {effective_bs}."
+            )
         return train_loader
 
     def _inject_class_weights(self):
@@ -405,7 +426,7 @@ class Trainer(TrainerBase):
         assert hasattr(self, "train_loader")
         self.cfg.scheduler.total_steps = (
             len(self.train_loader)
-            * self.cfg.eval_epoch
+            * self.cfg.epoch
             // self.cfg.gradient_accumulation_steps
         )
         return build_scheduler(self.cfg.scheduler, self.optimizer)

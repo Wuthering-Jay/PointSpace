@@ -8,7 +8,8 @@ Validates:
 4. Sliding window: only recent step times affect mean
 5. Absolute threshold: triggers independently of relative check
 6. Logging: each clean event is logged with reason
-7. Disabled mode: enable_step_clean=False skips step-level cleaning
+7. Interval mode: step_clean_interval triggers fixed-interval cleaning
+8. Default mode: step_clean_interval=None still does adaptive cleaning
 """
 
 import time
@@ -141,30 +142,63 @@ class TestSlidingWindow(unittest.TestCase):
         self.assertEqual(len(hook._step_times), 5)
 
 
-class TestDisabledMode(unittest.TestCase):
-    """enable_step_clean=False disables adaptive cleaning."""
+class TestIntervalMode(unittest.TestCase):
+    """step_clean_interval triggers fixed-interval cleaning."""
+
+    def _simulate_steps(self, hook, durations):
+        for d in durations:
+            hook.before_step()
+            hook._step_start = time.perf_counter() - d
+            hook.after_step()
 
     @patch("pointspace.engines.hooks.misc.gc.collect")
     @patch("pointspace.engines.hooks.misc.torch.cuda.empty_cache")
     @patch("pointspace.engines.hooks.misc.torch.cuda.is_available", return_value=True)
-    def test_disabled_no_step_clean(self, mock_avail, mock_empty, mock_gc):
-        hook = CacheCleaner(enable_step_clean=False, warmup_steps=0, time_multiplier=1.0)
+    def test_interval_triggers_at_correct_steps(self, mock_avail, mock_empty, mock_gc):
+        hook = CacheCleaner(
+            step_clean_interval=5, warmup_steps=0, time_multiplier=100.0
+        )
         hook.trainer = _make_trainer_mock()
-        # Simulate many steps — none should trigger clean
-        for _ in range(20):
-            hook.before_step()
-            hook.after_step()
+        # 10 uniform steps — should clean at step 5 and 10
+        self._simulate_steps(hook, [0.1] * 10)
+        self.assertEqual(mock_gc.call_count, 2)
+
+    @patch("pointspace.engines.hooks.misc.gc.collect")
+    @patch("pointspace.engines.hooks.misc.torch.cuda.empty_cache")
+    @patch("pointspace.engines.hooks.misc.torch.cuda.is_available", return_value=True)
+    def test_no_interval_no_clean_for_uniform(self, mock_avail, mock_empty, mock_gc):
+        """step_clean_interval=None with uniform steps → no clean."""
+        hook = CacheCleaner(
+            step_clean_interval=None, warmup_steps=2, time_multiplier=2.0
+        )
+        hook.trainer = _make_trainer_mock()
+        self._simulate_steps(hook, [0.1] * 20)
         mock_gc.assert_not_called()
 
     @patch("pointspace.engines.hooks.misc.gc.collect")
     @patch("pointspace.engines.hooks.misc.torch.cuda.empty_cache")
     @patch("pointspace.engines.hooks.misc.torch.cuda.is_available", return_value=True)
-    def test_disabled_still_cleans_epoch(self, mock_avail, mock_empty, mock_gc):
-        """Fixed cleaning points still work when step cleaning is disabled."""
-        hook = CacheCleaner(enable_step_clean=False)
+    def test_interval_still_cleans_epoch(self, mock_avail, mock_empty, mock_gc):
+        """Fixed cleaning points still work regardless of interval setting."""
+        hook = CacheCleaner(step_clean_interval=None)
         hook.trainer = _make_trainer_mock()
         hook.after_epoch()
         mock_gc.assert_called_once()
+
+    @patch("pointspace.engines.hooks.misc.gc.collect")
+    @patch("pointspace.engines.hooks.misc.torch.cuda.empty_cache")
+    @patch("pointspace.engines.hooks.misc.torch.cuda.is_available", return_value=True)
+    def test_check_and_clean_interval(self, mock_avail, mock_empty, mock_gc):
+        """check_and_clean also respects step_clean_interval."""
+        hook = CacheCleaner(
+            step_clean_interval=3, warmup_steps=0, time_multiplier=100.0
+        )
+        hook.logger = logging.getLogger("test_cache_cleaner")
+        hook.logger.setLevel(logging.DEBUG)
+        for i in range(9):
+            hook.check_and_clean(0.1, f"iter {i + 1}")
+        # Should clean at iter 3, 6, 9
+        self.assertEqual(mock_gc.call_count, 3)
 
 
 class TestLogging(unittest.TestCase):
@@ -214,13 +248,13 @@ class TestRegistration(unittest.TestCase):
             time_multiplier=3.0,
             abs_threshold_sec=5.0,
             window_size=100,
-            enable_step_clean=False,
+            step_clean_interval=50,
         ))
         self.assertEqual(hook.warmup_steps, 20)
         self.assertEqual(hook.time_multiplier, 3.0)
         self.assertEqual(hook.abs_threshold_sec, 5.0)
         self.assertEqual(hook.window_size, 100)
-        self.assertFalse(hook.enable_step_clean)
+        self.assertEqual(hook.step_clean_interval, 50)
 
 
 if __name__ == "__main__":

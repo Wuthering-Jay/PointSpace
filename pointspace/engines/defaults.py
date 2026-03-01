@@ -120,7 +120,7 @@ def default_config_parser(file_path, options):
     if cfg.seed is None:
         cfg.seed = get_random_seed()
 
-    cfg.data.train.loop = cfg.epoch // cfg.eval_epoch
+    # loop is set explicitly in each dataset config; no auto-override here.
 
     os.makedirs(os.path.join(cfg.save_path, "model"), exist_ok=True)
     if not cfg.resume:
@@ -142,8 +142,12 @@ def default_setup(cfg):
         _bs_train = cfg.batch_size  # legacy name
     assert _bs_train % world_size == 0
     cfg.batch_size_train_per_gpu = _bs_train // world_size
-    # 保留旧名称以兼容未更新的代码
-    cfg.batch_size_per_gpu = cfg.batch_size_train_per_gpu
+
+    # ---- micro-batch: gradient accumulation reduces per-step batch ----
+    # batch_size_per_gpu is the ACTUAL DataLoader batch size (micro-batch).
+    # Effective batch = micro-batch × gradient_accumulation_steps.
+    grad_accum = getattr(cfg, "gradient_accumulation_steps", 1)
+    cfg.batch_size_per_gpu = max(1, cfg.batch_size_train_per_gpu // grad_accum)
 
     assert cfg.batch_size_val is None or cfg.batch_size_val % world_size == 0
     assert cfg.batch_size_test is None or cfg.batch_size_test % world_size == 0
@@ -153,8 +157,6 @@ def default_setup(cfg):
     cfg.batch_size_test_per_gpu = (
         cfg.batch_size_test // world_size if cfg.batch_size_test is not None else 1
     )
-    # update data loop
-    assert cfg.epoch % cfg.eval_epoch == 0
     # settle random seed
     rank = comm.get_rank()
     seed = None if cfg.seed is None else cfg.seed + rank * cfg.num_worker_per_gpu

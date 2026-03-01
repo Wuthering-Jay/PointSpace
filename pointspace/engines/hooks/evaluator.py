@@ -92,7 +92,7 @@ class ClsEvaluator(HookBase):
             self.trainer.storage.put_scalar("val_loss", loss.item())
             if (i + 1) % self.log_interval == 0 or (i + 1) == len(self.trainer.val_loader):
                 self.trainer.logger.info(
-                    "Test: [{iter}/{max_iter}] "
+                    "Val: [{iter}/{max_iter}] "
                     "Loss {loss:.4f} ".format(
                         iter=i + 1, max_iter=len(self.trainer.val_loader), loss=loss.item()
                     )
@@ -112,17 +112,19 @@ class ClsEvaluator(HookBase):
         m_acc = np.mean(acc_class)
         all_acc = sum(intersection) / (sum(target) + 1e-10)
         self.trainer.logger.info(
-            "Val result: mIoU/mAcc/allAcc {:.4f}/{:.4f}/{:.4f}.".format(
+            "Val result:  mIoU {:.4f}  mAcc {:.4f}  OA {:.4f}".format(
                 m_iou, m_acc, all_acc
             )
         )
+        names = self.trainer.cfg.data.names
+        precision_class = intersection / (intersection + np.maximum(union - target, 0) + 1e-10)
+        f1_class = 2 * precision_class * acc_class / (precision_class + acc_class + 1e-10)
+        max_name_len = max(len(n) for n in names)
         for i in range(self.trainer.cfg.data.num_classes):
             self.trainer.logger.info(
-                "Class_{idx}-{name} Result: iou/accuracy {iou:.4f}/{accuracy:.4f}".format(
-                    idx=i,
-                    name=self.trainer.cfg.data.names[i],
-                    iou=iou_class[i],
-                    accuracy=acc_class[i],
+                "  Class {:2d} - {:<{w}} | IoU {:.4f}  Prec {:.4f}  Recall {:.4f}  F1 {:.4f}".format(
+                    i, names[i], iou_class[i], precision_class[i], acc_class[i], f1_class[i],
+                    w=max_name_len,
                 )
             )
         current_epoch = self.trainer.epoch + 1
@@ -211,7 +213,7 @@ class SemSegEvaluator(HookBase):
             self.trainer.storage.put_scalar("val_loss", loss.item())
             # Log only every log_interval iterations (always log the last one)
             if (i + 1) % self.log_interval == 0 or (i + 1) == len(self.trainer.val_loader):
-                info = "Test: [{iter}/{max_iter}] ".format(
+                info = "Val: [{iter}/{max_iter}] ".format(
                     iter=i + 1, max_iter=len(self.trainer.val_loader)
                 )
                 if "origin_coord" in input_dict.keys():
@@ -235,17 +237,19 @@ class SemSegEvaluator(HookBase):
         m_acc = np.mean(acc_class)
         all_acc = sum(intersection) / (sum(target) + 1e-10)
         self.trainer.logger.info(
-            "Val result: mIoU/mAcc/allAcc {:.4f}/{:.4f}/{:.4f}.".format(
+            "Val result:  mIoU {:.4f}  mAcc {:.4f}  OA {:.4f}".format(
                 m_iou, m_acc, all_acc
             )
         )
+        names = self.trainer.cfg.data.names
+        precision_class = intersection / (intersection + np.maximum(union - target, 0) + 1e-10)
+        f1_class = 2 * precision_class * acc_class / (precision_class + acc_class + 1e-10)
+        max_name_len = max(len(n) for n in names)
         for i in range(self.trainer.cfg.data.num_classes):
             self.trainer.logger.info(
-                "Class_{idx}-{name} Result: iou/accuracy {iou:.4f}/{accuracy:.4f}".format(
-                    idx=i,
-                    name=self.trainer.cfg.data.names[i],
-                    iou=iou_class[i],
-                    accuracy=acc_class[i],
+                "  Class {:2d} - {:<{w}} | IoU {:.4f}  Prec {:.4f}  Recall {:.4f}  F1 {:.4f}".format(
+                    i, names[i], iou_class[i], precision_class[i], acc_class[i], f1_class[i],
+                    w=max_name_len,
                 )
             )
         current_epoch = self.trainer.epoch + 1
@@ -364,7 +368,7 @@ class RegressionEvaluator(HookBase):
                 self.trainer.val_loader
             ):
                 self.trainer.logger.info(
-                    "Test: [{iter}/{max_iter}] Loss {loss:.4f}".format(
+                    "Val: [{iter}/{max_iter}] Loss {loss:.4f}".format(
                         iter=i + 1,
                         max_iter=len(self.trainer.val_loader),
                         loss=loss.item(),
@@ -534,7 +538,7 @@ class SemSegRegressionEvaluator(HookBase):
                 self.trainer.val_loader
             ):
                 self.trainer.logger.info(
-                    "Test: [{iter}/{max_iter}] Loss {loss:.4f}".format(
+                    "Val: [{iter}/{max_iter}] Loss {loss:.4f}".format(
                         iter=i + 1,
                         max_iter=len(self.trainer.val_loader),
                         loss=loss.item(),
@@ -577,18 +581,20 @@ class SemSegRegressionEvaluator(HookBase):
 
         # ---- logging ----
         self.trainer.logger.info(
-            "Val result: mIoU/mAcc/allAcc {:.4f}/{:.4f}/{:.4f} "
-            "| MAE {:.6f} | RMSE {:.6f} | R² {:.6f}".format(
+            "Val result:  mIoU {:.4f}  mAcc {:.4f}  OA {:.4f}"
+            "  | MAE {:.6f} | RMSE {:.6f} | R² {:.6f}".format(
                 m_iou, m_acc, all_acc, mae, rmse, r2
             )
         )
+        names = self.trainer.cfg.data.names
+        precision_class = intersection / (intersection + np.maximum(union - target_seg, 0) + 1e-10)
+        f1_class = 2 * precision_class * acc_class / (precision_class + acc_class + 1e-10)
+        max_name_len = max(len(n) for n in names)
         for i in range(self.trainer.cfg.data.num_classes):
             self.trainer.logger.info(
-                "Class_{idx}-{name} Result: iou/accuracy {iou:.4f}/{accuracy:.4f}".format(
-                    idx=i,
-                    name=self.trainer.cfg.data.names[i],
-                    iou=iou_class[i],
-                    accuracy=acc_class[i],
+                "  Class {:2d} - {:<{w}} | IoU {:.4f}  Prec {:.4f}  Recall {:.4f}  F1 {:.4f}".format(
+                    i, names[i], iou_class[i], precision_class[i], acc_class[i], f1_class[i],
+                    w=max_name_len,
                 )
             )
 

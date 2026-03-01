@@ -5,7 +5,7 @@ train_data_dir = r"E:\data\DALES\dales_las\tile\train"
 val_data_dir = r"E:\data\DALES\dales_las\tile\test"
 test_data_dir = r"E:\data\DALES\dales_las\tile\test"
 pred_save_dir = r"E:\data\DALES\dales_las\tile\pred"
-save_path = "exp/dales/semseg-pt-v2m4-0-base"
+save_path = "exp/dales/semseg-pt-v2m4-1-base"
 
 # -------------------------------------------------------
 # 1. General settings
@@ -31,8 +31,8 @@ in_channels = 5
 # -------------------------------------------------------
 # 2. Checkpoint / run control
 # -------------------------------------------------------
-weight = None       # path to pretrained / fine-tune weight
-resume = False      # resume from the latest checkpoint
+weight = "exp/dales/semseg-pt-v2m4-1-base/model/model_last.pth"   # path to pretrained / fine-tune weight
+resume = True      # resume from the latest checkpoint
 evaluate = True     # run evaluation after each training epoch
 test_only = False   # skip training, run test only
 seed = 42           # fixed seed (None = auto-random, value is logged)
@@ -40,17 +40,17 @@ seed = 42           # fixed seed (None = auto-random, value is logged)
 # -------------------------------------------------------
 # 3. Resource & batch settings
 # -------------------------------------------------------
-batch_size_train = 2       # total across all GPUs
-batch_size_val = 2         # None → auto 1 per GPU
+batch_size_train = 6       # effective batch = micro_batch × gradient_accumulation_steps
+                           #   micro_batch = batch_size_train // gradient_accumulation_steps
+batch_size_val = 3         # None → auto 1 per GPU (no gradient → less memory than train)
 batch_size_test = 2        # None → auto 1 per GPU; >1 = fragments per forward in SemSegTester
-num_worker = 8             # total dataloader workers across all GPUs
-gradient_accumulation_steps = 2
+num_worker = 0            # total dataloader workers across all GPUs
+gradient_accumulation_steps = 2  # effective batch = 2, micro_batch per step = 3
 
 # -------------------------------------------------------
 # 4. Training loop
 # -------------------------------------------------------
-epoch = 2        # total epochs
-eval_epoch = epoch    # evaluate & save checkpoint every N epochs
+epoch = 10        # total epochs; val runs after every epoch
 clip_grad = None    # gradient clipping (None = disabled)
 
 # -------------------------------------------------------
@@ -129,7 +129,7 @@ hooks = [
     dict(type="ModelHook"),
     dict(type="IterationTimer", warmup_iter=2),
     dict(type="InformationWriter", interval=10),
-    dict(type="CacheCleaner", time_multiplier=5),
+    dict(type="CacheCleaner", time_multiplier=5, step_clean_interval=100),
     dict(type="SemSegEvaluator",log_interval=10),
     dict(type="CheckpointSaver", save_freq=None),
     dict(type="PreciseEvaluator", test_last=False),
@@ -159,7 +159,7 @@ data = dict(
         weight_sample=0.2,             # Use 20% of data for weight computation
         weighted_sampler=True,         # Enable WeightedRandomSampler
         test_mode=False,
-        loop=1,
+        loop=5,
         # Data augmentation
         transform=[
             dict(type="ZPercentileCenterShift", percentile=2.0),
@@ -193,7 +193,7 @@ data = dict(
         remap_class=True,
         ignore_index=ignore_index,
         test_mode=False,
-        loop=1,  # Validation doesn't need loop
+        loop=5,  # Validation doesn't need loop
         # Validation uses minimal transforms (no random augmentation for deterministic eval)
         transform=[
             dict(type="ZPercentileCenterShift", percentile=2.0),
