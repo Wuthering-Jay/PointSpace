@@ -54,6 +54,7 @@ class LasDataset(DefaultDataset):
         "intensity",
         "echo",  # Combined first/last return info (2D: is_first, is_last)
         "hag",  # Height above ground
+        "z_base", # Z_base height
         "segment",
         "instance",
     ]
@@ -602,6 +603,21 @@ class LasDataset(DefaultDataset):
                         data_dict["hag"] = hag
                     except (AttributeError, KeyError):
                         pass  # HAG not available
+
+            # Extract Z_base height if available (another common extra dimension)
+            if "z_base" in las.point_format.dimension_names:
+                try:
+                    zbase = np.array(las.zbase, dtype=np.float32).reshape(-1, 1)
+                    data_dict["z_base"] = zbase
+                    data_dict["z_delta"] = data_dict["coord"][:, 2:3] - zbase
+                except (AttributeError, KeyError):
+                    # Fallback: try dictionary-style access
+                    try:
+                        zbase = np.array(las["z_base"], dtype=np.float32).reshape(-1, 1)
+                        data_dict["z_base"] = zbase
+                        data_dict["z_delta"] = data_dict["coord"][:, 2:3] - zbase
+                    except (AttributeError, KeyError):
+                        pass  # Z_base not available
 
         except Exception as e:
             logger = get_root_logger()

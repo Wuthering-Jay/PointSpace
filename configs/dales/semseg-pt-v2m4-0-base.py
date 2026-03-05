@@ -5,7 +5,7 @@ train_data_dir = r"E:\data\DALES\dales_las\tile\train"
 val_data_dir = r"E:\data\DALES\dales_las\tile\test"
 test_data_dir = r"E:\data\DALES\dales_las\tile\test"
 pred_save_dir = r"E:\data\DALES\dales_las\tile\pred"
-save_path = "exp/dales/semseg-pt-v2m4-1-base"
+save_path = "exp/dales/semseg-pt-v2m4-2-base"
 
 # -------------------------------------------------------
 # 1. General settings
@@ -31,7 +31,8 @@ in_channels = 5
 # -------------------------------------------------------
 # 2. Checkpoint / run control
 # -------------------------------------------------------
-weight = "exp/dales/semseg-pt-v2m4-1-base/model/model_last.pth"   # path to pretrained / fine-tune weight
+weight = "exp/dales/semseg-pt-v2m4-2-base/model/model_last.pth"   # path to pretrained / fine-tune weight
+# weight = None
 resume = True      # resume from the latest checkpoint
 evaluate = True     # run evaluation after each training epoch
 test_only = False   # skip training, run test only
@@ -42,7 +43,7 @@ seed = 42           # fixed seed (None = auto-random, value is logged)
 # -------------------------------------------------------
 batch_size_train = 6       # effective batch = micro_batch × gradient_accumulation_steps
                            #   micro_batch = batch_size_train // gradient_accumulation_steps
-batch_size_val = 3         # None → auto 1 per GPU (no gradient → less memory than train)
+batch_size_val = 4         # None → auto 1 per GPU (no gradient → less memory than train)
 batch_size_test = 2        # None → auto 1 per GPU; >1 = fragments per forward in SemSegTester
 num_worker = 0            # total dataloader workers across all GPUs
 gradient_accumulation_steps = 2  # effective batch = 2, micro_batch per step = 3
@@ -83,19 +84,19 @@ model = dict(
         patch_embed_channels=24,
         patch_embed_groups=6,
         patch_embed_neighbours=24,
-        enc_depths=(2, 2, 2, 2),
-        enc_channels=(48, 96, 192, 256),
-        enc_groups=(6, 12, 24, 32),
-        enc_neighbours=(32, 32, 32, 32),
-        dec_depths=(1, 1, 1, 1),
-        dec_channels=(24, 48, 96, 192),
-        dec_groups=(4, 6, 12, 24),
-        dec_neighbours=(32, 32, 32, 32),
+        enc_depths=(2, 2, 2),
+        enc_channels=(48, 96, 192),
+        enc_groups=(6, 12, 24),
+        enc_neighbours=(32, 32, 32),
+        dec_depths=(1, 1, 1),
+        dec_channels=(24, 48, 96),
+        dec_groups=(4, 6, 12),
+        dec_neighbours=(32, 32, 32),
         grid_sizes=(
             3 * grid_size,
             7.5 * grid_size,
             18.75 * grid_size,
-            45.875 * grid_size,
+            # 45.875 * grid_size,
         ),  # x3, x2.5, x2.5, x2.5
         attn_qkv_bias=True,
         pe_multiplier=False,
@@ -180,7 +181,7 @@ data = dict(
             dict(type="ToTensor"),
             dict(
                 type="Collect",
-                keys=["coord", "segment"],  # 只需要coord和segment
+                keys=["coord", "segment","hag"],  # 只需要coord和segment
                 feat_keys=feature_keys,
             ),
         ],
@@ -214,7 +215,7 @@ data = dict(
             dict(type="ToTensor"),
             dict(
                 type="Collect",
-                keys=["coord", "segment"],  # 只需要coord和segment
+                keys=["coord", "segment","hag"],  # 只需要coord和segment
                 feat_keys=feature_keys,
             ),
         ],
@@ -254,7 +255,7 @@ data = dict(
             dict(type="ToTensor"),
             dict(
                 type="Collect",
-                keys=["coord", "index"],
+                keys=["coord", "index","hag"],
                 feat_keys=feature_keys,
             ),
         ],

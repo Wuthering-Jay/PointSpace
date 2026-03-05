@@ -32,6 +32,7 @@ def index_operator(data_dict, index, duplicate=False):
             "superpoint",
             "intensity",
             "hag",
+            "z_base",
             "echo",
             "segment",
             "instance",

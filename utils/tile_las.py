@@ -8,6 +8,7 @@ LAS/LAZ Tile Processor (Simple Version)
 - 支持 LAS 1.0 ~ 1.4 多种格式
 - 保留坐标系和头文件信息（VLRs）
 - HAG (Height Above Ground) 计算：基于 IDW 插值
+- Z_base 计算：提取宏观物理地面基准面，专为深度学习（隐式地形重建）设计
 """
 
 import numpy as np
@@ -21,6 +22,8 @@ from sklearn.neighbors import KDTree
 from scipy.spatial import cKDTree
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
+import CSF
+from scipy.interpolate import NearestNDInterpolator
 
 # Try to import pointspace logger, fallback to standard logging
 try:
@@ -50,12 +53,16 @@ class LASTileProcessor:
         max_points: 最大点数阈值，超过此值的块会被递归切分
         save_orig_idx: 是否保存原始点索引
         output_format: 输出格式 'las' 或 'laz'
+
         calc_hag: 是否计算 HAG (Height Above Ground)
         hag_ground_class: 地面点的分类 ID（默认 2，ASPRS 标准）
         hag_on_source: True=在原始点云上计算HAG（避免边界效应），
                        False=在分割后的每个tile上计算（节省内存）
         hag_k_neighbors: IDW 插值使用的邻近地面点数量（默认 12）
         hag_power: IDW 插值的幂次（默认 2，即反距离平方）
+        
+        calc_z_base: 是否利用 CSF 计算深度学习基准面 (Z_base)
+        z_base_on_source: 是否在源点云上全局计算基准面（强烈建议 True，消除块间断层）
     """
     
     def __init__(
@@ -69,11 +76,21 @@ class LASTileProcessor:
         max_points: Optional[int] = None,
         save_orig_idx: bool = True,
         output_format: str = 'las',
+        
         calc_hag: bool = False,
         hag_ground_class: int = 2,
         hag_on_source: bool = True,
         hag_k_neighbors: int = 12,
         hag_power: float = 2.0,
+
+        calc_z_base: bool = False,
+        z_base_on_source: bool = True,
+        z_base_denoise_radius: float = 2.0,
+        z_base_denoise_elev_diff: float = 2.0,
+        z_base_ptd_radius: float = 15.0,
+        z_base_ptd_slope: float = 15.0,
+        z_base_ptd_height: float = 0.25,
+        z_base_ptd_slope_norm: bool = True,
     ):
         self.input_path = Path(input_path)
         self.output_dir = Path(output_dir) if output_dir else self.input_path.parent / 'tiles'
@@ -92,6 +109,16 @@ class LASTileProcessor:
         self.hag_k_neighbors = hag_k_neighbors
         self.hag_power = hag_power
         
+        # Z_base 参数
+        self.calc_z_base = calc_z_base
+        self.z_base_on_source = z_base_on_source
+        self.z_base_denoise_radius = z_base_denoise_radius
+        self.z_base_denoise_elev_diff = z_base_denoise_elev_diff
+        self.z_base_ptd_radius = z_base_ptd_radius
+        self.z_base_ptd_slope = z_base_ptd_slope
+        self.z_base_ptd_height = z_base_ptd_height
+        self.z_base_ptd_slope_norm = z_base_ptd_slope_norm
+
         self.logger = get_root_logger()
         
         if not self.output_dir.exists():
@@ -129,6 +156,9 @@ class LASTileProcessor:
         if self.calc_hag:
             mode = 'source' if self.hag_on_source else 'tile'
             self.logger.info(f"  HAG: enabled (ground_class={self.hag_ground_class}, k={self.hag_k_neighbors}, mode={mode})")
+        if self.calc_z_base:
+            mode = 'source' if self.z_base_on_source else 'tile'
+            self.logger.info(f"  Z_base: enabled (denoise_radius={self.z_base_denoise_radius}m, ptd_radius={self.z_base_ptd_radius}m, mode={mode})")
         
         for idx, las_file in enumerate(self.las_files, 1):
             try:
@@ -156,7 +186,7 @@ class LASTileProcessor:
         # 获取坐标
         points = np.vstack((las_data.x, las_data.y, las_data.z)).transpose()
         
-        # 2. 在原始点云上计算 HAG（如果启用且选择 source 模式）
+        # 2.1 在原始点云上计算 HAG（如果启用且选择 source 模式）
         source_hag = None
         if self.calc_hag and self.hag_on_source:
             self.logger.info(f"  Computing HAG on source point cloud...")
@@ -164,6 +194,14 @@ class LASTileProcessor:
             classification = np.array(las_data.classification)
             source_hag = self._compute_hag(points, classification)
             self.logger.info(f"  HAG computed in {time.time() - hag_start:.2f}s")
+
+        # 2.2 在原始点云上计算 Z_base（如果启用且选择 source 模式）
+        source_z_base = None
+        if self.calc_z_base and self.z_base_on_source:
+            self.logger.info(f"  Computing Z_base on source point cloud...")
+            z_base_start = time.time()
+            source_z_base = self._compute_z_base(points)
+            self.logger.info(f"  Z_base computed in {time.time() - z_base_start:.2f}s")
         
         # 3. 滑动窗口切块 (获取索引列表)
         segments_indices, stats_list = self._segment_point_cloud(points, n_workers=n_workers)
@@ -176,7 +214,7 @@ class LASTileProcessor:
             self.logger.info(f"  Generated {total_segs} tiles")
         
         # 4. 保存分块
-        self._save_tiles(las_file, las_data, segments_indices, points, source_hag)
+        self._save_tiles(las_file, las_data, segments_indices, points, source_hag, source_z_base)
         
         elapsed = time.time() - file_start
         self.logger.info(f"  Completed in {elapsed:.2f}s")
@@ -438,9 +476,119 @@ class LASTileProcessor:
         # 注意：保留负值，地下噪点会有 HAG < 0，便于识别和过滤
         
         return hag
+    
+    def _compute_z_base(self, points: np.ndarray, source_las_path: Path = None) -> np.ndarray:
+        """
+        利用 WhiteboxTools (去噪 + PTD) 计算全局地形底座 (Z_base)
+        
+        Args:
+            points: [N, 3] 内存中的点云坐标 (用于最终映射 Z_base)
+            source_las_path: 如果是在全局计算，传入原始文件路径以避免重复写文件
+        """
+        try:
+            import whitebox
+            from scipy.interpolate import LinearNDInterpolator, NearestNDInterpolator
+            import tempfile
+            import os
+        except ImportError:
+            raise ImportError("Please install whitebox and scipy (pip install whitebox scipy)")
+            
+        start_time = time.time()
+        self.logger.info("    Computing Z_base using WhiteboxTools (Denoise + PTD)...")
+        
+        # 1. 初始化并静音 WBT
+        wbt = whitebox.WhiteboxTools()
+        wbt.set_verbose_mode(False)  # [关键] 彻底屏蔽所有终端输出
+        
+        # 2. 使用安全的临时文件夹沙箱 (随用随删，不留垃圾)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            wbt.set_working_dir(temp_dir)
+            
+            # 确定输入文件：如果有源文件直接用，没有就把 numpy 写入临时 las
+            if source_las_path is not None and source_las_path.exists():
+                input_las = str(source_las_path)
+            else:
+                input_las = os.path.join(temp_dir, "temp_in.las")
+                # 将内存中的 points 临时写入 las (针对 z_base_on_source=False 的后备方案)
+                header = laspy.LasHeader(point_format=3, version="1.2")
+                header.offsets = np.min(points, axis=0)
+                header.scales = np.array([0.001, 0.001, 0.001])
+                temp_las = laspy.LasData(header)
+                temp_las.x, temp_las.y, temp_las.z = points[:, 0], points[:, 1], points[:, 2]
+                temp_las.write(input_las)
+                
+            clean_las = os.path.join(temp_dir, "temp_clean.las")
+            ground_las = os.path.join(temp_dir, "temp_ground.las")
+            
+            # ================= 执行 WBT 算法链 =================
+            # A. 孤立噪声点剔除
+            wbt.lidar_remove_outliers(
+                input_las, 
+                clean_las, 
+                radius=self.z_base_denoise_radius,
+                elev_diff=self.z_base_denoise_elev_diff,    
+                use_median=True
+            )
+            
+            if not os.path.exists(clean_las):
+                self.logger.warning("    WBT Denoise failed! Falling back to global Z-min.")
+                return np.full(len(points), points[:, 2].min(), dtype=np.float32)
+                
+            # B. PTD 地面滤波 (参数根据你的设定)
+            wbt.lidar_ground_point_filter(
+                clean_las,
+                ground_las,
+                radius=self.z_base_ptd_radius,
+                min_neighbours=0,
+                slope_threshold=self.z_base_ptd_slope,
+                height_threshold=self.z_base_ptd_height,
+                classify=True,          # 必须为 True，将地面点分类为 2
+                slope_norm=self.z_base_ptd_slope_norm,
+                height_above_ground=False
+            )
+            # ==================================================
+            
+            if not os.path.exists(ground_las):
+                self.logger.warning("    WBT Ground Filter failed! Falling back to global Z-min.")
+                return np.full(len(points), points[:, 2].min(), dtype=np.float32)
+
+            # 3. 读取 WBT 提取的地面点
+            with laspy.open(ground_las) as fh:
+                g_las = fh.read()
+                # 提取分类为 2 (Ground) 的点
+                ground_mask = g_las.classification == 2
+                raw_ground_points = np.vstack((g_las.x[ground_mask], g_las.y[ground_mask], g_las.z[ground_mask])).T
+
+        # <--- 离开 with 块后，temp_dir 中的所有中间 .las 文件已被 Python 自动删除！--->
+
+        if len(raw_ground_points) < 3:
+            self.logger.warning("    Too few ground points found by WBT, using global Z-min.")
+            return np.full(len(points), points[:, 2].min(), dtype=np.float32)
+
+        # 4. 骨架降采样 (保留这一步，能成倍加速 KD-Tree 构建并过滤密集噪声)
+        grid_size = 2.0
+        xy_grid = np.floor(raw_ground_points[:, :2] / grid_size).astype(np.int32)
+        _, unique_indices = np.unique(xy_grid, axis=0, return_index=True)
+        skeleton_points = raw_ground_points[unique_indices]
+        
+        skeleton_xy = skeleton_points[:, :2]
+        skeleton_z = skeleton_points[:, 2]
+
+        self.logger.info(f"    Building Nearest Neighbor surface from {len(skeleton_points):,} skeleton points...")
+
+        from scipy.interpolate import NearestNDInterpolator
+
+        # 5. 极速最近邻插值 (直接生成全覆盖的连续基准面，自带外推，无 NaN)
+        nearest_interp = NearestNDInterpolator(skeleton_xy, skeleton_z)
+        z_base = nearest_interp(points[:, :2])
+
+        # ==========================================================
+
+        self.logger.info(f"    Z_base computed in {time.time() - start_time:.2f}s")
+        return z_base.astype(np.float32)
 
     def _save_tiles(self, las_file: Path, las_data: laspy.LasData, segments: List[np.ndarray],
-                    points: np.ndarray = None, source_hag: np.ndarray = None):
+                    points: np.ndarray = None, source_hag: np.ndarray = None, source_z_base: np.ndarray = None):
         """
         保存分块为 LAS/LAZ 文件
         
@@ -450,6 +598,7 @@ class LASTileProcessor:
             segments: 分块索引列表
             points: 点云坐标 (N, 3)，用于 tile 模式计算 HAG
             source_hag: 在源点云上预计算的 HAG 值（source 模式）
+            source_z_base: 在源点云上预计算的 Z_base 值（source 模式）
         """
         base_name = las_file.stem
         ext = f".{self.output_format}"
@@ -465,6 +614,7 @@ class LASTileProcessor:
         
         # 判断是否需要添加 HAG 字段
         need_hag = self.calc_hag
+        need_z_base = self.calc_z_base
         
         for i, indices in enumerate(tqdm(segments, desc="  Saving tiles", leave=False)):
             if len(indices) == 0:
@@ -502,6 +652,14 @@ class LASTileProcessor:
                     type=np.float32,
                     description="Height Above Ground"
                 ))
+
+            # 注意：如果 calc_z_base 也启用，可以在这里添加 z_base 字段，类似于 hag 的处理
+            if need_z_base and 'z_base' not in existing_names:
+                header.add_extra_dim(laspy.ExtraBytesParams(
+                    name="z_base",
+                    type=np.float32,
+                    description="CSF Macro Base Surface"
+                ))
             
             # 创建新的 LAS 数据
             new_las = laspy.LasData(header)
@@ -511,7 +669,7 @@ class LASTileProcessor:
             
             # 复制所有维度（除了我们要单独处理的）
             for dim_name in source_points.array.dtype.names:
-                if dim_name in ['orig_idx', 'hag']:
+                if dim_name in ['orig_idx', 'hag', 'z_base']:
                     continue  # 跳过，后面单独写入
                 if dim_name in new_las.points.array.dtype.names:
                     new_las.points[dim_name] = source_points[dim_name]
@@ -524,14 +682,21 @@ class LASTileProcessor:
             if need_hag:
                 if source_hag is not None:
                     # source 模式：使用预计算的 HAG
-                    tile_hag = source_hag[indices]
+                    tile_hag = source_hag[indices].astype(np.float32)
                 else:
                     # tile 模式：在每个 tile 上单独计算 HAG
                     tile_points = points[indices]
                     tile_classification = np.array(source_points['classification'])
                     tile_hag = self._compute_hag(tile_points, tile_classification)
-                
                 new_las.hag = tile_hag.astype(np.float32)
+
+            if need_z_base:
+                if self.z_base_on_source:
+                    tile_z_base = source_z_base[indices].astype(np.float32)
+                else:
+                    tile_points = points[indices]
+                    tile_z_base = self._compute_z_base(tile_points)
+                new_las.z_base = tile_z_base.astype(np.float32)
             
             # 更新头文件统计信息
             new_las.update_header()
@@ -546,12 +711,12 @@ class LASTileProcessor:
 if __name__ == "__main__":
     processor = LASTileProcessor(
         # 路径与格式配置
-        input_path=r"E:\data\DALES\dales_las\test",  # 原始数据路径
-        output_dir=r"E:\data\DALES\dales_las\tile\test", # 输出路径
+        input_path=r"E:\data\云南遥感中心\第二批\ground-only\disk03\train",  # 原始数据路径
+        output_dir=r"E:\data\云南遥感中心\第二批\ground-only\disk03\tile\train", # 输出路径
         output_format='las',          # 输出格式
 
         # 分块参数
-        window_size=(50.0, 50.0),   # 分块大小
+        window_size=(150.0, 150.0),   # 分块大小
         overlap=True,                 # 启用重叠
         overlap_factor=1,             # 重叠因子
         min_points=5000,              # 最小点数
@@ -564,5 +729,16 @@ if __name__ == "__main__":
         hag_on_source=True,           # 在原始点云计算（推荐，避免边界效应）
         hag_k_neighbors=12,           # IDW 插值邻居数
         hag_power=2.0,                # IDW 幂次（反距离平方）
+
+        # Z_base 参数
+        calc_z_base=True,             # 启用 Z_base 计算
+        z_base_on_source=True,         # 在原始点云计算（强烈建议，消除块间断层）
+        z_base_denoise_radius=2.0,    # 局部搜索半径(米)
+        z_base_denoise_elev_diff=2.0, # 判定为高空/地下噪声的高差阈值(米)
+        z_base_ptd_radius=5.0,       # 提取地面的最大搜索半径 (大型建筑多可设大至20-30)
+        z_base_ptd_slope=15.0,        # 坡度阈值 (山区可设大，如20-30；城市设小，如10)
+        z_base_ptd_height=0.25,       # 贴地精度阈值 (越小越贴地，但也容易漏掉微起伏)
+        z_base_ptd_slope_norm=True,   # 是否对坡度进行归一化（推荐，适应不同地形）
+
     )
     processor.process_all_files()
