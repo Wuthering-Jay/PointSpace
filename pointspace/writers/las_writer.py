@@ -45,6 +45,10 @@ class LASWriter(BaseWriter):
            （GPS time, Intensity, RGB, 回波, 自定义字段等），
            仅覆写/追加推理结果字段。
 
+           对于 **pred_coord（CNF 密网格输出）**，上述模式有所不同：
+           仅从源文件借用 scale、offset 和坐标系 VLR（GeoKey / WKT），
+           输出始终为标准 LAS 1.2 / point_format=0，以保证最大兼容性。
+
         2. **无源文件模式** (source_dir 为 None)：
            从零创建 LAS 文件，使用默认 point_format=2（含 RGB），
            point 坐标由传入的 coord 填充。
@@ -59,7 +63,13 @@ class LASWriter(BaseWriter):
     # 输出扩展名映射
     _EXT_MAP = {False: ".las", True: ".laz"}
 
-    def __init__(self, save_dir: str, source_dir: str = None, compressed: bool = False):
+    def __init__(
+        self,
+        save_dir: str,
+        source_dir: str = None,
+        compressed: bool = False,
+        classification: int = None,
+    ):
         super().__init__(save_dir)
         if laspy is None:
             raise ImportError(
@@ -67,6 +77,7 @@ class LASWriter(BaseWriter):
             )
         self.source_dir = source_dir
         self.compressed = compressed
+        self.classification = classification
         self._ext = self._EXT_MAP[compressed]
 
     # ------------------------------------------------------------------
@@ -84,11 +95,15 @@ class LASWriter(BaseWriter):
                 在有源文件模式 (source_dir) 下允许为 None，此时坐标
                 和点数从源文件获取。无源文件且 coord 为 None 时抛异常。
             **kwargs: 推理结果字段，支持:
+                pred_coord (np.ndarray): CNF 预测坐标 (Q, 3)。当提供时
+                    忽略 coord 和源文件，直接从 pred_coord 创建新 LAS。
                 pred_sem (np.ndarray): 语义分割标签 (N,)
                 pred_ins (np.ndarray): 实例分割 ID (N,)
                 pred_panoptic (np.ndarray): 全景分割标签（预留）
                 pred_bbox (np.ndarray): 3D 检测框（预留）
                 pred_reg (np.ndarray): 回归值（预留）
+                slope (np.ndarray): CNF 地形坡度 (Q,)
+                curvature (np.ndarray): CNF 地形曲率 (Q,)
                 color (np.ndarray): RGB 颜色 (N, 3)（仅无源文件模式使用）
                 extra_dims (dict): 额外自定义维度 {name: (np.ndarray, dtype_str)}
 
@@ -100,6 +115,26 @@ class LASWriter(BaseWriter):
                 或无源文件且 coord 为 None 时。
         """
         out_path = os.path.join(self.save_dir, f"{data_name}{self._ext}")
+
+        # ---------- pred_coord shortcut (CNF dense-grid output) ----------
+        pred_coord = kwargs.pop("pred_coord", None)
+        if pred_coord is not None:
+            pred_coord = np.asarray(pred_coord, dtype=np.float64)
+            # Borrow CRS / scale / offset from source file when source_dir is set
+            src_las = (
+                self._try_load_source(data_name)
+                if self.source_dir is not None
+                else None
+            )
+            if src_las is not None:
+                las = self._create_from_source_header(src_las, pred_coord, **kwargs)
+            else:
+                las = self._create_new(pred_coord, **kwargs)
+            n_points = len(las.points)
+            self._apply_predictions(las, n_points, **kwargs)
+            las.write(out_path)
+            logger.info(f"LASWriter: 已保存 {n_points} 个点 (pred_coord) -> {out_path}")
+            return out_path
 
         # ---------- 获取 LAS 对象（有源 / 无源两种路径） ----------
         las = self._load_or_create(data_name, coord, **kwargs)
@@ -174,6 +209,45 @@ class LASWriter(BaseWriter):
                     )
         return None
 
+    def _create_from_source_header(
+        self, src_las: "laspy.LasData", coord: np.ndarray, **kwargs
+    ) -> "laspy.LasData":
+        """
+        创建标准新 LAS 1.2 / point_format=0 文件，仅从源文件借用：
+        - scale / offset（精度/基准）
+        - 坐标系 VLR（GeoKeyDirectory、GeoDoubleParams、GeoAsciiParams、WKT OGC CRS）
+
+        其他源文件头信息一律不复制，以保证最大的软件兼容性。
+        """
+        src_hdr = src_las.header
+
+        # 始终使用 point_format=0 + version=1.2，确保软件兼容性
+        new_header = laspy.LasHeader(point_format=0, version="1.2")
+
+        # 1. 借用 scale & offset（坐标精度 / 平移基准）
+        new_header.scales = np.asarray(src_hdr.scales, dtype=np.float64)
+        new_header.offsets = np.asarray(src_hdr.offsets, dtype=np.float64)
+
+        # 2. 仅复制 CRS 相关的 VLR（按 user_id / record_id 过滤）
+        #    GeoTIFF keys:  user_id="LASF_Projection", record_id in (34735,34736,34737)
+        #    OGC WKT:       user_id="LASF_Projection", record_id=2112
+        CRS_RECORD_IDS = {34735, 34736, 34737, 2112}
+        crs_vlrs = [
+            v for v in src_hdr.vlrs
+            if getattr(v, "user_id", "").strip().upper() == "LASF_PROJECTION"
+            and getattr(v, "record_id", -1) in CRS_RECORD_IDS
+        ]
+        if crs_vlrs:
+            new_header.vlrs = crs_vlrs
+
+        las = laspy.LasData(new_header)
+        coord = np.asarray(coord, dtype=np.float64)
+        las.x = coord[:, 0]
+        las.y = coord[:, 1]
+        las.z = coord[:, 2]
+
+        return las
+
     def _create_new(self, coord: np.ndarray, **kwargs) -> "laspy.LasData":
         """
         从零创建 LAS 文件（无源文件模式）。
@@ -234,6 +308,14 @@ class LASWriter(BaseWriter):
             logger.debug(
                 f"  -> classification 字段已写入 "
                 f"(unique labels: {np.unique(pred_sem).tolist()})"
+            )
+        elif self.classification is not None:
+            # 未传入 pred_sem 时，用 writer 配置的默认类别值填充所有点
+            las.classification = np.full(
+                n_points, self.classification, dtype=np.uint8
+            )
+            logger.debug(
+                f"  -> classification 字段已写入 (default: {self.classification})"
             )
 
         # ========== 实例分割 (Instance Segmentation) ==========
@@ -297,6 +379,27 @@ class LASWriter(BaseWriter):
                 raise ValueError(
                     f"pred_reg 维度不合法: ndim={pred_reg.ndim}, 期望 1 或 2"
                 )
+
+        # ========== CNF 地形派生属性 (Slope / Curvature) ==========
+        slope = kwargs.get("slope", None)
+        if slope is not None:
+            slope = np.asarray(slope, dtype=np.float64)
+            if slope.shape[0] != n_points:
+                raise ValueError(
+                    f"slope 长度 ({slope.shape[0]}) 与点数 ({n_points}) 不匹配"
+                )
+            self._add_extra_dim(las, "slope", slope, np.float64)
+            logger.debug("  -> slope 字段已写入")
+
+        curvature = kwargs.get("curvature", None)
+        if curvature is not None:
+            curvature = np.asarray(curvature, dtype=np.float64)
+            if curvature.shape[0] != n_points:
+                raise ValueError(
+                    f"curvature 长度 ({curvature.shape[0]}) 与点数 ({n_points}) 不匹配"
+                )
+            self._add_extra_dim(las, "curvature", curvature, np.float64)
+            logger.debug("  -> curvature 字段已写入")
 
         # ========== 通用自定义维度 (Extra Dimensions) ==========
         # 允许用户直接指定 {字段名: (数据数组, dtype)} 的字典来写入任意维度

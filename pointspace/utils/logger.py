@@ -70,6 +70,10 @@ def get_logger(name, log_file=None, log_level=logging.INFO, file_mode="a", color
     logger.propagate = False
 
     stream_handler = logging.StreamHandler()
+    # Force UTF-8 on the console stream so Chinese chars and other
+    # non-ASCII characters are not garbled on Windows GBK consoles.
+    if hasattr(stream_handler.stream, "reconfigure"):
+        stream_handler.stream.reconfigure(encoding="utf-8", errors="backslashreplace")
     handlers = [stream_handler]
 
     if dist.is_available() and dist.is_initialized():
@@ -82,7 +86,7 @@ def get_logger(name, log_file=None, log_level=logging.INFO, file_mode="a", color
         # Here, the default behaviour of the official logger is 'a'. Thus, we
         # provide an interface to change the file mode to the default
         # behaviour.
-        file_handler = logging.FileHandler(log_file, file_mode)
+        file_handler = logging.FileHandler(log_file, file_mode, encoding="utf-8")
         handlers.append(file_handler)
 
     plain_formatter = logging.Formatter(

@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch_scatter
 import torch_cluster
 from peft import LoraConfig, get_peft_model
@@ -535,3 +536,268 @@ class DefaultSemSegRegressor(nn.Module):
             return_dict["seg_logits"] = seg_logits
             return_dict["reg_pred"] = reg_pred
         return return_dict
+
+
+from .head import DualBranchCNFHead, SingleBranchCNFHead  # noqa: F401 — triggers MODELS registration
+
+
+@MODELS.register_module()
+class DefaultCNF(nn.Module):
+    """针对连续地形隐式重建 (Continuous DEM) 的默认网络包装器。
+
+    包含特征提取 Backbone 和双分支条件神经场 Head，
+    采用 Point 数据结构传递数据给 Backbone，与 Pointcept 生态一致。
+
+    Architecture:
+        1. **Backbone** encodes the support point cloud into per-point
+           feature vectors ``(N, C)`` via ``Point`` data structure.
+        2. **Head** (e.g. :class:`DualBranchCNFHead`) decodes
+           predictions for arbitrary *query* coordinates, returning
+           ``(pred_base, pred_detail)``.
+
+    Default loss (asymmetric dual-stream, with detach):
+        - loss_base:  SmoothL1(pred_base, query_gt_low, beta=1.0)
+        - loss_final: SmoothL1(pred_base.detach() + pred_detail, query_gt, beta=0.1)
+        - loss_reg:   L1 mean of pred_detail * reg_weight
+
+    Args:
+        backbone (dict | None): Backbone config (e.g. PT-v2m4).
+        head (dict | None): CNF head config (e.g. DualBranchCNFHead).
+        criteria (dict | None): Custom loss module. If provided,
+            ``compute_loss`` delegates to ``criteria(head_output,
+            input_dict)``.  Otherwise uses the built-in loss.
+        reg_weight (float): L1 regularization weight on the detail
+            branch (only used by the built-in dual-branch loss).
+        terrain_alpha (float): Terrain-complexity weighting coefficient.
+            ``weight = 1 + alpha * |query_gt - z_anchor|``.  Only used by
+            single-branch built-in loss.  Default 2.0.
+    """
+
+    def __init__(self, backbone=None, head=None, criteria=None,
+                 reg_weight=0.01, terrain_alpha=2.0, ohem_ratio=0.5):
+        super().__init__()
+        self.backbone = build_model(backbone) if backbone is not None else None
+        self.head = build_model(head) if head is not None else None
+        self.criteria = build_model(criteria) if criteria is not None else None
+        self.reg_weight = reg_weight
+        self.terrain_alpha = terrain_alpha
+        self.ohem_ratio = ohem_ratio
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+    def _run_backbone(self, input_dict):
+        """Run backbone with Point wrapping and unwind pooling hierarchy.
+
+        Returns:
+            tuple: (feat, coord) — (N, C) and (N, 3) tensors.
+        """
+        point = Point(input_dict)
+        point = self.backbone(point)
+
+        if isinstance(point, Point):
+            while "pooling_parent" in point.keys():
+                assert "pooling_inverse" in point.keys()
+                parent = point.pop("pooling_parent")
+                inverse = point.pop("pooling_inverse")
+                parent.feat = torch.cat(
+                    [parent.feat, point.feat[inverse]], dim=-1
+                )
+                point = parent
+            return point.feat, point.coord
+        else:
+            return point, input_dict["coord"]
+
+    # ------------------------------------------------------------------
+    # Public sub-methods (called by CnfTester)
+    # ------------------------------------------------------------------
+    def extract_feat(self, input_dict):
+        """[Inference] Run backbone only, return ``{feat, coord}``."""
+        feat, coord = self._run_backbone(input_dict)
+        return dict(feat=feat, coord=coord)
+
+    def query_forward(self, support_coord, support_feat, query_coord):
+        """[Inference] Run head only, return final prediction.
+
+        Used by :class:`CnfTester` for chunked dense queries.
+        Forces eval mode on the head so that single-branch returns a plain
+        tensor and dual-branch returns ``(pred_base, pred_detail)``.
+        """
+        was_training = self.head.training
+        self.head.eval()
+        result = self.head(
+            support_coord, support_feat, query_coord
+        )
+        if was_training:
+            self.head.train()
+        if isinstance(result, tuple):
+            # Dual-branch: base + detail
+            return result[0] + result[1]
+        return result
+
+    # ------------------------------------------------------------------
+    # Loss
+    # ------------------------------------------------------------------
+    def compute_loss(self, head_output, input_dict):
+        """Compute loss for both single-branch and dual-branch heads.
+
+        For single-branch heads (training), *head_output* is
+        ``(pred_z, local_z_anchor)``; the IDW anchor is used for
+        terrain-complexity adaptive weighting.
+        For dual-branch heads, *head_output* is ``(pred_base, pred_detail)``.
+
+        If ``self.criteria`` is set, delegates entirely to that module.
+        Otherwise uses the appropriate built-in loss.
+        """
+        if self.criteria is not None:
+            return self.criteria(head_output, input_dict)
+
+        # ---- Single-branch loss with terrain-complexity weighting ----
+        if isinstance(self.head, SingleBranchCNFHead):
+            if isinstance(head_output, tuple):
+                pred_z, local_z_anchor = head_output
+            else:
+                pred_z = head_output
+                local_z_anchor = None
+
+            query_gt = input_dict["query_gt"]
+            if query_gt.dim() == 1:
+                query_gt = query_gt.unsqueeze(-1)
+            pz = pred_z.unsqueeze(-1) if pred_z.dim() == 1 else pred_z
+
+            # ==========================================================
+            # 🌟 1. 基础 MAE 保底 (保细节、保锐利)
+            # ==========================================================
+            l1_error = torch.abs(pz - query_gt)
+            
+            # 结合您的地形复杂度加权 (如果有)
+            if local_z_anchor is not None:
+                with torch.no_grad():
+                    anchor = local_z_anchor.unsqueeze(-1) if local_z_anchor.dim() == 1 else local_z_anchor
+                    idw_error = torch.abs(query_gt - anchor)
+                    terrain_weight = torch.clamp(1.0 + self.terrain_alpha * idw_error, max=5.0)
+                weighted_l1 = l1_error * terrain_weight
+            else:
+                weighted_l1 = l1_error
+
+            # 之前的 OHEM (25%) 用于回传基础 L1
+            num_keep_25 = int(weighted_l1.shape[0] * self.ohem_ratio)
+            if num_keep_25 > 0:
+                loss_l1 = torch.mean(torch.topk(weighted_l1.view(-1), k=num_keep_25)[0])
+            else:
+                loss_l1 = torch.mean(weighted_l1)
+
+            # ==========================================================
+            # 🌟 2. 专杀 RMSE：辅助 MSE Loss
+            # 用 L2 的平方特性去压制大误差，但不给太大权重，防止把地形抹平
+            # ==========================================================
+            l2_error = (pz - query_gt) ** 2
+            # 为了防止平地的 0.1 米误差也被 L2 过度关注，我们只对 OHEM 选出的 25% 难点施加 L2
+            if num_keep_25 > 0:
+                loss_l2 = torch.mean(torch.topk(l2_error.view(-1), k=num_keep_25)[0])
+            else:
+                loss_l2 = torch.mean(l2_error)
+
+            # ==========================================================
+            # 🌟 3. 专杀 MaxE：极限 Top-1% 惩罚
+            # 专门盯着误差最离谱的那一小撮点，给予极端的 L1 惩罚
+            # ==========================================================
+            num_keep_1 = max(1, int(l1_error.shape[0] * 0.01)) # 前 1% 的点
+            loss_max_e = torch.mean(torch.topk(l1_error.view(-1), k=num_keep_1)[0])
+
+            # ==========================================================
+            # 🌟 4. 融合：按科学权重组装目标
+            # ==========================================================
+            # 权重设计哲学：
+            # 1.0 * loss_l1: 维持微观锐利，保证 MAE
+            # 0.5 * loss_l2: 压低 RMSE，消除中等偏大的误差
+            # 1.0 * loss_max_e: 像锤子一样砸平 30 米高的那几个 MaxE 刺头
+            loss_final = 1.0 *loss_l1 + 0.5 * loss_l2 + 1.0 * loss_max_e
+
+            monitor_mae = torch.mean(l1_error).detach()
+            monitor_rmse = torch.sqrt(torch.mean(l2_error)).detach()
+            monitor_maxe = torch.max(l1_error).detach()
+
+            return dict(
+                loss=loss_final,
+                loss_l1_ohem=loss_l1.detach(),
+                loss_l2=loss_l2.detach(),
+                loss_maxe_penalty=loss_max_e.detach(),
+                m_mae=monitor_mae,
+                m_rmse=monitor_rmse,  # 实时看 RMSE 有没有被压下去
+                m_maxe=monitor_maxe   # 实时看 MaxE 刺头还在不在
+            )
+
+        # ---- Dual-branch loss ----
+        pred_base, pred_detail = head_output
+        query_gt = input_dict["query_gt"]
+        query_gt_low = input_dict["query_gt_low"]
+
+        if query_gt.dim() == 1:
+            query_gt = query_gt.unsqueeze(-1)
+        if query_gt_low.dim() == 1:
+            query_gt_low = query_gt_low.unsqueeze(-1)
+        pb = pred_base.unsqueeze(-1) if pred_base.dim() == 1 else pred_base
+        pd = pred_detail.unsqueeze(-1) if pred_detail.dim() == 1 else pred_detail
+
+        loss_base = F.smooth_l1_loss(pb, query_gt_low, reduction="mean", beta=1.0)
+        loss_final = F.smooth_l1_loss(
+            pb.detach() + pd, query_gt, reduction="mean", beta=0.1,
+        )
+        loss_reg = torch.mean(torch.abs(pd)) * self.reg_weight
+
+        loss = loss_base + loss_final + loss_reg
+        return dict(
+            loss=loss,
+            loss_base=loss_base,
+            loss_final=loss_final,
+            loss_reg=loss_reg,
+        )
+
+    # ------------------------------------------------------------------
+    # Standard forward (used by DefaultTrainer.run_step)
+    # ------------------------------------------------------------------
+    def forward(self, input_dict):
+        """Standard forward for train / eval.
+
+        Train:
+            Returns ``dict(loss=..., loss_base=..., loss_final=...,
+            loss_reg=...)``.
+        Eval with query:
+            Returns ``dict(cnf_pred=..., loss=..., ...)``.
+        Eval without query:
+            Returns ``dict(support_feat=..., support_coord=...)``.
+        """
+        support_feat, support_coord = self._run_backbone(input_dict)
+
+        if self.training:
+            query_coord = input_dict["query_coord"]
+            head_output = self.head(
+                support_coord, support_feat, query_coord,
+                support_offset=input_dict.get("offset"),
+                query_offset=input_dict.get("query_offset"),
+            )
+            return self.compute_loss(head_output, input_dict)
+
+        # ---- Eval / Test ----
+        if "query_coord" in input_dict:
+            query_coord = input_dict["query_coord"]
+            head_output = self.head(
+                support_coord, support_feat, query_coord,
+                support_offset=input_dict.get("offset"),
+                query_offset=input_dict.get("query_offset"),
+            )
+            if isinstance(head_output, tuple):
+                pred_final = head_output[0] + head_output[1]
+            else:
+                pred_final = head_output
+            result = dict(cnf_pred=pred_final)
+
+            # Compute loss when GT available (validation)
+            has_gt = "query_gt" in input_dict
+            if has_gt:
+                loss_dict = self.compute_loss(head_output, input_dict)
+                result.update(loss_dict)
+            return result
+
+        # No query → return features for CnfTester
+        return dict(support_feat=support_feat, support_coord=support_coord)

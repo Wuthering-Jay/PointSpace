@@ -55,6 +55,7 @@ class LasDataset(DefaultDataset):
         "echo",  # Combined first/last return info (2D: is_first, is_last)
         "hag",  # Height above ground
         "z_base", # Z_base height
+        "normal",  # Normal vectors (normal_x, normal_y, normal_z extra dims)
         "segment",
         "instance",
     ]
@@ -129,7 +130,10 @@ class LasDataset(DefaultDataset):
 
         # Compute sample weights for WeightedRandomSampler (train only)
         if self.weighted_sampler and not test_mode:
-            self._compute_sample_weights()
+            if self.weighted_sampler == "terrain":
+                self._compute_terrain_sample_weights()
+            else:
+                self._compute_sample_weights()
     
     def _scan_classes(self):
         """
@@ -461,6 +465,118 @@ class LasDataset(DefaultDataset):
         for uc, c in zip(unique_counts, counts):
             logger.info(f"    {uc} classes: {c} samples ({c/n_samples*100:.1f}%)")
 
+    def _compute_terrain_sample_weights(self, cell_size=2.0):
+        """Compute per-tile sample weights based on terrain roughness.
+
+        For each LAS tile the method reads only XYZ, bins into a
+        ``cell_size``-metre grid, computes per-cell Z standard deviation,
+        and takes the **90th percentile** of those stds as the tile's
+        roughness score.  The 90th percentile captures how *extreme* the
+        roughness is without being dominated by a single noisy cell.
+
+        Higher roughness → higher weight → more frequent sampling.
+
+        Final weights are normalised so that ``sum = N`` (same convention as
+        :meth:`_compute_sample_weights`).
+
+        Args:
+            cell_size (float): Grid cell size in metres for roughness
+                estimation.  Default 2.0 m.
+        """
+        logger = get_root_logger()
+        logger.info("Computing terrain sample weights (roughness-based)...")
+
+        n_samples = len(self.data_list)
+        if n_samples == 0:
+            logger.warning("No files in data_list — skipping terrain weight computation")
+            self.sample_weights = None
+            return
+
+        roughness = np.zeros(n_samples, dtype=np.float64)
+        log_interval = max(1, n_samples // 10)
+
+        def _tile_roughness(idx):
+            """Return (idx, roughness_score) for one tile."""
+            data_path = self.data_list[idx]
+            try:
+                las = laspy.read(data_path)
+                x = np.asarray(las.x, dtype=np.float64)
+                y = np.asarray(las.y, dtype=np.float64)
+                z = np.asarray(las.z, dtype=np.float64)
+
+                if len(z) < 4:
+                    return idx, 0.0
+
+                # Grid bin
+                gx = ((x - x.min()) / cell_size).astype(np.int32)
+                gy = ((y - y.min()) / cell_size).astype(np.int32)
+                ncols = int(gx.max()) + 1
+                cell_id = gy * ncols + gx
+
+                # Per-cell Z std using bincount tricks
+                n_cells = int(cell_id.max()) + 1
+                cnt = np.bincount(cell_id, minlength=n_cells).astype(np.float64)
+                z_sum = np.bincount(cell_id, weights=z, minlength=n_cells)
+                z_sq = np.bincount(cell_id, weights=z * z, minlength=n_cells)
+
+                valid = cnt >= 3  # need ≥3 pts for meaningful std
+                if valid.sum() == 0:
+                    return idx, 0.0
+
+                mean = z_sum[valid] / cnt[valid]
+                var = z_sq[valid] / cnt[valid] - mean ** 2
+                var = np.clip(var, 0, None)  # numerical safety
+                std = np.sqrt(var)
+
+                # 90th percentile of cell stds
+                score = float(np.percentile(std, 90))
+                return idx, score
+            except Exception as e:
+                logger.warning(f"Failed to read {data_path}: {e}")
+                return idx, 0.0
+
+        # Parallel IO
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import os as _os
+        num_workers = min(8, _os.cpu_count() or 4)
+        logger.info(f"  Processing {n_samples} tiles with {num_workers} workers...")
+
+        with ThreadPoolExecutor(max_workers=num_workers) as pool:
+            futs = {pool.submit(_tile_roughness, i): i for i in range(n_samples)}
+            done = 0
+            for fut in as_completed(futs):
+                idx, score = fut.result()
+                roughness[idx] = score
+                done += 1
+                if done % log_interval == 0:
+                    logger.info(f"  Progress: {done}/{n_samples} ({done / n_samples * 100:.1f}%)")
+
+        # Convert roughness → weight: w = 1 + alpha * roughness
+        # alpha chosen so that tile with median roughness gets weight ~1,
+        # and the roughest tile gets weight ~5.
+        median_r = float(np.median(roughness[roughness > 0])) if (roughness > 0).any() else 1.0
+        alpha = 4.0 / (float(np.max(roughness)) - median_r + 1e-6) if float(np.max(roughness)) > median_r else 2.0
+        sample_weights = 1.0 + alpha * roughness
+
+        # Normalise so sum = n_samples
+        total = sample_weights.sum()
+        if total > 0:
+            sample_weights = sample_weights / total * n_samples
+
+        self.sample_weights = sample_weights
+
+        logger.info(f"  Roughness statistics (cell_size={cell_size}m):")
+        logger.info(f"    Min:  {roughness.min():.4f} m")
+        logger.info(f"    Max:  {roughness.max():.4f} m")
+        logger.info(f"    Mean: {roughness.mean():.4f} m")
+        logger.info(f"    P50:  {np.median(roughness):.4f} m")
+        logger.info(f"    P90:  {np.percentile(roughness, 90):.4f} m")
+        logger.info(f"  Sample weight statistics:")
+        logger.info(f"    Min:  {sample_weights.min():.4f}")
+        logger.info(f"    Max:  {sample_weights.max():.4f}")
+        logger.info(f"    Mean: {sample_weights.mean():.4f}")
+        logger.info(f"    Std:  {sample_weights.std():.4f}")
+
     def _map_classes(self, segment):
         """
         Map original class IDs to remapped IDs
@@ -607,7 +723,7 @@ class LasDataset(DefaultDataset):
             # Extract Z_base height if available (another common extra dimension)
             if "z_base" in las.point_format.dimension_names:
                 try:
-                    zbase = np.array(las.zbase, dtype=np.float32).reshape(-1, 1)
+                    zbase = np.array(las.z_base, dtype=np.float32).reshape(-1, 1)
                     data_dict["z_base"] = zbase
                     data_dict["z_delta"] = data_dict["coord"][:, 2:3] - zbase
                 except (AttributeError, KeyError):
@@ -618,6 +734,17 @@ class LasDataset(DefaultDataset):
                         data_dict["z_delta"] = data_dict["coord"][:, 2:3] - zbase
                     except (AttributeError, KeyError):
                         pass  # Z_base not available
+
+            # Extract normal vectors if available (stored as extra dims by tile_las.py)
+            dim_names = las.point_format.dimension_names
+            if "normal_x" in dim_names and "normal_y" in dim_names and "normal_z" in dim_names:
+                try:
+                    nx = np.array(las.normal_x, dtype=np.float32)
+                    ny = np.array(las.normal_y, dtype=np.float32)
+                    nz = np.array(las.normal_z, dtype=np.float32)
+                    data_dict["normal"] = np.stack((nx, ny, nz), axis=1)  # (N, 3)
+                except (AttributeError, KeyError):
+                    pass  # Normal vectors not available
 
         except Exception as e:
             logger = get_root_logger()
@@ -686,6 +813,8 @@ class LasDataset(DefaultDataset):
                 result_dict["origin_segment"] = transform_result[0].pop("origin_segment")
             if "inverse" in transform_result[0]:
                 result_dict["inverse"] = transform_result[0].pop("inverse")
+            if "coord_shift" in transform_result[0]:
+                result_dict["coord_shift"] = transform_result[0].pop("coord_shift")
             
             # Apply aug_transform and post_transform to each fragment
             fragment_list = []
@@ -709,6 +838,8 @@ class LasDataset(DefaultDataset):
                 result_dict["origin_segment"] = data_dict.pop("origin_segment")
             if "inverse" in data_dict:
                 result_dict["inverse"] = data_dict.pop("inverse")
+            if "coord_shift" in data_dict:
+                result_dict["coord_shift"] = data_dict.pop("coord_shift")
             # Pop regression target for the tester
             if target_key and target_key in data_dict:
                 result_dict["regression_target"] = data_dict.pop(target_key)

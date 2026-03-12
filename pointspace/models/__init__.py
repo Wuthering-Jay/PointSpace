@@ -2,6 +2,9 @@ from .builder import build_model
 from .default import DefaultSegmentor, DefaultClassifier, DefaultRegressor
 from .modules import PointModule, PointModel
 
+# Heads
+from .head import *
+
 # Backbones
 from .backbone import *
 

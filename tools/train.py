@@ -6,6 +6,12 @@ Please cite our work if the code is helpful to you.
 """
 import sys
 from pathlib import Path
+# Force UTF-8 output so Unicode chars (e.g. R^2, ², etc.) don't crash on
+# Windows consoles that default to a narrow encoding like GBK / cp936.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace")
 import argparse
 # Add project root to Python path
 project_root = Path(__file__).resolve().parent.parent
@@ -17,6 +23,7 @@ from pointspace.engines.defaults import (
     default_setup,
 )
 from pointspace.engines.train import TRAINERS
+from pointspace.engines.test import TESTERS
 from pointspace.engines.launch import launch
 from pointspace.utils.config import DictAction
 
@@ -25,7 +32,7 @@ def default_argument_parser(epilog=None):
         epilog=epilog,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--config-file", default=r"configs\dales\semseg-pt-v2m4-0-base.py", metavar="FILE", help="path to config file")
+    parser.add_argument("--config-file", default=r"configs\cnf\terrain-cnf-pt-v2m4-1-single.py", metavar="FILE", help="path to config file")
     parser.add_argument("--num-gpus", type=int, default=1, help="number of gpus *per machine*")
     parser.add_argument("--num-machines", type=int, default=1, help="total number of machines")
     parser.add_argument("--machine-rank", type=int, default=0, help="the rank of this machine (unique per machine)",)
@@ -41,6 +48,12 @@ def main_worker(cfg):
     cfg = default_setup(cfg)
     trainer = TRAINERS.build(dict(type=cfg.train.type, cfg=cfg))
     trainer.train()
+    # After training, run the test phase if a test config is present
+    # and test_only is not set (test_only would have skipped training entirely).
+    if hasattr(cfg, "test") and cfg.test is not None and not getattr(cfg, "test_only", False):
+        test_cfg = dict(cfg=cfg, **cfg.test)
+        tester = TESTERS.build(test_cfg)
+        tester.test()
 
 
 def main():

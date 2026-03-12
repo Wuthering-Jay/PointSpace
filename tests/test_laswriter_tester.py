@@ -508,5 +508,158 @@ class TestFullTesterSimulation(unittest.TestCase):
         self.assertTrue(os.path.isfile(out_path))
 
 
+# ===========================================================================
+#  8. CNF pred_coord + source_dir（借用头文件）
+# ===========================================================================
+
+
+@unittest.skipIf(not HAS_LASPY, "laspy not installed")
+class TestCNFPredCoordSourceHeader(unittest.TestCase):
+    """
+    验证 LASWriter 在收到 pred_coord 时能从 source_dir 借用
+    CRS/scale/offset，而点数及坐标全部来自 pred_coord。
+    """
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.source_dir = os.path.join(self.tmpdir, "source")
+        self.save_dir = os.path.join(self.tmpdir, "output")
+        os.makedirs(self.source_dir)
+
+        # 源文件：100 个点，特定 scale/offset 模拟真实 CRS
+        src_header = laspy.LasHeader(point_format=2, version="1.2")
+        src_header.scales = np.array([0.01, 0.01, 0.01])
+        src_header.offsets = np.array([500000.0, 4000000.0, 1000.0])
+        src_las = laspy.LasData(src_header)
+        np.random.seed(7)
+        src_xyz = np.random.rand(100, 3)
+        src_las.x = src_xyz[:, 0] + src_header.offsets[0]
+        src_las.y = src_xyz[:, 1] + src_header.offsets[1]
+        src_las.z = src_xyz[:, 2] + src_header.offsets[2]
+        self.src_path = os.path.join(self.source_dir, "tile_001.las")
+        src_las.write(self.src_path)
+
+        self.src_scales = src_header.scales.copy()
+        self.src_offsets = src_header.offsets.copy()
+
+        # CNF 预测网格：500 个点（点数与源文件不同）
+        np.random.seed(13)
+        self.pred_coord = np.random.rand(500, 3)
+        self.pred_coord[:, 0] += self.src_offsets[0]
+        self.pred_coord[:, 1] += self.src_offsets[1]
+        self.pred_coord[:, 2] += self.src_offsets[2]
+
+        self.writer = LASWriter(save_dir=self.save_dir, source_dir=self.source_dir)
+
+    def test_pred_coord_creates_new_point_count(self):
+        """输出 LAS 的点数等于 pred_coord 行数，而非源文件点数。"""
+        out_path = self.writer.write("tile_001", pred_coord=self.pred_coord)
+        las = laspy.read(out_path)
+        self.assertEqual(len(las.points), len(self.pred_coord))
+
+    def test_pred_coord_inherits_source_scale_offset(self):
+        """输出 LAS 继承源文件的 scale 和 offset。"""
+        out_path = self.writer.write("tile_001", pred_coord=self.pred_coord)
+        las = laspy.read(out_path)
+        np.testing.assert_allclose(
+            np.array(las.header.scales), self.src_scales, rtol=1e-9
+        )
+        np.testing.assert_allclose(
+            np.array(las.header.offsets), self.src_offsets, rtol=1e-6
+        )
+
+    def test_pred_coord_xyz_preserved(self):
+        """输出 LAS 的 XYZ 坐标与 pred_coord 一致（scale 精度内）。"""
+        out_path = self.writer.write("tile_001", pred_coord=self.pred_coord)
+        las = laspy.read(out_path)
+        # scale = 0.01 → atol=0.01
+        np.testing.assert_allclose(
+            np.array(las.x), self.pred_coord[:, 0], atol=0.011
+        )
+        np.testing.assert_allclose(
+            np.array(las.y), self.pred_coord[:, 1], atol=0.011
+        )
+        np.testing.assert_allclose(
+            np.array(las.z), self.pred_coord[:, 2], atol=0.011
+        )
+
+    def test_pred_coord_no_source_falls_back_to_create_new(self):
+        """source_dir 中无匹配文件时，退回到 _create_new（自动 scale/offset）。"""
+        writer = LASWriter(save_dir=self.save_dir, source_dir=self.source_dir)
+        with warnings.catch_warnings(record=True):
+            out_path = writer.write("tile_nonexistent", pred_coord=self.pred_coord)
+        las = laspy.read(out_path)
+        self.assertEqual(len(las.points), len(self.pred_coord))
+
+    def test_pred_coord_without_source_dir(self):
+        """未设置 source_dir 时，pred_coord 路径仍正常创建文件。"""
+        writer = LASWriter(save_dir=self.save_dir)
+        out_path = writer.write("tile_nosrc", pred_coord=self.pred_coord)
+        las = laspy.read(out_path)
+        self.assertEqual(len(las.points), len(self.pred_coord))
+
+
+# ===========================================================================
+#  9. classification 参数
+# ===========================================================================
+
+
+@unittest.skipIf(not HAS_LASPY, "laspy not installed")
+class TestLASWriterClassificationParam(unittest.TestCase):
+    """验证 classification 构造参数的行为。"""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.source_dir = os.path.join(self.tmpdir, "source")
+        self.save_dir = os.path.join(self.tmpdir, "output")
+        os.makedirs(self.source_dir)
+        self.n = 80
+        _create_source_las(self.source_dir, "scene_cls", self.n)
+
+        np.random.seed(99)
+        self.pred_coord = np.random.rand(200, 3) * 100.0
+
+    def test_classification_set_on_pred_coord(self):
+        """pred_coord 输出时，每个点的 classification == 构造参数值。"""
+        writer = LASWriter(
+            save_dir=self.save_dir, source_dir=self.source_dir, classification=2
+        )
+        out_path = writer.write("scene_cls", pred_coord=self.pred_coord)
+        las = laspy.read(out_path)
+        expected = np.full(len(self.pred_coord), 2, dtype=np.uint8)
+        np.testing.assert_array_equal(np.array(las.classification), expected)
+
+    def test_classification_set_on_standard_write_no_pred_sem(self):
+        """无 pred_sem 时，标准 write() 也应用默认 classification。"""
+        writer = LASWriter(
+            save_dir=self.save_dir, source_dir=self.source_dir, classification=5
+        )
+        out_path = writer.write("scene_cls")
+        las = laspy.read(out_path)
+        expected = np.full(self.n, 5, dtype=np.uint8)
+        np.testing.assert_array_equal(np.array(las.classification), expected)
+
+    def test_pred_sem_overrides_classification_param(self):
+        """显式传入 pred_sem 时，优先使用 pred_sem，忽略 classification 参数。"""
+        writer = LASWriter(
+            save_dir=self.save_dir, source_dir=self.source_dir, classification=2
+        )
+        override = np.full(self.n, 9, dtype=np.uint8)
+        out_path = writer.write("scene_cls", pred_sem=override)
+        las = laspy.read(out_path)
+        np.testing.assert_array_equal(np.array(las.classification), override)
+
+    def test_classification_none_no_field_written(self):
+        """classification=None（默认）且无 pred_sem 时，classification 字段保持源文件默认值（0）。"""
+        writer = LASWriter(
+            save_dir=self.save_dir, source_dir=self.source_dir, classification=None
+        )
+        out_path = writer.write("scene_cls")
+        las = laspy.read(out_path)
+        # 源文件创建时未设置 classification → 全部为 0
+        expected = np.zeros(self.n, dtype=np.uint8)
+        np.testing.assert_array_equal(np.array(las.classification), expected)
+
+
 if __name__ == "__main__":
     unittest.main()

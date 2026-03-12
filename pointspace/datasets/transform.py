@@ -8,9 +8,10 @@ Please cite our work if the code is helpful to you.
 import random
 import numbers
 import scipy
-import scipy.ndimage
-import scipy.interpolate
 import scipy.stats
+from scipy.stats import binned_statistic_2d
+from scipy.ndimage import convolve, gaussian_filter, map_coordinates
+from scipy.interpolate import NearestNDInterpolator, RegularGridInterpolator
 import numpy as np
 import torch
 from torchvision import transforms
@@ -214,10 +215,11 @@ class CenterShift(object):
             x_min, y_min, z_min = data_dict["coord"].min(axis=0)
             x_max, y_max, _ = data_dict["coord"].max(axis=0)
             if self.apply_z:
-                shift = [(x_min + x_max) / 2, (y_min + y_max) / 2, z_min]
+                shift = np.array([(x_min + x_max) / 2, (y_min + y_max) / 2, z_min])
             else:
-                shift = [(x_min + x_max) / 2, (y_min + y_max) / 2, 0]
+                shift = np.array([(x_min + x_max) / 2, (y_min + y_max) / 2, 0])
             data_dict["coord"] -= shift
+            data_dict["coord_shift"] = shift
         return data_dict
 
 
@@ -232,6 +234,7 @@ class CentroidShift(object):
             if not self.apply_z:
                 centroid[2] = 0
             data_dict["coord"] -= centroid
+            data_dict["coord_shift"] = centroid
         return data_dict
 
 
@@ -252,6 +255,7 @@ class ZPercentileCenterShift(object):
                 z_shift_val
             ])
             data_dict["coord"] -= shift
+            data_dict["coord_shift"] = shift
             
         return data_dict
 
@@ -898,7 +902,7 @@ class ElasticDistortion(object):
                 noise_dim,
             )
         ]
-        interp = scipy.interpolate.RegularGridInterpolator(
+        interp = RegularGridInterpolator(
             ax, noise, bounds_error=False, fill_value=0
         )
         coords += interp(coords) * magnitude
@@ -1740,3 +1744,330 @@ class ImgAugmentation(object):
         correspondence[mask] -= np.array(self.crop_start)
         point["correspondence"] = correspondence.reshape(correspondence_shape)
         return point
+
+@TRANSFORMS.register_module()
+class TerrainImplicitSampler(object):
+    """
+    针对连续地形隐式重建(Continuous DEM)的多策略混合数据采样器。
+    该模块会将输入的点云划分为 Support(支撑点，用于提取特征) 和 Query(查询点，用于监督隐式网络)。
+    """
+    def __init__(self, 
+                 random_ratio=0.1,             # 策略1: 纯随机抽取的比例
+                 feature_ratio=0.1,            # 策略2: 基于地形特征(山脊/陡坎)抽取的比例
+                 max_blocks=5,                 # 策略3: 矩形空洞的最大数量
+                 block_size_range=(2.0, 15.0), # 矩形空洞的长宽边长范围(米)
+                 feature_resolution=2.0,       # 极速地形特征提取的 2.5D 栅格分辨率(米)
+                 max_query_ratio=0.6,          # 安全阈值: 确保 Query 点不超过总点的比例，防止 Backbone 无点可用
+                 compute_gt_low=True,          # 是否计算低频平滑真值 (双分支需要, 单分支可关闭)
+                 ):
+        self.random_ratio = random_ratio
+        self.feature_ratio = feature_ratio
+        self.max_blocks = max_blocks
+        self.block_size_range = block_size_range
+        self.feature_resolution = feature_resolution
+        self.max_query_ratio = max_query_ratio
+        self.compute_gt_low = compute_gt_low
+
+    def _fast_topographic_weights(self, coord):
+        """
+        极速计算地形特征权重 (基于 2.5D 栅格近似)，复杂度严格 O(N)
+        """
+        xy = coord[:, :2]
+        z = coord[:, 2]
+
+        min_x, min_y = np.min(xy[:, 0]), np.min(xy[:, 1])
+        max_x, max_y = np.max(xy[:, 0]), np.max(xy[:, 1])
+        
+        # 1. 构建栅格 Bins
+        bins_x = np.arange(min_x, max_x + self.feature_resolution, self.feature_resolution)
+        bins_y = np.arange(min_y, max_y + self.feature_resolution, self.feature_resolution)
+        
+        # 如果点云范围极小(异常数据)，直接返回均匀分布
+        if len(bins_x) < 3 or len(bins_y) < 3:
+            return np.ones_like(z) / len(z)
+
+        # 2. 极速计算格网统计量
+        z_mean, x_edge, y_edge, _ = binned_statistic_2d(
+            xy[:, 0], xy[:, 1], z, statistic='mean', bins=[bins_x, bins_y])
+        z_max, _, _, _ = binned_statistic_2d(
+            xy[:, 0], xy[:, 1], z, statistic='max', bins=[bins_x, bins_y])
+        z_min, _, _, _ = binned_statistic_2d(
+            xy[:, 0], xy[:, 1], z, statistic='min', bins=[bins_x, bins_y])
+
+        # 处理空网格 (NaN)
+        valid_mean = np.nanmean(z_mean)
+        z_mean = np.nan_to_num(z_mean, nan=valid_mean if not np.isnan(valid_mean) else 0.0)
+        z_range = np.nan_to_num(z_max - z_min, nan=0.0)
+
+        # 3. 提取二阶特征 (拉普拉斯算子 -> 山脊/山谷)
+        kernel = np.array([[ 0,  1,  0],
+                           [ 1, -4,  1],
+                           [ 0,  1,  0]])
+        laplacian = convolve(z_mean, kernel, mode='reflect')
+        curvature = np.abs(laplacian)
+
+        # 4. 融合特征 (陡坎 + 山谷山脊)
+        norm_range = z_range / (np.max(z_range) + 1e-6)
+        norm_curve = curvature / (np.max(curvature) + 1e-6)
+        grid_feature_map = norm_range + 1.5 * norm_curve 
+
+        # 5. 极速映射回原始点云
+        idx_x = np.clip(np.digitize(xy[:, 0], x_edge) - 1, 0, len(bins_x) - 2)
+        idx_y = np.clip(np.digitize(xy[:, 1], y_edge) - 1, 0, len(bins_y) - 2)
+        point_weights = grid_feature_map[idx_x, idx_y]
+
+        # 指数激化：拉大普通平地点与地形特征点的概率差距
+        point_weights = point_weights ** 2
+
+        # 归一化为合法概率分布
+        sum_weights = np.sum(point_weights)
+        if sum_weights > 1e-6:
+            return point_weights / sum_weights
+        else:
+            return np.ones_like(z) / len(z)
+        
+    def _robust_extract_low_frequency(self, coord, resolution=2.0, sigma=1.5):
+        """
+        稳健、极速且连续的低频地形真值提取 (Transform 中使用)
+        """
+        xy = coord[:, :2]
+        z = coord[:, 2]
+
+        # ---------------------------------------------------------
+        # 1. 极端情况保底防崩 (点数太少直接返回均值平面)
+        # ---------------------------------------------------------
+        if len(z) < 50:
+            return np.full_like(z, np.mean(z) if len(z) > 0 else 0.0)
+
+        # ---------------------------------------------------------
+        # 2. 构建带 Padding 的网格 (防止边缘点插值时越界)
+        # ---------------------------------------------------------
+        min_x, min_y = np.min(xy[:, 0]), np.min(xy[:, 1])
+        max_x, max_y = np.max(xy[:, 0]), np.max(xy[:, 1])
+        
+        pad = resolution * 2.0
+        bins_x = np.arange(min_x - pad, max_x + pad, resolution)
+        bins_y = np.arange(min_y - pad, max_y + pad, resolution)
+
+        # 如果范围太小，退化为均值
+        if len(bins_x) < 3 or len(bins_y) < 3:
+            return np.full_like(z, np.mean(z))
+
+        # ---------------------------------------------------------
+        # 3. 极速栅格化 (求网格均值)
+        # ---------------------------------------------------------
+        z_grid, x_edge, y_edge, _ = binned_statistic_2d(
+            xy[:, 0], xy[:, 1], z, statistic='mean', bins=[bins_x, bins_y])
+
+        # ---------------------------------------------------------
+        # 4. 稳健的 NaN 空洞填补
+        # ---------------------------------------------------------
+        valid_mask = ~np.isnan(z_grid)
+        if not np.any(valid_mask):
+            return np.full_like(z, np.mean(z))
+
+        # 仅当存在空洞时才进行插值填补，节省时间
+        if not np.all(valid_mask):
+            grid_x, grid_y = np.meshgrid(
+                (x_edge[:-1] + x_edge[1:]) / 2, 
+                (y_edge[:-1] + y_edge[1:]) / 2, 
+                indexing='ij'
+            )
+            # 使用 NearestNDInterpolator 填补，速度极快
+            valid_coords = np.column_stack((grid_x[valid_mask], grid_y[valid_mask]))
+            valid_z = z_grid[valid_mask]
+            interpolator = NearestNDInterpolator(valid_coords, valid_z)
+            z_grid_filled = interpolator(grid_x, grid_y)
+        else:
+            z_grid_filled = z_grid
+
+        # ---------------------------------------------------------
+        # 5. 提取低频 (高斯滤波)
+        # ---------------------------------------------------------
+        z_grid_smooth = gaussian_filter(z_grid_filled, sigma=sigma)
+
+        # ---------------------------------------------------------
+        # 6. 🌟 核心：连续映射！(双线性插值消除阶梯效应)
+        # ---------------------------------------------------------
+        # 将实际的 X, Y 物理坐标转换为网格矩阵的“小数索引”
+        idx_x = (xy[:, 0] - x_edge[0]) / resolution - 0.5
+        idx_y = (xy[:, 1] - y_edge[0]) / resolution - 0.5
+
+        # map_coordinates 底层是 C，速度极快
+        # order=1 表示双线性插值，这样提取出来的高程是一个完美连续的光滑曲面
+        z_low = map_coordinates(
+            z_grid_smooth, 
+            [idx_x, idx_y], 
+            order=1, 
+            mode='nearest'
+        )
+
+        return z_low.astype(np.float32)
+
+    def __call__(self, data_dict):
+        # 仅在包含监督信号时处理 (跳过推理致密网格阶段)
+        if "segment" not in data_dict and "gt" not in data_dict and "query_gt" not in data_dict.get("keys", []):
+            return data_dict
+
+        coord = data_dict["coord"]
+        num_points = coord.shape[0]
+
+        if num_points < 10:
+            # 极少点时给出最小合法输出，避免下游 Collect/Collate 报 KeyError
+            data_dict["query_coord"] = np.empty((0, 2), dtype=np.float32)
+            data_dict["query_gt"] = np.empty((0,), dtype=np.float32)
+            if self.compute_gt_low:
+                data_dict["query_gt_low"] = np.empty((0,), dtype=np.float32)
+            return data_dict
+
+        # ==========================================
+        # 🌟 0. 全局低频真值计算与缓存
+        # ==========================================
+        if self.compute_gt_low:
+            if "z_low" in data_dict:
+                z_low_full = data_dict["z_low"]
+            else:
+                # 必须在破坏前对【最原始、最完整的 coord】进行计算
+                z_low_full = self._robust_extract_low_frequency(
+                    coord, resolution=3.0, sigma=1.5
+                )
+                data_dict["z_low"] = z_low_full
+        else:
+            z_low_full = None
+
+        # 全局掩码，标记哪些点被挖走作为 Query
+        query_mask = np.zeros(num_points, dtype=bool)
+
+        # ==========================================
+        # 策略 1: 随机数量、随机长宽的矩形空洞抽取 (模拟遮挡/水面)
+        # ==========================================
+        num_blocks = np.random.randint(0, self.max_blocks + 1)
+        for _ in range(num_blocks):
+            w = np.random.uniform(self.block_size_range[0], self.block_size_range[1])
+            h = np.random.uniform(self.block_size_range[0], self.block_size_range[1])
+            center_idx = np.random.randint(num_points)
+            center_x, center_y = coord[center_idx, 0], coord[center_idx, 1]
+            
+            mask_x = np.abs(coord[:, 0] - center_x) <= w / 2.0
+            mask_y = np.abs(coord[:, 1] - center_y) <= h / 2.0
+            query_mask |= (mask_x & mask_y)
+
+        # ==========================================
+        # 策略 2: 基于真实地形起伏（山脊、山谷、陡坎）的特征点抽取
+        # ==========================================
+        num_feat = int(num_points * self.feature_ratio)
+        if num_feat > 0:
+            probs = self._fast_topographic_weights(coord)
+            feat_indices = np.random.choice(num_points, num_feat, replace=False, p=probs)
+            query_mask[feat_indices] = True
+
+        # ==========================================
+        # 策略 3: 全局随机均匀抽取 (模拟激光雷达常规掉点/抽稀)
+        # ==========================================
+        num_rand = int(num_points * self.random_ratio)
+        if num_rand > 0:
+            rand_indices = np.random.choice(num_points, num_rand, replace=False)
+            query_mask[rand_indices] = True
+
+        # ==========================================
+        # 截断与保底机制：确保有足够的点送给 Backbone 提特征
+        # ==========================================
+        query_indices = np.where(query_mask)[0]
+        max_allowed_queries = max(1, int(num_points * self.max_query_ratio))
+
+        if len(query_indices) > max_allowed_queries:
+            # 如果挖得太猛，随机归还一部分给 Support
+            keep_idx = np.random.choice(len(query_indices), max_allowed_queries, replace=False)
+            query_indices = query_indices[keep_idx]
+            query_mask = np.zeros(num_points, dtype=bool)
+            query_mask[query_indices] = True
+
+        # 保底：若没有任何 query，随机选 1 个点作为 query
+        if query_mask.sum() == 0:
+            fallback = np.random.randint(num_points)
+            query_mask[fallback] = True
+
+        # 最终掩码
+        support_mask = ~query_mask
+        # 保证至少 1 个 support 点（极端保底）
+        if support_mask.sum() == 0:
+            support_mask[0] = True
+            query_mask[0] = False
+
+        # ==========================================
+        # 🌟 提取真值与网络输入
+        # ==========================================
+        query_coord_xy = coord[query_mask, :2].copy().astype(np.float32)
+        query_gt_raw = coord[query_mask, 2].copy().astype(np.float32)
+
+        # 使用框架原生算子切片 Support 点
+        data_dict = index_operator(data_dict, np.where(support_mask)[0])
+        
+        # 注入 Query 属性供 Head 监督使用
+        data_dict["query_coord"] = query_coord_xy
+        data_dict["query_gt"] = query_gt_raw
+        if z_low_full is not None:
+            data_dict["query_gt_low"] = z_low_full[query_mask].copy().astype(np.float32)
+
+        return data_dict
+
+
+@TRANSFORMS.register_module()
+class ClassFilter(object):
+    """Filter point cloud to keep only points belonging to specified classes.
+
+    Keys listed in ``index_valid_keys`` are subsetted; all other keys are
+    left untouched.  If ``class_key`` is absent from the data dict the
+    transform is a no-op.
+
+    Args:
+        keep_classes (list[int]): Class labels to retain.
+        class_key (str): Key in data_dict containing per-point labels.
+            Defaults to ``"segment"``.
+    """
+
+    def __init__(self, keep_classes, class_key="segment"):
+        self.keep_classes = list(keep_classes)
+        self.class_key = class_key
+
+    def __call__(self, data_dict):
+        if self.class_key not in data_dict:
+            return data_dict
+        labels = data_dict[self.class_key]
+        mask = np.isin(labels, self.keep_classes)
+        idx = np.where(mask)[0]
+        return index_operator(data_dict, idx)
+
+
+@TRANSFORMS.register_module()
+class GridCoordinate(object):
+    """Compute integer grid coordinates without downsampling.
+
+    Adds ``grid_coord`` (int32, same shape as ``coord``) to the data dict
+    and registers it in ``index_valid_keys``.  Unlike :class:`GridSample`,
+    no points are removed.
+
+    ``grid_coord[i] = floor(coord[i] / grid_size) - floor(coord / grid_size).min(axis=0)``
+
+    Args:
+        grid_size (float): Voxel edge length used for quantisation.
+    """
+
+    def __init__(self, grid_size=0.05):
+        self.grid_size = grid_size
+
+    def __call__(self, data_dict):
+        assert "coord" in data_dict
+        grid_coord = np.floor(data_dict["coord"] / self.grid_size).astype(np.int32)
+        grid_coord -= grid_coord.min(axis=0)
+        data_dict["grid_coord"] = grid_coord
+        if "index_valid_keys" not in data_dict:
+            data_dict["index_valid_keys"] = list(
+                filter(lambda k: isinstance(data_dict[k], np.ndarray)
+                       and data_dict[k].ndim > 0
+                       and data_dict[k].shape[0] == data_dict["coord"].shape[0],
+                       [k for k in data_dict if k != "index_valid_keys"])
+            )
+        if "grid_coord" not in data_dict["index_valid_keys"]:
+            data_dict["index_valid_keys"].append("grid_coord")
+        return data_dict

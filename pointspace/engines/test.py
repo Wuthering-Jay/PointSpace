@@ -13,6 +13,7 @@ import numpy as np
 from collections import OrderedDict
 from functools import partial
 from packaging import version
+from scipy.ndimage import binary_dilation, binary_fill_holes, binary_closing, label as _ndimage_label
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -1755,6 +1756,383 @@ class SemSegRegressionTester(TesterBase):
             logger.info(
                 "<<<<<<<<<<<<<<<<< End SemSeg-Regression Evaluation <<<<<<<<<<<<<<<<<"
             )
+
+    @staticmethod
+    def collate_fn(batch):
+        return batch
+
+
+@TESTERS.register_module()
+class CnfTester(TesterBase):
+    """Test-time evaluator for Conditional Neural Field (CNF) tasks.
+
+    Implements the two-phase *encode-once, query-many* inference:
+
+    **Phase 1 – Encode**
+        Run the backbone on all fragments of a scene, accumulating per-
+        point features.  The final ``support_feat (N, C)`` and
+        ``support_coord (N, 3)`` are cached on GPU.
+
+    **Phase 2 – Dense query**
+        Generate a regular XY grid (``query_resolution``) spanning the
+        support bounding box.  Feed batches of ``(Q, 2)`` query
+        coordinates through ``model.query_forward`` to obtain
+        ``pred_z (Q,)``.
+
+    **Phase 3 – Optional derivatives**
+        If ``compute_derivatives`` is enabled, run the same query with
+        ``requires_grad=True`` and extract slope / curvature via
+        ``torch.autograd.grad``.
+
+    Config-level attributes read from ``self.cfg``:
+        query_resolution (float): Output grid spacing in coordinate
+            units (default 0.5).
+        query_batch_size (int): Maximum query points per forward pass
+            (default 100 000).
+        compute_derivatives (bool): Compute slope / curvature maps
+            (default False).
+    """
+
+    def test(self):
+        batch_size_test = self.cfg.batch_size_test_per_gpu
+        query_resolution = getattr(self.cfg, "query_resolution", 0.5)
+        query_batch_size = getattr(self.cfg, "query_batch_size", 100_000)
+        compute_derivatives = getattr(self.cfg, "compute_derivatives", False)
+        query_dim = getattr(self.cfg, "query_dim", 2)
+        auto_cast = _build_autocast(self.cfg)
+        logger = get_root_logger()
+        logger.info(">>>>>>>>>>>>>>>> Start CNF Evaluation >>>>>>>>>>>>>>>>")
+        logger.info(
+            f"Fragment batch: {batch_size_test}  "
+            f"Query resolution: {query_resolution}  "
+            f"Query batch: {query_batch_size}  "
+            f"Derivatives: {compute_derivatives}  "
+            f"Query dim: {query_dim}"
+        )
+
+        batch_time = AverageMeter()
+        self.model.eval()
+
+        # Optional general writer (LAS / PLY / …)
+        general_writer = None
+        writer_cfg = getattr(self.cfg, "writer", None)
+        if writer_cfg is not None:
+            general_writer = build_writer(writer_cfg)
+
+        comm.synchronize()
+
+        # Unwrap DDP to access encode / interpolate / decode directly
+        raw_model = (
+            self.model.module if hasattr(self.model, "module") else self.model
+        )
+
+        for idx, data_dict in enumerate(self.test_loader):
+            start = time.time()
+            data_dict = data_dict[0]  # batch_size == 1
+            fragment_list = data_dict.pop("fragment_list")
+            data_name = data_dict.pop("name")
+
+            # ============================================================
+            # Phase 1: Backbone encoding (run once per scene)
+            # ============================================================
+            support_feat_parts = []
+            support_coord_parts = []
+            num_fragments = len(fragment_list)
+            frag_batch_num = int(np.ceil(num_fragments / batch_size_test))
+
+            for i in range(frag_batch_num):
+                s_i = i * batch_size_test
+                e_i = min((i + 1) * batch_size_test, num_fragments)
+                input_dict = collate_fn(fragment_list[s_i:e_i])
+                for key in input_dict.keys():
+                    if isinstance(input_dict[key], torch.Tensor):
+                        input_dict[key] = input_dict[key].cuda(non_blocking=True)
+
+                with torch.no_grad(), auto_cast():
+                    enc = raw_model.extract_feat(input_dict)
+
+                # Map fragment indices back to original point space.
+                # When GridSample is not used (CNF case: all support points
+                # in one pass, no sub-sampling), there is no "index" key —
+                # use an identity mapping so the averaging merge is a no-op.
+                if "index" in input_dict:
+                    frag_idx = input_dict["index"].cpu()
+                else:
+                    frag_idx = torch.arange(enc["feat"].shape[0])
+                support_feat_parts.append(
+                    (frag_idx, enc["feat"].cpu())
+                )
+                support_coord_parts.append(
+                    (frag_idx, enc["coord"].cpu())
+                )
+
+                logger.info(
+                    "CNF Encode: {}/{}-{}, Fragment: {}/{}".format(
+                        idx + 1,
+                        len(self.test_loader),
+                        data_name,
+                        e_i,
+                        num_fragments,
+                    )
+                )
+
+            # Merge fragments: average features at overlapping indices
+            all_idx = torch.cat([p[0] for p in support_feat_parts])
+            N = int(all_idx.max().item()) + 1
+            C = support_feat_parts[0][1].shape[1]
+            feat_sum = torch.zeros(N, C)
+            feat_count = torch.zeros(N, 1)
+            coord_sum = torch.zeros(N, 3)
+
+            for frag_idx, frag_feat in support_feat_parts:
+                feat_sum[frag_idx] += frag_feat
+                feat_count[frag_idx] += 1
+            for frag_idx, frag_coord in support_coord_parts:
+                coord_sum[frag_idx] += frag_coord
+
+            valid_mask = feat_count.squeeze(1) > 0
+            feat_sum[valid_mask] /= feat_count[valid_mask]
+            coord_sum[valid_mask] /= feat_count[valid_mask]
+
+            # Handle inverse mapping (grid-subsampled → original cloud)
+            if "inverse" in data_dict:
+                inverse = data_dict["inverse"]
+                support_feat = feat_sum[inverse].cuda()
+                support_coord = coord_sum[inverse].cuda()
+            else:
+                support_feat = feat_sum[valid_mask].cuda()
+                support_coord = coord_sum[valid_mask].cuda()
+
+            logger.info(
+                "CNF Encode done: {} support points, feat shape {}".format(
+                    support_coord.shape[0], support_feat.shape
+                )
+            )
+
+            # ============================================================
+            # Phase 2: Build query grid (occupancy-masked)
+            # ============================================================
+            qd = query_dim
+            xy_min = support_coord[:, :qd].min(dim=0).values.cpu()
+            xy_max = support_coord[:, :qd].max(dim=0).values.cpu()
+
+            # --- Occupancy mask pipeline:
+            # 1. Bin support XY into a coarse grid
+            # 2. binary_closing (adaptive iterations) — bridges gaps in the
+            #    outer ring of support points so the interior boundary is
+            #    fully sealed from the exterior
+            # 3. Exterior flood-fill via scipy.ndimage.label — labels
+            #    connected components of background; the component touching
+            #    the grid corner (always exterior thanks to 2-cell padding)
+            #    is the true outside.  Everything else becomes True, filling
+            #    ALL interior voids regardless of size.
+            # 4. binary_dilation(1) — slight outward tolerance
+            occ_cell = query_resolution * 5  # coarse cell size
+            support_xy_np = support_coord[:, :qd].cpu().numpy()
+
+            # Extra border padding: enough cells so closing and flood-fill
+            # have room to operate near the grid edge — we use the larger of
+            # 2 cells or the gap-closing radius so the corners stay exterior.
+            _gap_close_iters = max(3, int(np.ceil(5.0 / occ_cell)))
+            _pad_cells = _gap_close_iters + 2
+            occ_axes = [
+                np.arange(
+                    lo.item() - _pad_cells * occ_cell,
+                    hi.item() + (_pad_cells + 1) * occ_cell,
+                    occ_cell,
+                )
+                for lo, hi in zip(xy_min, xy_max)
+            ]
+            # Digitise support points into coarse bins
+            occ_bin_idx = [
+                np.clip(
+                    np.digitize(support_xy_np[:, d], occ_axes[d]) - 1,
+                    0, len(occ_axes[d]) - 1,
+                )
+                for d in range(qd)
+            ]
+            occ_shape = tuple(len(a) for a in occ_axes)
+            occ_grid = np.zeros(occ_shape, dtype=bool)
+            occ_grid[tuple(occ_bin_idx)] = True
+
+            # Step 2: close gaps so the outer ring has no through-holes.
+            # iterations = ceil(5 m / occ_cell) bridges typical data gaps.
+            occ_grid = binary_closing(occ_grid, iterations=_gap_close_iters)
+
+            # Step 3: exterior flood-fill.
+            # Label every connected component of the background (~occ_grid).
+            # The top-left corner cell [0, 0] is guaranteed to be background
+            # (exterior) because of the generous padding above.  Every other
+            # background component is an interior void — mark it as interior.
+            _bg_labels, _ = _ndimage_label(~occ_grid)
+            _exterior_label = _bg_labels[0, 0]  # corner = exterior
+            occ_grid = _bg_labels != _exterior_label  # True = inside outer boundary
+
+            # Step 4: small outward dilation so boundary query points are
+            # not clipped exactly at the last support point.
+            occ_grid = binary_dilation(occ_grid, iterations=1)
+
+            # Build fine query grid
+            axes = [
+                torch.arange(
+                    lo.item(),
+                    hi.item() + query_resolution,
+                    query_resolution,
+                )
+                for lo, hi in zip(xy_min, xy_max)
+            ]
+            grids = torch.meshgrid(*axes, indexing="ij")
+            query_xy_full = torch.stack(
+                [g.flatten() for g in grids], dim=1
+            )  # (Q_full, qd)
+
+            # Map each fine query point to its coarse bin and filter
+            occ_idx = []
+            for d in range(qd):
+                bin_d = np.clip(
+                    np.digitize(query_xy_full[:, d].numpy(), occ_axes[d]) - 1,
+                    0, occ_shape[d] - 1,
+                )
+                occ_idx.append(bin_d)
+            keep_mask = occ_grid[tuple(occ_idx)]
+            query_xy = query_xy_full[keep_mask]
+            total_queries = query_xy.shape[0]
+
+            logger.info(
+                "CNF Query grid: {} points (bbox {} -> masked {}, occ_cell {:.2f})".format(
+                    total_queries,
+                    query_xy_full.shape[0],
+                    total_queries,
+                    occ_cell,
+                )
+            )
+
+            # ============================================================
+            # Phase 3: Batch query through head
+            # ============================================================
+            pred_z_parts = []
+            slope_parts = [] if compute_derivatives else None
+            curvature_parts = [] if compute_derivatives else None
+
+            for qi in range(0, total_queries, query_batch_size):
+                q_batch = query_xy[qi : qi + query_batch_size].cuda()
+
+                if compute_derivatives:
+                    q_batch = q_batch.requires_grad_(True)
+
+                ctx = (
+                    torch.enable_grad()
+                    if compute_derivatives
+                    else torch.no_grad()
+                )
+                with ctx, auto_cast():
+                    pz = raw_model.query_forward(
+                        support_coord, support_feat, q_batch
+                    )
+
+                    if compute_derivatives:
+                        # First-order: slope
+                        grad = torch.autograd.grad(
+                            pz.sum(), q_batch, create_graph=True
+                        )[0]  # (B, qd)
+                        slope = grad.norm(dim=1)  # (B,)
+                        slope_parts.append(slope.detach().cpu())
+
+                        # Second-order: curvature (Laplacian)
+                        curv = torch.zeros(
+                            q_batch.shape[0], device=q_batch.device
+                        )
+                        for d in range(qd):
+                            g2 = torch.autograd.grad(
+                                grad[:, d].sum(),
+                                q_batch,
+                                retain_graph=(d < qd - 1),
+                            )[0]  # (B, qd)
+                            curv = curv + g2[:, d]
+                        curvature_parts.append(curv.detach().cpu())
+
+                pred_z_parts.append(pz.detach().cpu())
+
+                if (
+                    (qi // query_batch_size + 1) % 10 == 0
+                    or qi + query_batch_size >= total_queries
+                ):
+                    logger.info(
+                        "CNF Query: {}/{}-{}, {}/{}".format(
+                            idx + 1,
+                            len(self.test_loader),
+                            data_name,
+                            min(qi + query_batch_size, total_queries),
+                            total_queries,
+                        )
+                    )
+
+            pred_z_all = torch.cat(pred_z_parts)  # (Q,)
+
+            # ============================================================
+            # Phase 4: Assemble output & write
+            # ============================================================
+            output_xyz = torch.column_stack(
+                [
+                    query_xy,
+                    (
+                        pred_z_all.unsqueeze(1)
+                        if pred_z_all.dim() == 1
+                        else pred_z_all
+                    ),
+                ]
+            ).numpy()  # (Q, 3) or (Q, qd + num_targets)
+
+            # Restore real-world coordinates if a shift was applied
+            coord_shift = data_dict.get("coord_shift", None)
+            if coord_shift is not None:
+                coord_shift = np.asarray(coord_shift, dtype=np.float64)
+                # output_xyz columns: [query_dims..., pred_targets...]
+                # shift[:qd] applies to the XY query columns,
+                # shift[qd:] applies to the Z (predicted) columns
+                output_xyz[:, :qd] += coord_shift[:qd]
+                n_targets = output_xyz.shape[1] - qd
+                if coord_shift.shape[0] > qd and n_targets > 0:
+                    # For CNF terrain: shift[2] (z_shift) adds back to pred_z
+                    output_xyz[:, qd:qd + min(n_targets, coord_shift.shape[0] - qd)] += (
+                        coord_shift[qd:qd + n_targets]
+                    )
+                logger.info(
+                    "CNF: Restored real-world coords (shift={})".format(
+                        np.array2string(coord_shift, precision=3)
+                    )
+                )
+
+            write_kwargs = dict(pred_coord=output_xyz)
+            if compute_derivatives and slope_parts:
+                write_kwargs["slope"] = torch.cat(slope_parts).numpy()
+            if compute_derivatives and curvature_parts:
+                write_kwargs["curvature"] = (
+                    torch.cat(curvature_parts).numpy()
+                )
+
+            if general_writer is not None:
+                general_writer.write(data_name, **write_kwargs)
+
+            batch_time.update(time.time() - start)
+            logger.info(
+                "CNF: {} [{}/{}] "
+                "Batch {batch_time.val:.3f} ({batch_time.avg:.3f}) "
+                "Support {n_support} Query {n_query}".format(
+                    data_name,
+                    idx + 1,
+                    len(self.test_loader),
+                    batch_time=batch_time,
+                    n_support=support_coord.shape[0],
+                    n_query=total_queries,
+                )
+            )
+            self.cache_cleaner.check_and_clean(
+                batch_time.val,
+                f"test iter {idx + 1}/{len(self.test_loader)}",
+            )
+
+        logger.info("<<<<<<<<<<<<<<<<< End CNF Evaluation <<<<<<<<<<<<<<<<<")
 
     @staticmethod
     def collate_fn(batch):

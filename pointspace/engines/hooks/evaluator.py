@@ -404,7 +404,7 @@ class RegressionEvaluator(HookBase):
         r2 = 1.0 - ss_res / max(ss_tot, 1e-10)
 
         self.trainer.logger.info(
-            "Val result: MAE {:.6f} | RMSE {:.6f} | R² {:.6f}".format(mae, rmse, r2)
+            "Val result: MAE {:.6f} | RMSE {:.6f} | R^2 {:.6f}".format(mae, rmse, r2)
         )
 
         current_epoch = self.trainer.epoch + 1
@@ -582,7 +582,7 @@ class SemSegRegressionEvaluator(HookBase):
         # ---- logging ----
         self.trainer.logger.info(
             "Val result:  mIoU {:.4f}  mAcc {:.4f}  OA {:.4f}"
-            "  | MAE {:.6f} | RMSE {:.6f} | R² {:.6f}".format(
+            "  | MAE {:.6f} | RMSE {:.6f} | R^2 {:.6f}".format(
                 m_iou, m_acc, all_acc, mae, rmse, r2
             )
         )
@@ -1039,3 +1039,165 @@ class InsSegEvaluator(HookBase):
             )
             self.trainer.comm_info["current_metric_value"] = all_ap_50  # save for saver
             self.trainer.comm_info["current_metric_name"] = "AP50"  # save for saver
+
+
+@HOOKS.register_module()
+class CnfEvaluator(HookBase):
+    """Validation evaluator for Conditional Neural Field (CNF) tasks.
+
+    Each validation batch contains *query* points (``query_coord``,
+    ``query_gt``) that are disjoint from the support set.  The
+    model's ``cnf_pred`` output is compared against ``query_gt``.
+
+    Metrics computed every epoch:
+        - **MAE**  – mean absolute error
+        - **RMSE** – root mean square error
+        - **MaxE** – maximum absolute error (sensitivity to outliers)
+        - **R²**   – coefficient of determination
+
+    Best-model tracking uses **−RMSE** (higher is better), compatible
+    with :class:`CheckpointSaver`.
+
+    Args:
+        log_interval (int): Print progress every *log_interval* batches.
+    """
+
+    def __init__(self, log_interval=1):
+        self.log_interval = max(1, log_interval)
+
+    def before_train(self):
+        if self.trainer.writer is not None and self.trainer.cfg.enable_wandb:
+            wandb.define_metric("val/*", step_metric="Epoch")
+
+    def after_epoch(self):
+        if self.trainer.cfg.evaluate:
+            self.eval()
+
+    def eval(self):
+        self.trainer.logger.info(">>>>>>>>>>>>>>>> Start Evaluation >>>>>>>>>>>>>>>>")
+        self.trainer.model.eval()
+        auto_cast = _build_autocast(self.trainer.cfg)
+        from pointspace.engines.hooks.misc import CacheCleaner
+
+        _cache_cleaner = next(
+            (h for h in self.trainer.hooks if isinstance(h, CacheCleaner)), None
+        )
+
+        sum_abs_err = 0.0
+        sum_sq_err = 0.0
+        sum_target = 0.0
+        sum_target_sq = 0.0
+        max_abs_err = 0.0
+        total_count = 0
+
+        for i, input_dict in enumerate(self.trainer.val_loader):
+            _iter_start = time.perf_counter()
+            for key in input_dict.keys():
+                if isinstance(input_dict[key], torch.Tensor):
+                    input_dict[key] = input_dict[key].cuda(non_blocking=True)
+
+            with torch.no_grad(), auto_cast():
+                output_dict = self.trainer.model(input_dict)
+
+            pred = output_dict["cnf_pred"].detach().float().reshape(-1)
+            target = input_dict["query_gt"].float().reshape(-1)
+            loss = output_dict["loss"]
+
+            diff = pred - target
+            n = pred.numel()
+            abs_diff = diff.abs()
+            sum_abs_err += abs_diff.sum().item()
+            sum_sq_err += (diff ** 2).sum().item()
+            sum_target += target.sum().item()
+            sum_target_sq += (target ** 2).sum().item()
+            batch_max = abs_diff.max().item() if n > 0 else 0.0
+            if batch_max > max_abs_err:
+                max_abs_err = batch_max
+            total_count += n
+
+            self.trainer.storage.put_scalar("val_loss", loss.item())
+            # Log per-component losses if returned by dual-branch model
+            for lk in ("loss_base", "loss_final", "loss_reg"):
+                if lk in output_dict:
+                    self.trainer.storage.put_scalar(
+                        f"val_{lk}", output_dict[lk].item()
+                    )
+
+            if (i + 1) % self.log_interval == 0 or (i + 1) == len(
+                self.trainer.val_loader
+            ):
+                self.trainer.logger.info(
+                    "Val: [{iter}/{max_iter}] Loss {loss:.4f}".format(
+                        iter=i + 1,
+                        max_iter=len(self.trainer.val_loader),
+                        loss=loss.item(),
+                    )
+                )
+            if _cache_cleaner is not None:
+                _cache_cleaner.check_and_clean(
+                    time.perf_counter() - _iter_start,
+                    f"val iter {i + 1}/{len(self.trainer.val_loader)}",
+                )
+
+        loss_avg = self.trainer.storage.history("val_loss").avg
+
+        # Aggregate across ranks for DDP
+        if comm.get_world_size() > 1:
+            stats = torch.tensor(
+                [sum_abs_err, sum_sq_err, sum_target, sum_target_sq,
+                 max_abs_err, total_count],
+                dtype=torch.float64,
+                device="cuda",
+            )
+            dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+            # max_abs_err needs MAX reduction, not SUM
+            max_tensor = torch.tensor([max_abs_err], dtype=torch.float64, device="cuda")
+            dist.all_reduce(max_tensor, op=dist.ReduceOp.MAX)
+            sum_abs_err, sum_sq_err, sum_target, sum_target_sq, _, total_count = (
+                stats.tolist()
+            )
+            max_abs_err = max_tensor.item()
+
+        total_count = max(total_count, 1)
+        mae = sum_abs_err / total_count
+        rmse = (sum_sq_err / total_count) ** 0.5
+        mean_target = sum_target / total_count
+        ss_tot = sum_target_sq - total_count * mean_target ** 2
+        ss_res = sum_sq_err
+        r2 = 1.0 - ss_res / max(ss_tot, 1e-10)
+
+        self.trainer.logger.info(
+            "Val result: MAE {:.6f} | RMSE {:.6f} | MaxE {:.6f} | R^2 {:.6f}".format(
+                mae, rmse, max_abs_err, r2
+            )
+        )
+
+        current_epoch = self.trainer.epoch + 1
+        if self.trainer.writer is not None:
+            self.trainer.writer.add_scalar("val/loss", loss_avg, current_epoch)
+            self.trainer.writer.add_scalar("val/MAE", mae, current_epoch)
+            self.trainer.writer.add_scalar("val/RMSE", rmse, current_epoch)
+            self.trainer.writer.add_scalar("val/MaxE", max_abs_err, current_epoch)
+            self.trainer.writer.add_scalar("val/R2", r2, current_epoch)
+            if self.trainer.cfg.enable_wandb:
+                wandb.log(
+                    {
+                        "Epoch": current_epoch,
+                        "val/loss": loss_avg,
+                        "val/MAE": mae,
+                        "val/RMSE": rmse,
+                        "val/MaxE": max_abs_err,
+                        "val/R2": r2,
+                    },
+                    step=wandb.run.step,
+                )
+
+        self.trainer.logger.info("<<<<<<<<<<<<<<<<< End Evaluation <<<<<<<<<<<<<<<<<")
+        # Negative RMSE as best-model metric (higher = better)
+        self.trainer.comm_info["current_metric_value"] = -rmse
+        self.trainer.comm_info["current_metric_name"] = "neg_RMSE"
+
+    def after_train(self):
+        self.trainer.logger.info(
+            "Best {}: {:.6f}".format("neg_RMSE", self.trainer.best_metric_value)
+        )

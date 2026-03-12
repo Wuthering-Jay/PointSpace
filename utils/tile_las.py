@@ -22,8 +22,7 @@ from sklearn.neighbors import KDTree
 from scipy.spatial import cKDTree
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
-import CSF
-from scipy.interpolate import NearestNDInterpolator
+import open3d as o3d
 
 # Try to import pointspace logger, fallback to standard logging
 try:
@@ -76,7 +75,11 @@ class LASTileProcessor:
         max_points: Optional[int] = None,
         save_orig_idx: bool = True,
         output_format: str = 'las',
-        
+
+        calc_normals: bool = False,
+        normal_on_source: bool = True,
+        normal_k_neighbors: int = 12,
+
         calc_hag: bool = False,
         hag_ground_class: int = 2,
         hag_on_source: bool = True,
@@ -101,6 +104,11 @@ class LASTileProcessor:
         self.max_points = max_points
         self.save_orig_idx = save_orig_idx
         self.output_format = output_format.lower()
+
+        # 法向量参数
+        self.calc_normals = calc_normals
+        self.normals_on_source = normal_on_source
+        self.normal_k_neighbors = normal_k_neighbors
         
         # HAG 参数
         self.calc_hag = calc_hag
@@ -202,6 +210,15 @@ class LASTileProcessor:
             z_base_start = time.time()
             source_z_base = self._compute_z_base(points)
             self.logger.info(f"  Z_base computed in {time.time() - z_base_start:.2f}s")
+
+        # 2.3 在原始点云上计算法向量（如果启用）
+        source_normals = None
+        if self.calc_normals and self.normals_on_source:
+            self.logger.info(f"  Computing normals on source point cloud...")
+            normals_start = time.time()
+            source_normals = self._compute_normals(points)
+            self.logger.info(f"  Normals computed in {time.time() - normals_start:.2f}s")
+
         
         # 3. 滑动窗口切块 (获取索引列表)
         segments_indices, stats_list = self._segment_point_cloud(points, n_workers=n_workers)
@@ -214,7 +231,7 @@ class LASTileProcessor:
             self.logger.info(f"  Generated {total_segs} tiles")
         
         # 4. 保存分块
-        self._save_tiles(las_file, las_data, segments_indices, points, source_hag, source_z_base)
+        self._save_tiles(las_file, las_data, segments_indices, points, source_hag, source_z_base, source_normals)
         
         elapsed = time.time() - file_start
         self.logger.info(f"  Completed in {elapsed:.2f}s")
@@ -377,6 +394,33 @@ class LASTileProcessor:
                 segments[small_idx] = np.array([], dtype=int)
         
         return [segment for segment in segments if len(segment) > 0]
+
+    def _compute_normals(self, points: np.ndarray) -> np.ndarray:
+        """
+        计算点云法向量
+        使用 Open3D 极速 C++ 引擎，支持 K 近邻平滑
+        强制所有法向量 Z 分量为正 (朝向天空)
+        """
+        # 将 numpy 转换为 Open3D 点云格式
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(points)
+        
+        # 使用 KNN 估算法向。K值越大，法向越平滑，越抗噪
+        pcd.estimate_normals(
+            search_param=o3d.geometry.KDTreeSearchParamKNN(knn=self.normal_k_neighbors)
+        )
+        
+        normals = np.asarray(pcd.normals).astype(np.float32)
+        
+        # -----------------------------------------------------
+        # 🔥 极其关键的鲁棒性保证：法向一致性约束
+        # 对于地形，真实的法向必然是指向天空的（Z > 0）
+        # 将所有 Z < 0 的法向翻转，彻底解决法向乱翻的问题！
+        # -----------------------------------------------------
+        flip_mask = normals[:, 2] < 0
+        normals[flip_mask] *= -1.0
+
+        return normals
 
     def _compute_hag(self, points: np.ndarray, classification: np.ndarray) -> np.ndarray:
         """
@@ -588,7 +632,7 @@ class LASTileProcessor:
         return z_base.astype(np.float32)
 
     def _save_tiles(self, las_file: Path, las_data: laspy.LasData, segments: List[np.ndarray],
-                    points: np.ndarray = None, source_hag: np.ndarray = None, source_z_base: np.ndarray = None):
+                    points: np.ndarray = None, source_hag: np.ndarray = None, source_z_base: np.ndarray = None, source_normals: np.ndarray = None):
         """
         保存分块为 LAS/LAZ 文件
         
@@ -599,6 +643,7 @@ class LASTileProcessor:
             points: 点云坐标 (N, 3)，用于 tile 模式计算 HAG
             source_hag: 在源点云上预计算的 HAG 值（source 模式）
             source_z_base: 在源点云上预计算的 Z_base 值（source 模式）
+            source_normals: 在源点云上预计算的法向量（source 模式）
         """
         base_name = las_file.stem
         ext = f".{self.output_format}"
@@ -615,6 +660,7 @@ class LASTileProcessor:
         # 判断是否需要添加 HAG 字段
         need_hag = self.calc_hag
         need_z_base = self.calc_z_base
+        need_normal = self.calc_normals
         
         for i, indices in enumerate(tqdm(segments, desc="  Saving tiles", leave=False)):
             if len(indices) == 0:
@@ -660,6 +706,14 @@ class LASTileProcessor:
                     type=np.float32,
                     description="CSF Macro Base Surface"
                 ))
+
+            if need_normal:
+                if 'normal_x' not in existing_names:
+                    header.add_extra_dim(laspy.ExtraBytesParams(name="normal_x", type=np.float32, description="Normal Vector X"))
+                if 'normal_y' not in existing_names:
+                    header.add_extra_dim(laspy.ExtraBytesParams(name="normal_y", type=np.float32, description="Normal Vector Y"))
+                if 'normal_z' not in existing_names:
+                    header.add_extra_dim(laspy.ExtraBytesParams(name="normal_z", type=np.float32, description="Normal Vector Z"))
             
             # 创建新的 LAS 数据
             new_las = laspy.LasData(header)
@@ -697,6 +751,17 @@ class LASTileProcessor:
                     tile_points = points[indices]
                     tile_z_base = self._compute_z_base(tile_points)
                 new_las.z_base = tile_z_base.astype(np.float32)
+
+            if need_normal:
+                if self.normals_on_source:
+                    tile_normals = source_normals[indices].astype(np.float32)
+                else:
+                    # 如果在局部块计算，注意边缘可能出现畸变
+                    tile_normals = self._compute_normals(points[indices])
+                
+                new_las.normal_x = tile_normals[:, 0]
+                new_las.normal_y = tile_normals[:, 1]
+                new_las.normal_z = tile_normals[:, 2]
             
             # 更新头文件统计信息
             new_las.update_header()
@@ -711,17 +776,22 @@ class LASTileProcessor:
 if __name__ == "__main__":
     processor = LASTileProcessor(
         # 路径与格式配置
-        input_path=r"E:\data\云南遥感中心\第二批\ground-only\disk03\train",  # 原始数据路径
-        output_dir=r"E:\data\云南遥感中心\第二批\ground-only\disk03\tile\train", # 输出路径
+        input_path=r"E:\data\云南遥感中心\第二批\ground-only\disk03\val",  # 原始数据路径
+        output_dir=r"E:\data\云南遥感中心\第二批\ground-only\disk03\tile\val", # 输出路径
         output_format='las',          # 输出格式
 
         # 分块参数
-        window_size=(150.0, 150.0),   # 分块大小
+        window_size=(200.0, 200.0),   # 分块大小
         overlap=True,                 # 启用重叠
         overlap_factor=1,             # 重叠因子
         min_points=5000,              # 最小点数
         max_points=None,              # 最大点数限制（None=不限制）
         save_orig_idx=True,           # 保存原始点索引
+
+        # 法向量参数
+        calc_normals=True,           # 启用法向量计算
+        normal_on_source=True,        # 在原始点云计算法向量（推荐，避免边界效应）
+        normal_k_neighbors=30,        # 法向量 K 近邻数
 
         # HAG 参数
         calc_hag=False,                # 启用 HAG 计算
@@ -731,7 +801,7 @@ if __name__ == "__main__":
         hag_power=2.0,                # IDW 幂次（反距离平方）
 
         # Z_base 参数
-        calc_z_base=True,             # 启用 Z_base 计算
+        calc_z_base=False,             # 启用 Z_base 计算
         z_base_on_source=True,         # 在原始点云计算（强烈建议，消除块间断层）
         z_base_denoise_radius=2.0,    # 局部搜索半径(米)
         z_base_denoise_elev_diff=2.0, # 判定为高空/地下噪声的高差阈值(米)
