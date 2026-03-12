@@ -574,7 +574,8 @@ class DefaultCNF(nn.Module):
     """
 
     def __init__(self, backbone=None, head=None, criteria=None,
-                 reg_weight=0.01, terrain_alpha=2.0, ohem_ratio=0.5):
+                 reg_weight=0.01, terrain_alpha=2.0, ohem_ratio=0.5,
+                 normal_weight=0.0):
         super().__init__()
         self.backbone = build_model(backbone) if backbone is not None else None
         self.head = build_model(head) if head is not None else None
@@ -582,6 +583,7 @@ class DefaultCNF(nn.Module):
         self.reg_weight = reg_weight
         self.terrain_alpha = terrain_alpha
         self.ohem_ratio = ohem_ratio
+        self.normal_weight = normal_weight
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -637,7 +639,7 @@ class DefaultCNF(nn.Module):
     # ------------------------------------------------------------------
     # Loss
     # ------------------------------------------------------------------
-    def compute_loss(self, head_output, input_dict):
+    def compute_loss(self, head_output, input_dict, query_coord=None):
         """Compute loss for both single-branch and dual-branch heads.
 
         For single-branch heads (training), *head_output* is
@@ -647,6 +649,10 @@ class DefaultCNF(nn.Module):
 
         If ``self.criteria`` is set, delegates entirely to that module.
         Otherwise uses the appropriate built-in loss.
+
+        Args:
+            query_coord: Only needed in training when ``normal_weight > 0``
+                to compute analytical normals via autograd.
         """
         if self.criteria is not None:
             return self.criteria(head_output, input_dict)
@@ -711,7 +717,41 @@ class DefaultCNF(nn.Module):
             # 1.0 * loss_l1: 维持微观锐利，保证 MAE
             # 0.5 * loss_l2: 压低 RMSE，消除中等偏大的误差
             # 1.0 * loss_max_e: 像锤子一样砸平 30 米高的那几个 MaxE 刺头
-            loss_final = 1.0 *loss_l1 + 0.5 * loss_l2 + 1.0 * loss_max_e
+            loss_z_final = 1.0 *loss_l1 + 0.5 * loss_l2 + 1.0 * loss_max_e
+
+            # ==========================================================
+            # 🌟 5. 法向量约束 (Normal constraint via autograd)
+            # ==========================================================
+            loss_normal = torch.tensor(0.0, device=pz.device)
+            if (self.normal_weight > 0
+                    and query_coord is not None
+                    and "query_normal_gt" in input_dict):
+                gt_normal = input_dict["query_normal_gt"]  # (Q, 3), L2-normalised
+                dz_dxy = torch.autograd.grad(
+                    outputs=pz,
+                    inputs=query_coord,
+                    grad_outputs=torch.ones_like(pz),
+                    create_graph=True,
+                    retain_graph=True,
+                )[0]  # (Q, 2)
+                # analytical surface normal: n = (-dz/dx, -dz/dy, 1)
+                analytical_normal = torch.stack(
+                    [-dz_dxy[:, 0], -dz_dxy[:, 1], torch.ones_like(dz_dxy[:, 0])],
+                    dim=-1,
+                )  # (Q, 3)
+                analytical_normal = F.normalize(analytical_normal, p=2, dim=-1)
+                cos_sim = F.cosine_similarity(analytical_normal, gt_normal, dim=-1)
+                raw_normal_loss = 1.0 - cos_sim  # (Q,)
+                # OHEM on normal loss
+                num_keep_n = int(raw_normal_loss.shape[0] * self.ohem_ratio)
+                if num_keep_n > 0:
+                    loss_normal = torch.mean(
+                        torch.topk(raw_normal_loss, k=num_keep_n)[0]
+                    )
+                else:
+                    loss_normal = torch.mean(raw_normal_loss)
+
+            loss_final = loss_z_final + self.normal_weight * loss_normal
 
             monitor_mae = torch.mean(l1_error).detach()
             monitor_rmse = torch.sqrt(torch.mean(l2_error)).detach()
@@ -719,12 +759,13 @@ class DefaultCNF(nn.Module):
 
             return dict(
                 loss=loss_final,
-                loss_l1_ohem=loss_l1.detach(),
-                loss_l2=loss_l2.detach(),
-                loss_maxe_penalty=loss_max_e.detach(),
+                l1_ohem=loss_l1.detach(),
+                l2=loss_l2.detach(),
+                maxe_penalty=loss_max_e.detach(),
+                normal=loss_normal.detach(),
                 m_mae=monitor_mae,
-                m_rmse=monitor_rmse,  # 实时看 RMSE 有没有被压下去
-                m_maxe=monitor_maxe   # 实时看 MaxE 刺头还在不在
+                m_rmse=monitor_rmse,
+                m_maxe=monitor_maxe,
             )
 
         # ---- Dual-branch loss ----
@@ -771,12 +812,16 @@ class DefaultCNF(nn.Module):
 
         if self.training:
             query_coord = input_dict["query_coord"]
+            # Enable gradient tracking on query_coord for normal loss
+            if self.normal_weight > 0:
+                query_coord = query_coord.detach().requires_grad_(True)
             head_output = self.head(
                 support_coord, support_feat, query_coord,
                 support_offset=input_dict.get("offset"),
                 query_offset=input_dict.get("query_offset"),
             )
-            return self.compute_loss(head_output, input_dict)
+            return self.compute_loss(head_output, input_dict,
+                                     query_coord=query_coord)
 
         # ---- Eval / Test ----
         if "query_coord" in input_dict:

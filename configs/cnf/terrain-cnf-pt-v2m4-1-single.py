@@ -19,7 +19,7 @@ train_data_dir = r"E:\data\云南遥感中心\第二批\ground-only\disk03\tile\
 val_data_dir   = r"E:\data\云南遥感中心\第二批\ground-only\disk03\tile\val"
 test_data_dir  = r"E:\data\云南遥感中心\第二批\ground-only\disk03\tile\val"
 pred_save_dir  = r"E:\data\云南遥感中心\第二批\ground-only\disk03\tile\pred_cnf_single"
-save_path = "exp/cnf/terrain-cnf-pt-v2m4-2-single"
+save_path = "exp/cnf/terrain-cnf-pt-v2m4-3-single"
 
 # -------------------------------------------------------
 # 1. General settings
@@ -34,7 +34,7 @@ in_channels = 3
 # -------------------------------------------------------
 # 2. Checkpoint / run control
 # -------------------------------------------------------
-weight = "exp/cnf/terrain-cnf-pt-v2m4-2-single/model/model_last.pth"
+weight = "exp/cnf/terrain-cnf-pt-v2m4-3-single/model/model_last.pth"
 resume = True
 evaluate = True
 test_only = False
@@ -47,7 +47,7 @@ batch_size_train = 4
 batch_size_val = 1
 batch_size_test = 1
 num_worker = 0
-gradient_accumulation_steps = 2
+gradient_accumulation_steps = 4
 
 # -------------------------------------------------------
 # 4. Training loop
@@ -79,6 +79,7 @@ model = dict(
     reg_weight=0.0,       # no regularization for single branch
     terrain_alpha=2.0,    # terrain complexity weighting: W = 1 + alpha * |gt - z_anchor|
     ohem_ratio = 0.5,
+    normal_weight=0.5,
     backbone=dict(
         type="PT-v2m4",
         in_channels=in_channels,
@@ -158,7 +159,7 @@ writer = dict(
 # CNF test-time parameters
 query_dim = 2
 query_resolution = 0.25
-query_batch_size = 50_000
+query_batch_size = 10000
 compute_derivatives = True
 
 # -------------------------------------------------------
@@ -197,7 +198,8 @@ data = dict(
             dict(type="ToTensor"),
             dict(
                 type="Collect",
-                keys=["coord", "query_coord", "query_gt"],
+                keys=["coord", "query_coord", "query_gt", "query_normal_gt"],
+                optional_keys=["query_normal_gt"],
                 offset_keys_dict=dict(
                     offset="coord",
                     query_offset="query_coord",
@@ -230,7 +232,8 @@ data = dict(
             dict(type="ToTensor"),
             dict(
                 type="Collect",
-                keys=["coord", "query_coord", "query_gt"],
+                keys=["coord", "query_coord", "query_gt", "query_normal_gt"],
+                optional_keys=["query_normal_gt"],
                 offset_keys_dict=dict(
                     offset="coord",
                     query_offset="query_coord",

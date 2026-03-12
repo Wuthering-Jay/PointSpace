@@ -766,13 +766,14 @@ class TestDefaultCNF_SingleBranch(unittest.TestCase):
         return input_dict
 
     def test_forward_train_single_branch_loss(self):
-        """Train forward returns loss and loss_final (no loss_base/loss_reg)."""
+        """Train forward returns loss dict with expected keys."""
         model = self._make_model()
         model.train()
         inp = self._make_input(n=64, q=16)
         out = model(inp)
         self.assertIn("loss", out)
-        self.assertIn("loss_final", out)
+        self.assertIn("loss_l1_ohem", out)
+        self.assertIn("loss_normal", out)
         self.assertNotIn("loss_base", out)
         self.assertNotIn("loss_reg", out)
         self.assertTrue(out["loss"].requires_grad)
@@ -1364,6 +1365,111 @@ class TestRegistryCompleteness(unittest.TestCase):
         from pointspace.engines.test import TESTERS
 
         self.assertIn("CnfTester", TESTERS._module_dict)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Normal Constraint Tests
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class TestNormalConstraint(unittest.TestCase):
+    """Tests for normal vector constraint in DefaultCNF."""
+
+    def _make_model(self, normal_weight=0.1):
+        from pointspace.models.default import DefaultCNF
+
+        model = DefaultCNF(
+            backbone=None,
+            head=dict(
+                type="SingleBranchCNFHead",
+                backbone_out_channels=8,
+                query_dim=2,
+                num_targets=1,
+                k_neighbors=4,
+                hidden_dim=32,
+                num_freqs=4,
+                mlp_hidden_dims=[16],
+            ),
+            criteria=None,
+            reg_weight=0.0,
+            normal_weight=normal_weight,
+        )
+        model.backbone = _TinyBackbone(in_channels=3, out_channels=8)
+        return model
+
+    def _make_input(self, n=64, q=16, with_normals=True):
+        rng = np.random.RandomState(0)
+        coord = torch.from_numpy(
+            rng.uniform(0, 10, (n, 3)).astype(np.float32)
+        )
+        qc = torch.from_numpy(
+            rng.uniform(0, 10, (q, 2)).astype(np.float32)
+        )
+        qt = torch.from_numpy(
+            rng.uniform(0, 5, q).astype(np.float32)
+        )
+        inp = dict(
+            coord=coord,
+            feat=coord.clone(),
+            offset=torch.tensor([n]),
+            query_coord=qc,
+            query_gt=qt,
+            query_offset=torch.tensor([q]),
+        )
+        if with_normals:
+            normals = torch.randn(q, 3)
+            normals = normals / normals.norm(dim=-1, keepdim=True)
+            inp["query_normal_gt"] = normals
+        return inp
+
+    def test_normal_loss_nonzero_when_enabled(self):
+        """With normal_weight > 0 and normals provided, loss_normal > 0."""
+        model = self._make_model(normal_weight=0.1)
+        model.train()
+        inp = self._make_input(with_normals=True)
+        out = model(inp)
+        self.assertIn("loss_normal", out)
+        self.assertGreater(out["loss_normal"].item(), 0.0)
+
+    def test_normal_loss_zero_when_disabled(self):
+        """With normal_weight=0, loss_normal should be 0."""
+        model = self._make_model(normal_weight=0.0)
+        model.train()
+        inp = self._make_input(with_normals=True)
+        out = model(inp)
+        self.assertIn("loss_normal", out)
+        self.assertEqual(out["loss_normal"].item(), 0.0)
+
+    def test_no_normals_in_input_skips_normal_loss(self):
+        """Without query_normal_gt, loss_normal should be 0."""
+        model = self._make_model(normal_weight=0.1)
+        model.train()
+        inp = self._make_input(with_normals=False)
+        out = model(inp)
+        self.assertIn("loss_normal", out)
+        self.assertEqual(out["loss_normal"].item(), 0.0)
+
+    def test_eval_path_no_grad_on_query_coord(self):
+        """Eval forward should not require grad on query_coord."""
+        model = self._make_model(normal_weight=0.1)
+        model.eval()
+        inp = self._make_input(with_normals=True)
+        with torch.no_grad():
+            out = model(inp)
+        self.assertIn("cnf_pred", out)
+
+    def test_gradient_flows_through_normal_loss(self):
+        """Normal loss should contribute to gradient on backbone params."""
+        model = self._make_model(normal_weight=1.0)
+        model.train()
+        inp = self._make_input(with_normals=True)
+        out = model(inp)
+        out["loss"].backward()
+        has_grad = any(
+            p.grad is not None and p.grad.abs().sum() > 0
+            for p in model.parameters() if p.requires_grad
+        )
+        self.assertTrue(has_grad)
 
 
 if __name__ == "__main__":

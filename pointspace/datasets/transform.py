@@ -57,7 +57,7 @@ def index_operator(data_dict, index, duplicate=False):
 
 @TRANSFORMS.register_module()
 class Collect(object):
-    def __init__(self, keys, offset_keys_dict=None, **kwargs):
+    def __init__(self, keys, offset_keys_dict=None, optional_keys=None, **kwargs):
         """
         e.g. Collect(keys=[coord], feat_keys=[coord, color])
         """
@@ -65,6 +65,7 @@ class Collect(object):
             offset_keys_dict = dict(offset="coord")
         self.keys = keys
         self.offset_keys = offset_keys_dict
+        self.optional_keys = set(optional_keys) if optional_keys else set()
         self.kwargs = kwargs
 
     def __call__(self, data_dict):
@@ -72,7 +73,13 @@ class Collect(object):
         if isinstance(self.keys, str):
             self.keys = [self.keys]
         for key in self.keys:
-            data[key] = data_dict[key]
+            if key in data_dict:
+                data[key] = data_dict[key]
+            elif key not in self.optional_keys:
+                raise KeyError(
+                    f"Collect: required key '{key}' not found in data_dict. "
+                    f"Available keys: {list(data_dict.keys())}"
+                )
         for key, value in self.offset_keys.items():
             data[key] = torch.tensor([data_dict[value].shape[0]])
         for name, keys in self.kwargs.items():
@@ -1995,19 +2002,32 @@ class TerrainImplicitSampler(object):
             query_mask[0] = False
 
         # ==========================================
-        # 🌟 提取真值与网络输入
+        # 🌟 第一段：提取 (index_operator 破坏数组长度之前)
         # ==========================================
         query_coord_xy = coord[query_mask, :2].copy().astype(np.float32)
-        query_gt_raw = coord[query_mask, 2].copy().astype(np.float32)
+        query_gt_raw   = coord[query_mask, 2].copy().astype(np.float32)
 
-        # 使用框架原生算子切片 Support 点
+        if "normal" in data_dict:
+            raw_qn = data_dict["normal"][query_mask].astype(np.float32)
+            norms = np.linalg.norm(raw_qn, axis=-1, keepdims=True) + 1e-6
+            query_normal_gt = raw_qn / norms
+        else:
+            query_normal_gt = None
+
+        # ==========================================
+        # 第二段：破坏性切片，仅保留 Support 点
+        # ==========================================
         data_dict = index_operator(data_dict, np.where(support_mask)[0])
-        
-        # 注入 Query 属性供 Head 监督使用
+
+        # ==========================================
+        # 第三段：干净注入
+        # ==========================================
         data_dict["query_coord"] = query_coord_xy
-        data_dict["query_gt"] = query_gt_raw
+        data_dict["query_gt"]    = query_gt_raw
         if z_low_full is not None:
             data_dict["query_gt_low"] = z_low_full[query_mask].copy().astype(np.float32)
+        if query_normal_gt is not None:
+            data_dict["query_normal_gt"] = query_normal_gt
 
         return data_dict
 
