@@ -575,7 +575,8 @@ class DefaultCNF(nn.Module):
 
     def __init__(self, backbone=None, head=None, criteria=None,
                  reg_weight=0.01, terrain_alpha=2.0, ohem_ratio=0.5,
-                 normal_weight=0.0):
+                 normal_weight=0.0, enable_normal_loss=True,
+                 filter_non_ground=False, ground_class=2):
         super().__init__()
         self.backbone = build_model(backbone) if backbone is not None else None
         self.head = build_model(head) if head is not None else None
@@ -584,9 +585,47 @@ class DefaultCNF(nn.Module):
         self.terrain_alpha = terrain_alpha
         self.ohem_ratio = ohem_ratio
         self.normal_weight = normal_weight
+        self.enable_normal_loss = enable_normal_loss
+        self.filter_non_ground = filter_non_ground
+        self.ground_class = ground_class
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+    def _filter_ground(self, support_feat, support_coord, input_dict):
+        """Filter out non-ground points after backbone encoding.
+
+        Returns filtered (feat, coord, offset).  When ``filter_non_ground``
+        is False or ``classification`` is absent the inputs are returned
+        unchanged.
+        """
+        support_offset = input_dict.get("offset")
+        if not self.filter_non_ground:
+            return support_feat, support_coord, support_offset
+
+        # 支持 "segment" (LasDataset) 和 "classification" 两种 key
+        if "segment" in input_dict:
+            cls_labels = input_dict["segment"].squeeze()
+        elif "classification" in input_dict:
+            cls_labels = input_dict["classification"].squeeze()
+        else:
+            return support_feat, support_coord, support_offset
+        ground_mask = (cls_labels == self.ground_class)
+
+        if not ground_mask.any():
+            ground_mask[0] = True
+
+        support_coord = support_coord[ground_mask]
+        support_feat = support_feat[ground_mask]
+
+        if support_offset is not None:
+            batch_size = support_offset.shape[0]
+            batch_idx = offset2batch(support_offset)
+            batch_idx_ground = batch_idx[ground_mask]
+            counts = torch.bincount(batch_idx_ground, minlength=batch_size)
+            support_offset = torch.cumsum(counts, dim=0).int()
+
+        return support_feat, support_coord, support_offset
+
     def _run_backbone(self, input_dict):
         """Run backbone with Point wrapping and unwind pooling hierarchy.
 
@@ -613,9 +652,13 @@ class DefaultCNF(nn.Module):
     # Public sub-methods (called by CnfTester)
     # ------------------------------------------------------------------
     def extract_feat(self, input_dict):
-        """[Inference] Run backbone only, return ``{feat, coord}``."""
+        """[Inference] Run backbone only, return ``{feat, coord, offset}``."""
         feat, coord = self._run_backbone(input_dict)
-        return dict(feat=feat, coord=coord)
+        feat, coord, offset = self._filter_ground(feat, coord, input_dict)
+        result = dict(feat=feat, coord=coord)
+        if offset is not None:
+            result["offset"] = offset
+        return result
 
     def query_forward(self, support_coord, support_feat, query_coord):
         """[Inference] Run head only, return final prediction.
@@ -723,7 +766,8 @@ class DefaultCNF(nn.Module):
             # 🌟 5. 法向量约束 (Normal constraint via autograd)
             # ==========================================================
             loss_normal = torch.tensor(0.0, device=pz.device)
-            if (self.normal_weight > 0
+            if (self.enable_normal_loss
+                    and self.normal_weight > 0
                     and query_coord is not None
                     and "query_normal_gt" in input_dict):
                 gt_normal = input_dict["query_normal_gt"]  # (Q, 3), L2-normalised
@@ -809,15 +853,18 @@ class DefaultCNF(nn.Module):
             Returns ``dict(support_feat=..., support_coord=...)``.
         """
         support_feat, support_coord = self._run_backbone(input_dict)
+        support_feat, support_coord, support_offset = self._filter_ground(
+            support_feat, support_coord, input_dict
+        )
 
         if self.training:
             query_coord = input_dict["query_coord"]
             # Enable gradient tracking on query_coord for normal loss
-            if self.normal_weight > 0:
+            if self.normal_weight > 0 and self.enable_normal_loss:
                 query_coord = query_coord.detach().requires_grad_(True)
             head_output = self.head(
                 support_coord, support_feat, query_coord,
-                support_offset=input_dict.get("offset"),
+                support_offset=support_offset,
                 query_offset=input_dict.get("query_offset"),
             )
             return self.compute_loss(head_output, input_dict,
@@ -828,7 +875,7 @@ class DefaultCNF(nn.Module):
             query_coord = input_dict["query_coord"]
             head_output = self.head(
                 support_coord, support_feat, query_coord,
-                support_offset=input_dict.get("offset"),
+                support_offset=support_offset,
                 query_offset=input_dict.get("query_offset"),
             )
             if isinstance(head_output, tuple):

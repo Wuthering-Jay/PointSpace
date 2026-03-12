@@ -1766,6 +1766,8 @@ class TerrainImplicitSampler(object):
                  feature_resolution=2.0,       # 极速地形特征提取的 2.5D 栅格分辨率(米)
                  max_query_ratio=0.6,          # 安全阈值: 确保 Query 点不超过总点的比例，防止 Backbone 无点可用
                  compute_gt_low=True,          # 是否计算低频平滑真值 (双分支需要, 单分支可关闭)
+                 query_max=None,
+                 ground_class=None,            # 若非 None，仅从该类别的地面点中抽取 Query
                  ):
         self.random_ratio = random_ratio
         self.feature_ratio = feature_ratio
@@ -1774,6 +1776,8 @@ class TerrainImplicitSampler(object):
         self.feature_resolution = feature_resolution
         self.max_query_ratio = max_query_ratio
         self.compute_gt_low = compute_gt_low
+        self.query_max = query_max
+        self.ground_class = ground_class
 
     def _fast_topographic_weights(self, coord):
         """
@@ -1942,6 +1946,14 @@ class TerrainImplicitSampler(object):
         else:
             z_low_full = None
 
+        # ==========================================
+        # 🌟 地面点掩码 (当 ground_class 不为 None 时，仅从地面点中抽 Query)
+        # ==========================================
+        if self.ground_class is not None and "segment" in data_dict:
+            ground_eligible = (data_dict["segment"].flatten() == self.ground_class)
+        else:
+            ground_eligible = None  # 全部点均可成为 Query
+
         # 全局掩码，标记哪些点被挖走作为 Query
         query_mask = np.zeros(num_points, dtype=bool)
 
@@ -1977,10 +1989,18 @@ class TerrainImplicitSampler(object):
             query_mask[rand_indices] = True
 
         # ==========================================
+        # 🌟 限制 Query 仅来自地面点: 非地面点永远留在 Support
+        # ==========================================
+        if ground_eligible is not None:
+            query_mask &= ground_eligible
+
+        # ==========================================
         # 截断与保底机制：确保有足够的点送给 Backbone 提特征
         # ==========================================
         query_indices = np.where(query_mask)[0]
         max_allowed_queries = max(1, int(num_points * self.max_query_ratio))
+        if self.query_max is not None:
+            max_allowed_queries = min(max_allowed_queries, self.query_max)
 
         if len(query_indices) > max_allowed_queries:
             # 如果挖得太猛，随机归还一部分给 Support
@@ -1991,7 +2011,11 @@ class TerrainImplicitSampler(object):
 
         # 保底：若没有任何 query，随机选 1 个点作为 query
         if query_mask.sum() == 0:
-            fallback = np.random.randint(num_points)
+            if ground_eligible is not None and ground_eligible.any():
+                candidates = np.where(ground_eligible)[0]
+                fallback = candidates[np.random.randint(len(candidates))]
+            else:
+                fallback = np.random.randint(num_points)
             query_mask[fallback] = True
 
         # 最终掩码
@@ -2030,6 +2054,56 @@ class TerrainImplicitSampler(object):
             data_dict["query_normal_gt"] = query_normal_gt
 
         return data_dict
+
+
+@TRANSFORMS.register_module()
+class CategoryAwareDownsample(object):
+    """Non-ground voxel downsampling while preserving 100% ground points.
+
+    Ground points (``segment == ground_class``) are kept at full density.
+    Non-ground points are voxel-downsampled to reduce computational cost
+    while still providing semantic context to the backbone.
+
+    Args:
+        grid_size (float): Voxel edge length for non-ground downsampling.
+        ground_class (int): LAS classification code for ground (default 2).
+    """
+
+    def __init__(self, grid_size=1.0, ground_class=2):
+        self.grid_size = grid_size
+        self.ground_class = ground_class
+
+    def __call__(self, data_dict):
+        if "segment" not in data_dict or "coord" not in data_dict:
+            return data_dict
+
+        coord = data_dict["coord"]
+        num_points = coord.shape[0]
+        if num_points < 10:
+            return data_dict
+
+        segment = data_dict["segment"].flatten()
+        ground_indices = np.where(segment == self.ground_class)[0]
+        non_ground_indices = np.where(segment != self.ground_class)[0]
+
+        if len(non_ground_indices) == 0:
+            # All ground — nothing to downsample
+            return data_dict
+
+        # Voxel downsample non-ground points
+        ng_coord = coord[non_ground_indices]
+        voxel_idx = np.floor(ng_coord / self.grid_size).astype(np.int32)
+        # Produce a unique key per voxel via structured array view
+        _, unique_rel_idx = np.unique(
+            voxel_idx, axis=0, return_index=True
+        )
+        sampled_non_ground = non_ground_indices[unique_rel_idx]
+
+        # Merge and shuffle
+        keep_indices = np.concatenate([ground_indices, sampled_non_ground])
+        np.random.shuffle(keep_indices)
+
+        return index_operator(data_dict, keep_indices)
 
 
 @TRANSFORMS.register_module()

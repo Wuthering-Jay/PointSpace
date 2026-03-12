@@ -772,8 +772,8 @@ class TestDefaultCNF_SingleBranch(unittest.TestCase):
         inp = self._make_input(n=64, q=16)
         out = model(inp)
         self.assertIn("loss", out)
-        self.assertIn("loss_l1_ohem", out)
-        self.assertIn("loss_normal", out)
+        self.assertIn("l1_ohem", out)
+        self.assertIn("normal", out)
         self.assertNotIn("loss_base", out)
         self.assertNotIn("loss_reg", out)
         self.assertTrue(out["loss"].requires_grad)
@@ -1423,31 +1423,31 @@ class TestNormalConstraint(unittest.TestCase):
         return inp
 
     def test_normal_loss_nonzero_when_enabled(self):
-        """With normal_weight > 0 and normals provided, loss_normal > 0."""
+        """With normal_weight > 0 and normals provided, normal loss > 0."""
         model = self._make_model(normal_weight=0.1)
         model.train()
         inp = self._make_input(with_normals=True)
         out = model(inp)
-        self.assertIn("loss_normal", out)
-        self.assertGreater(out["loss_normal"].item(), 0.0)
+        self.assertIn("normal", out)
+        self.assertGreater(out["normal"].item(), 0.0)
 
     def test_normal_loss_zero_when_disabled(self):
-        """With normal_weight=0, loss_normal should be 0."""
+        """With normal_weight=0, normal loss should be 0."""
         model = self._make_model(normal_weight=0.0)
         model.train()
         inp = self._make_input(with_normals=True)
         out = model(inp)
-        self.assertIn("loss_normal", out)
-        self.assertEqual(out["loss_normal"].item(), 0.0)
+        self.assertIn("normal", out)
+        self.assertEqual(out["normal"].item(), 0.0)
 
     def test_no_normals_in_input_skips_normal_loss(self):
-        """Without query_normal_gt, loss_normal should be 0."""
+        """Without query_normal_gt, normal loss should be 0."""
         model = self._make_model(normal_weight=0.1)
         model.train()
         inp = self._make_input(with_normals=False)
         out = model(inp)
-        self.assertIn("loss_normal", out)
-        self.assertEqual(out["loss_normal"].item(), 0.0)
+        self.assertIn("normal", out)
+        self.assertEqual(out["normal"].item(), 0.0)
 
     def test_eval_path_no_grad_on_query_coord(self):
         """Eval forward should not require grad on query_coord."""

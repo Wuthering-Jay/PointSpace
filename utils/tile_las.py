@@ -79,6 +79,7 @@ class LASTileProcessor:
         calc_normals: bool = False,
         normal_on_source: bool = True,
         normal_k_neighbors: int = 12,
+        normal_class=None,
 
         calc_hag: bool = False,
         hag_ground_class: int = 2,
@@ -109,6 +110,11 @@ class LASTileProcessor:
         self.calc_normals = calc_normals
         self.normals_on_source = normal_on_source
         self.normal_k_neighbors = normal_k_neighbors
+        # 若非 None，仅对指定类别计算法向量，其他类别赋 [0,0,1]
+        self.normal_class = (
+            list(normal_class) if isinstance(normal_class, (list, tuple))
+            else ([normal_class] if normal_class is not None else None)
+        )
         
         # HAG 参数
         self.calc_hag = calc_hag
@@ -216,7 +222,8 @@ class LASTileProcessor:
         if self.calc_normals and self.normals_on_source:
             self.logger.info(f"  Computing normals on source point cloud...")
             normals_start = time.time()
-            source_normals = self._compute_normals(points)
+            src_cls = np.array(las_data.classification) if self.normal_class is not None else None
+            source_normals = self._compute_normals(points, classification=src_cls)
             self.logger.info(f"  Normals computed in {time.time() - normals_start:.2f}s")
 
         
@@ -395,30 +402,60 @@ class LASTileProcessor:
         
         return [segment for segment in segments if len(segment) > 0]
 
-    def _compute_normals(self, points: np.ndarray) -> np.ndarray:
+    def _compute_normals(self, points: np.ndarray,
+                         classification: np.ndarray = None) -> np.ndarray:
         """
         计算点云法向量
         使用 Open3D 极速 C++ 引擎，支持 K 近邻平滑
         强制所有法向量 Z 分量为正 (朝向天空)
+
+        Args:
+            points: 点云坐标 (N, 3)
+            classification: 逐点分类标签 (N,)；仅当 ``normal_class`` 非 None
+                时使用。指定类别的点参与 KNN 计算，其他类别法向量默认为 [0, 0, 1]。
         """
-        # 将 numpy 转换为 Open3D 点云格式
+        # ------------------------------------------------------------------
+        # 确定参与计算的点集
+        # ------------------------------------------------------------------
+        if self.normal_class is not None and classification is not None:
+            mask = np.isin(classification, self.normal_class)
+            sub_points = points[mask]
+        else:
+            mask = None
+            sub_points = points
+
+        # 所有点默认法向量为 [0, 0, 1]（朝天）
+        normals = np.zeros((len(points), 3), dtype=np.float32)
+        normals[:, 2] = 1.0
+
+        if len(sub_points) < 3:
+            return normals
+
+        # ------------------------------------------------------------------
+        # Open3D KNN 法向估算（仅在子集点上构建 KD-Tree）
+        # ------------------------------------------------------------------
         pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(points)
-        
+        pcd.points = o3d.utility.Vector3dVector(sub_points)
+
         # 使用 KNN 估算法向。K值越大，法向越平滑，越抗噪
         pcd.estimate_normals(
             search_param=o3d.geometry.KDTreeSearchParamKNN(knn=self.normal_k_neighbors)
         )
-        
-        normals = np.asarray(pcd.normals).astype(np.float32)
-        
+
+        sub_normals = np.asarray(pcd.normals).astype(np.float32)
+
         # -----------------------------------------------------
         # 🔥 极其关键的鲁棒性保证：法向一致性约束
         # 对于地形，真实的法向必然是指向天空的（Z > 0）
         # 将所有 Z < 0 的法向翻转，彻底解决法向乱翻的问题！
         # -----------------------------------------------------
-        flip_mask = normals[:, 2] < 0
-        normals[flip_mask] *= -1.0
+        flip_mask = sub_normals[:, 2] < 0
+        sub_normals[flip_mask] *= -1.0
+
+        if mask is not None:
+            normals[mask] = sub_normals
+        else:
+            normals = sub_normals
 
         return normals
 
@@ -757,7 +794,8 @@ class LASTileProcessor:
                     tile_normals = source_normals[indices].astype(np.float32)
                 else:
                     # 如果在局部块计算，注意边缘可能出现畸变
-                    tile_normals = self._compute_normals(points[indices])
+                    tile_cls = np.array(source_points['classification']) if self.normal_class is not None else None
+                    tile_normals = self._compute_normals(points[indices], classification=tile_cls)
                 
                 new_las.normal_x = tile_normals[:, 0]
                 new_las.normal_y = tile_normals[:, 1]
@@ -776,8 +814,8 @@ class LASTileProcessor:
 if __name__ == "__main__":
     processor = LASTileProcessor(
         # 路径与格式配置
-        input_path=r"E:\data\云南遥感中心\第二批\ground-only\disk03\val",  # 原始数据路径
-        output_dir=r"E:\data\云南遥感中心\第二批\ground-only\disk03\tile\val", # 输出路径
+        input_path=r"E:\data\云南遥感中心\第二批\disk03\val",  # 原始数据路径
+        output_dir=r"E:\data\云南遥感中心\第二批\disk03\tile\val", # 输出路径
         output_format='las',          # 输出格式
 
         # 分块参数
@@ -792,6 +830,7 @@ if __name__ == "__main__":
         calc_normals=True,           # 启用法向量计算
         normal_on_source=True,        # 在原始点云计算法向量（推荐，避免边界效应）
         normal_k_neighbors=30,        # 法向量 K 近邻数
+        normal_class=[2],              # 仅使用地面点计算法向量（如果 None 则使用全部点）
 
         # HAG 参数
         calc_hag=False,                # 启用 HAG 计算

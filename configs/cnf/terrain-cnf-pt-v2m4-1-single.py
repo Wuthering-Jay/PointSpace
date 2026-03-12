@@ -15,26 +15,26 @@
 # -------------------------------------------------------
 # 0. Path settings
 # -------------------------------------------------------
-train_data_dir = r"E:\data\云南遥感中心\第二批\ground-only\disk03\tile\train"
-val_data_dir   = r"E:\data\云南遥感中心\第二批\ground-only\disk03\tile\val"
-test_data_dir  = r"E:\data\云南遥感中心\第二批\ground-only\disk03\tile\val"
-pred_save_dir  = r"E:\data\云南遥感中心\第二批\ground-only\disk03\tile\pred_cnf_single"
-save_path = "exp/cnf/terrain-cnf-pt-v2m4-3-single"
+train_data_dir = r"E:\data\云南遥感中心\第二批\disk03\tile\train"
+val_data_dir   = r"E:\data\云南遥感中心\第二批\disk03\tile\val"
+test_data_dir  = r"E:\data\云南遥感中心\第二批\disk03\tile\val"
+pred_save_dir  = r"E:\data\云南遥感中心\第二批\disk03\tile\pred_cnf"
+save_path = "exp/cnf/terrain-cnf-pt-v2m4-4-single"
 
 # -------------------------------------------------------
 # 1. General settings
 # -------------------------------------------------------
-grid_size = 0.5
+grid_size = 1.0
 ignore_index = -1
 dataset_type = "LasDataset"
-ground_class = [2]
+ground_class = 2
 feature_keys = ["coord"]
 in_channels = 3
 
 # -------------------------------------------------------
 # 2. Checkpoint / run control
 # -------------------------------------------------------
-weight = "exp/cnf/terrain-cnf-pt-v2m4-3-single/model/model_last.pth"
+weight = "exp/cnf/terrain-cnf-pt-v2m4-4-single/model/model_last.pth"
 resume = True
 evaluate = True
 test_only = False
@@ -79,10 +79,16 @@ model = dict(
     reg_weight=0.0,       # no regularization for single branch
     terrain_alpha=2.0,    # terrain complexity weighting: W = 1 + alpha * |gt - z_anchor|
     ohem_ratio = 0.5,
-    normal_weight=0.5,
+    normal_weight=10.0,
+    enable_normal_loss=True,
+    filter_non_ground=True,   # post-backbone: keep only ground for head
+    ground_class=ground_class,           # LAS class 2 = ground
     backbone=dict(
-        type="PT-v2m4",
+        type="PT-v2m5",
         in_channels=in_channels,
+        use_cls_embed=True,       # LAS semantic class embedding
+        num_classes=32,           # max LAS classification code
+        cls_embed_dim=16,         # embedding dimension
         patch_embed_depth=1,
         patch_embed_channels=24,
         patch_embed_groups=6,
@@ -114,9 +120,9 @@ model = dict(
         query_dim=2,                # predict z from (x, y)
         num_targets=1,              # scalar output (terrain height)
         k_neighbors=24,             # KNN for IDW anchor + grouped features
-        hidden_dim=256,             # fusion hidden dimension
+        hidden_dim=128,             # fusion hidden dimension
         num_freqs=6,                # Fourier PE octaves
-        mlp_hidden_dims=[128, 64],
+        mlp_hidden_dims=[64, 32],
     ),
     criteria=None,  # use built-in SmoothL1 loss
 )
@@ -178,7 +184,7 @@ data = dict(
         weighted_sampler="terrain",
         transform=[
             dict(type="ZPercentileCenterShift", percentile=2.0),
-            dict(type="ClassFilter", keep_classes=ground_class, class_key="segment"),
+            dict(type="CategoryAwareDownsample", grid_size=grid_size, ground_class=ground_class),
             dict(type="RandomRotate", angle=[-1, 1], axis="z", center=[0, 0, 0], p=0.5),
             dict(type="RandomScale", scale=[0.9, 1.1]),
             dict(type="RandomFlip", p=0.5),
@@ -187,19 +193,21 @@ data = dict(
                 type="TerrainImplicitSampler",
                 random_ratio=0.1,
                 feature_ratio=0.1,
-                max_blocks=5,
-                block_size_range=(5.0, 50.0),
+                max_blocks=3,
+                block_size_range=(5.0, 30.0),
                 feature_resolution=2.0,
-                max_query_ratio=0.5,
+                max_query_ratio=0.6,
+                query_max=4096,
                 compute_gt_low=False,
+                ground_class=ground_class,
             ),
         ],
         post_transform=[
             dict(type="ToTensor"),
             dict(
                 type="Collect",
-                keys=["coord", "query_coord", "query_gt", "query_normal_gt"],
-                optional_keys=["query_normal_gt"],
+                keys=["coord", "segment", "query_coord", "query_gt", "query_normal_gt"],
+                optional_keys=["query_normal_gt", "segment"],
                 offset_keys_dict=dict(
                     offset="coord",
                     query_offset="query_coord",
@@ -216,24 +224,26 @@ data = dict(
         loop=4,
         transform=[
             dict(type="ZPercentileCenterShift", percentile=2.0),
-            dict(type="ClassFilter", keep_classes=ground_class, class_key="segment"),
+            dict(type="CategoryAwareDownsample", grid_size=grid_size, ground_class=ground_class),
             dict(
                 type="TerrainImplicitSampler",
                 random_ratio=0.1,
                 feature_ratio=0.1,
-                max_blocks=5,
-                block_size_range=(5.0, 50.0),
+                max_blocks=3,
+                block_size_range=(5.0, 30.0),
                 feature_resolution=2.0,
-                max_query_ratio=0.5,
+                max_query_ratio=0.6,
+                query_max=4096,
                 compute_gt_low=False,
+                ground_class=ground_class,
             ),
         ],
         post_transform=[
             dict(type="ToTensor"),
             dict(
                 type="Collect",
-                keys=["coord", "query_coord", "query_gt", "query_normal_gt"],
-                optional_keys=["query_normal_gt"],
+                keys=["coord", "segment", "query_coord", "query_gt", "query_normal_gt"],
+                optional_keys=["query_normal_gt", "segment"],
                 offset_keys_dict=dict(
                     offset="coord",
                     query_offset="query_coord",
@@ -249,7 +259,7 @@ data = dict(
         test_mode=True,
         transform=[
             dict(type="ZPercentileCenterShift", percentile=2.0),
-            dict(type="ClassFilter", keep_classes=ground_class, class_key="segment"),
+            dict(type="CategoryAwareDownsample", grid_size=grid_size, ground_class=ground_class),
         ],
         aug_transform=[
             [dict(type="RandomScale", scale=[1, 1])],
@@ -258,7 +268,8 @@ data = dict(
             dict(type="ToTensor"),
             dict(
                 type="Collect",
-                keys=["coord"],
+                keys=["coord", "segment"],
+                optional_keys=["segment"],
                 feat_keys=feature_keys,
             ),
         ],

@@ -1910,69 +1910,22 @@ class CnfTester(TesterBase):
             )
 
             # ============================================================
-            # Phase 2: Build query grid (occupancy-masked)
+            # Phase 2: Build query grid (Convex Hull Masked)
+            # 彻底抛弃形态学，使用凸包确保包容所有内部空洞！
             # ============================================================
+            import numpy as np
+            from scipy.spatial import ConvexHull
+            from matplotlib.path import Path
+            import torch
+            
             qd = query_dim
             xy_min = support_coord[:, :qd].min(dim=0).values.cpu()
             xy_max = support_coord[:, :qd].max(dim=0).values.cpu()
-
-            # --- Occupancy mask pipeline:
-            # 1. Bin support XY into a coarse grid
-            # 2. binary_closing (adaptive iterations) — bridges gaps in the
-            #    outer ring of support points so the interior boundary is
-            #    fully sealed from the exterior
-            # 3. Exterior flood-fill via scipy.ndimage.label — labels
-            #    connected components of background; the component touching
-            #    the grid corner (always exterior thanks to 2-cell padding)
-            #    is the true outside.  Everything else becomes True, filling
-            #    ALL interior voids regardless of size.
-            # 4. binary_dilation(1) — slight outward tolerance
-            occ_cell = query_resolution * 5  # coarse cell size
             support_xy_np = support_coord[:, :qd].cpu().numpy()
 
-            # Extra border padding: enough cells so closing and flood-fill
-            # have room to operate near the grid edge — we use the larger of
-            # 2 cells or the gap-closing radius so the corners stay exterior.
-            _gap_close_iters = max(3, int(np.ceil(5.0 / occ_cell)))
-            _pad_cells = _gap_close_iters + 2
-            occ_axes = [
-                np.arange(
-                    lo.item() - _pad_cells * occ_cell,
-                    hi.item() + (_pad_cells + 1) * occ_cell,
-                    occ_cell,
-                )
-                for lo, hi in zip(xy_min, xy_max)
-            ]
-            # Digitise support points into coarse bins
-            occ_bin_idx = [
-                np.clip(
-                    np.digitize(support_xy_np[:, d], occ_axes[d]) - 1,
-                    0, len(occ_axes[d]) - 1,
-                )
-                for d in range(qd)
-            ]
-            occ_shape = tuple(len(a) for a in occ_axes)
-            occ_grid = np.zeros(occ_shape, dtype=bool)
-            occ_grid[tuple(occ_bin_idx)] = True
-
-            # Step 2: close gaps so the outer ring has no through-holes.
-            # iterations = ceil(5 m / occ_cell) bridges typical data gaps.
-            occ_grid = binary_closing(occ_grid, iterations=_gap_close_iters)
-
-            # Step 3: exterior flood-fill.
-            # Label every connected component of the background (~occ_grid).
-            # The top-left corner cell [0, 0] is guaranteed to be background
-            # (exterior) because of the generous padding above.  Every other
-            # background component is an interior void — mark it as interior.
-            _bg_labels, _ = _ndimage_label(~occ_grid)
-            _exterior_label = _bg_labels[0, 0]  # corner = exterior
-            occ_grid = _bg_labels != _exterior_label  # True = inside outer boundary
-
-            # Step 4: small outward dilation so boundary query points are
-            # not clipped exactly at the last support point.
-            occ_grid = binary_dilation(occ_grid, iterations=1)
-
-            # Build fine query grid
+            # ---------------------------------------------------------
+            # Step 1: 构建密集的 Bounding Box 网格 (Fine Query Grid)
+            # ---------------------------------------------------------
             axes = [
                 torch.arange(
                     lo.item(),
@@ -1984,28 +1937,51 @@ class CnfTester(TesterBase):
             grids = torch.meshgrid(*axes, indexing="ij")
             query_xy_full = torch.stack(
                 [g.flatten() for g in grids], dim=1
-            )  # (Q_full, qd)
+            )  # (Q_full, 2)
 
-            # Map each fine query point to its coarse bin and filter
-            occ_idx = []
-            for d in range(qd):
-                bin_d = np.clip(
-                    np.digitize(query_xy_full[:, d].numpy(), occ_axes[d]) - 1,
-                    0, occ_shape[d] - 1,
-                )
-                occ_idx.append(bin_d)
-            keep_mask = occ_grid[tuple(occ_idx)]
-            query_xy = query_xy_full[keep_mask]
-            total_queries = query_xy.shape[0]
+            # 如果点数极少（比如刚好只有3、4个点排成一线），直接返回 bbox 网格
+            if support_xy_np.shape[0] < 4:
+                query_xy = query_xy_full
+                total_queries = query_xy.shape[0]
+                logger.info(f"CNF Query grid: {total_queries} points (Fallback to BBox)")
+            else:
+                # ---------------------------------------------------------
+                # Step 2: 计算二维凸包 (Convex Hull) 作为绝对密封的边界
+                # ---------------------------------------------------------
+                try:
+                    # 计算外围轮廓
+                    hull = ConvexHull(support_xy_np)
+                    # 提取构成外围轮廓的顶点坐标
+                    hull_vertices = support_xy_np[hull.vertices]
+                    
+                    # ---------------------------------------------------------
+                    # Step 3: 使用 Ray Casting 算法快速判断哪些网格点在凸包内部
+                    # matplotlib.path.Path 是底层 C++ 实现的，速度极快
+                    # ---------------------------------------------------------
+                    poly_path = Path(hull_vertices)
+                    
+                    # 传入所有的 Query 坐标 (N, 2)，返回布尔掩码
+                    # radius=query_resolution 相当于在边界外向外扩张一点点容差，防止边缘点被误杀
+                    keep_mask = poly_path.contains_points(
+                        query_xy_full.numpy(), 
+                        radius=query_resolution * 0.5 
+                    )
+                    
+                    query_xy = query_xy_full[keep_mask]
+                    
+                except Exception as e:
+                    # 如果算凸包失败（比如所有点都在一条直线上），退回到 BBox
+                    logger.warning(f"Convex hull failed: {e}. Falling back to BBox grid.")
+                    query_xy = query_xy_full
 
-            logger.info(
-                "CNF Query grid: {} points (bbox {} -> masked {}, occ_cell {:.2f})".format(
-                    total_queries,
-                    query_xy_full.shape[0],
-                    total_queries,
-                    occ_cell,
+                total_queries = query_xy.shape[0]
+                logger.info(
+                    "CNF Query grid: {} points (bbox {} -> hull masked {})".format(
+                        total_queries,
+                        query_xy_full.shape[0],
+                        total_queries,
+                    )
                 )
-            )
 
             # ============================================================
             # Phase 3: Batch query through head
