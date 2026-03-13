@@ -791,13 +791,15 @@ class PointTransformerV2(PointModule):
 
         # 提取逐点类别标签 (可选)
         if self.use_cls_embed:
-            if hasattr(point, "segment") and point.segment is not None:
-                cls_label = point.segment
-            elif hasattr(point, "classification") and point.classification is not None:
-                cls_label = point.classification
+            if "segment" in point.keys() and point["segment"] is not None:
+                cls_label = point["segment"]
+            elif "classification" in point.keys() and point["classification"] is not None:
+                cls_label = point["classification"]
             else:
                 cls_label = torch.zeros(coord.shape[0], dtype=torch.long,
                                         device=coord.device)
+            if not torch.is_tensor(cls_label):
+                cls_label = torch.as_tensor(cls_label, device=coord.device)
             if cls_label.dim() > 1:
                 cls_label = cls_label.view(-1)
             points = [coord, feat, offset, cls_label]

@@ -366,9 +366,30 @@ class SingleBranchCNFHead(nn.Module):
         q_row, s_col = assign[0], assign[1]
         Q = q_xy.shape[0]
 
-        # 2. Gather neighbour data → (Q, K, ...)
-        grouped_coords = support_coord[s_col].view(Q, K, -1)       # (Q, K, 3)
-        grouped_feats = support_feat[s_col].view(Q, K, -1)         # (Q, K, C)
+        counts = torch.bincount(q_row, minlength=Q)
+        if (counts == K).all():
+            # 数据良好，直接 reshape (摒弃危险的 view(..., -1))
+            s_col_dense = s_col.reshape(Q, K)
+        else:
+            # 遭遇极端稀疏切块，开启自动复制补齐
+            s_col_dense = torch.zeros((Q, K), dtype=torch.long, device=s_xy.device)
+            ptr = torch.cat([counts.new_zeros(1), counts.cumsum(0)])
+            for k in range(K):
+                # 存在第 k 个邻居的 query
+                valid = counts > k
+                s_col_dense[valid, k] = s_col[ptr[valid] + k]
+                
+                # 不存在第 k 个邻居的 query，用它自己的第 0 个邻居(最近点)安全垫底
+                invalid = ~valid
+                has_any = counts > 0
+                mask = invalid & has_any
+                if mask.any():
+                    s_col_dense[mask, k] = s_col[ptr[mask]]
+
+        # 2. Gather neighbour data
+        # 使用安全的 [Q, K] 二维索引数组，绝对保证最后取出来是 [Q, K, 3] 和 [Q, K, C]
+        grouped_coords = support_coord[s_col_dense]        # (Q, K, 3)
+        grouped_feats = support_feat[s_col_dense]          # (Q, K, C)
 
         # 3. Relative XY: neighbour − query
         relative_xy = grouped_coords[:, :, :qd] - q_xy.unsqueeze(1)  # (Q, K, qd)

@@ -18,6 +18,8 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 import torch.utils.data
+from scipy.spatial import ConvexHull
+from matplotlib.path import Path
 
 from .defaults import create_ddp_model
 import pointspace.utils.comm as comm
@@ -1913,10 +1915,6 @@ class CnfTester(TesterBase):
             # Phase 2: Build query grid (Convex Hull Masked)
             # 彻底抛弃形态学，使用凸包确保包容所有内部空洞！
             # ============================================================
-            import numpy as np
-            from scipy.spatial import ConvexHull
-            from matplotlib.path import Path
-            import torch
             
             qd = query_dim
             xy_min = support_coord[:, :qd].min(dim=0).values.cpu()
