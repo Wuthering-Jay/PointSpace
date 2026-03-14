@@ -13,6 +13,7 @@ LAS/LAZ Tile Processor (Simple Version)
 
 import numpy as np
 import laspy
+import json
 import time
 import multiprocessing
 from pathlib import Path
@@ -52,6 +53,8 @@ class LASTileProcessor:
         max_points: 最大点数阈值，超过此值的块会被递归切分
         save_orig_idx: 是否保存原始点索引
         output_format: 输出格式 'las' 或 'laz'
+        buffer_size: 缓冲区大小（单位：米），在核心边界外扩展点集以消除边界效应；
+                     <= 0 时禁用缓冲区，核心 BBox 仍会写入 VLR
 
         calc_hag: 是否计算 HAG (Height Above Ground)
         hag_ground_class: 地面点的分类 ID（默认 2，ASPRS 标准）
@@ -75,6 +78,7 @@ class LASTileProcessor:
         max_points: Optional[int] = None,
         save_orig_idx: bool = True,
         output_format: str = 'las',
+        buffer_size: float = 10.0,
 
         calc_normals: bool = False,
         normal_on_source: bool = True,
@@ -105,6 +109,7 @@ class LASTileProcessor:
         self.max_points = max_points
         self.save_orig_idx = save_orig_idx
         self.output_format = output_format.lower()
+        self.buffer_size = buffer_size
 
         # 法向量参数
         self.calc_normals = calc_normals
@@ -291,50 +296,66 @@ class LASTileProcessor:
         
         return all_segments, stats_list
         
-    def _grid_segmentation(self, points: np.ndarray, offset_x: float = 0, offset_y: float = 0) -> List[np.ndarray]:
+    def _grid_segmentation(self, points: np.ndarray, offset_x: float = 0, offset_y: float = 0):
         """
-        基于网格的分割
-        
+        基于网格的分割，支持带缓冲区的重叠切块 (Buffered Tiling)。
+
         Args:
             points: 点云坐标 (N, 3)
             offset_x: X 方向偏移
             offset_y: Y 方向偏移
-            
+
         Returns:
-            分块索引列表
+            List[Tuple[np.ndarray, np.ndarray]]：每个元素为
+            (包含 buffer 的点索引数组, 核心边界数组 [xmin, ymin, xmax, ymax])
         """
         x_size, y_size = self.window_size
-        
-        # 计算原点
         min_x, min_y = np.min(points[:, 0]), np.min(points[:, 1])
-        origin_x = min_x - offset_x
-        origin_y = min_y - offset_y
-        
-        # 计算窗口索引
+        origin_x, origin_y = min_x - offset_x, min_y - offset_y
+
         x_bins = ((points[:, 0] - origin_x) / x_size).astype(np.int64)
         y_bins = ((points[:, 1] - origin_y) / y_size).astype(np.int64)
-        
-        # 组合二维索引
-        y_multiplier = 1000000
-        window_ids = x_bins * y_multiplier + y_bins
-        
-        # 使用 argsort 一次性分组
+        window_ids = x_bins * 1000000 + y_bins
+
         sort_idx = np.argsort(window_ids)
         sorted_window_ids = window_ids[sort_idx]
-        
-        # 找到切分点
-        unique_ids, split_indices = np.unique(sorted_window_ids, return_index=True)
+        _, split_indices = np.unique(sorted_window_ids, return_index=True)
         segments = np.split(sort_idx, split_indices[1:])
-        
-        # Min 阈值处理
+
         if self.min_points is not None:
             segments = self._apply_min_threshold(points, segments)
-        
-        # Max 阈值处理
         if self.max_points is not None:
             segments = self._apply_max_threshold(points, segments)
-            
-        return segments
+
+        core_bboxes = []
+        for seg in segments:
+            c_xmin, c_ymin = points[seg, :2].min(axis=0)
+            c_xmax, c_ymax = points[seg, :2].max(axis=0)
+            core_bboxes.append(np.array([c_xmin, c_ymin, c_xmax, c_ymax], dtype=np.float64))
+
+        if self.buffer_size <= 0:
+            return list(zip(segments, core_bboxes))
+
+        self.logger.info("    Applying buffer using fast binary search...")
+        sort_x_idx = np.argsort(points[:, 0])
+        sorted_points = points[sort_x_idx]
+        sorted_x, sorted_y = sorted_points[:, 0], sorted_points[:, 1]
+
+        buffered_results = []
+        for bbox in core_bboxes:
+            b_xmin, b_xmax = bbox[0] - self.buffer_size, bbox[2] + self.buffer_size
+            b_ymin, b_ymax = bbox[1] - self.buffer_size, bbox[3] + self.buffer_size
+
+            left_idx = np.searchsorted(sorted_x, b_xmin, side='left')
+            right_idx = np.searchsorted(sorted_x, b_xmax, side='right')
+
+            cand_y = sorted_y[left_idx:right_idx]
+            mask_y = (cand_y >= b_ymin) & (cand_y <= b_ymax)
+
+            final_indices = sort_x_idx[left_idx:right_idx][mask_y]
+            buffered_results.append((final_indices, bbox))
+
+        return buffered_results
     
     def _apply_max_threshold(self, points: np.ndarray, segments: List[np.ndarray]) -> List[np.ndarray]:
         """对超过 max_points 的块进行递归切分"""
@@ -668,7 +689,7 @@ class LASTileProcessor:
         self.logger.info(f"    Z_base computed in {time.time() - start_time:.2f}s")
         return z_base.astype(np.float32)
 
-    def _save_tiles(self, las_file: Path, las_data: laspy.LasData, segments: List[np.ndarray],
+    def _save_tiles(self, las_file: Path, las_data: laspy.LasData, segments: List[Tuple[np.ndarray, np.ndarray]],
                     points: np.ndarray = None, source_hag: np.ndarray = None, source_z_base: np.ndarray = None, source_normals: np.ndarray = None):
         """
         保存分块为 LAS/LAZ 文件
@@ -676,7 +697,7 @@ class LASTileProcessor:
         Args:
             las_file: 原始文件路径
             las_data: 原始 LAS 数据
-            segments: 分块索引列表
+            segments: 分块列表，每个元素为 (包含buffer的点索引数组, 核心边界数组 [xmin, ymin, xmax, ymax])
             points: 点云坐标 (N, 3)，用于 tile 模式计算 HAG
             source_hag: 在源点云上预计算的 HAG 值（source 模式）
             source_z_base: 在源点云上预计算的 Z_base 值（source 模式）
@@ -699,7 +720,7 @@ class LASTileProcessor:
         need_z_base = self.calc_z_base
         need_normal = self.calc_normals
         
-        for i, indices in enumerate(tqdm(segments, desc="  Saving tiles", leave=False)):
+        for i, (indices, core_bbox) in enumerate(tqdm(segments, desc="  Saving tiles", leave=False)):
             if len(indices) == 0:
                 continue
             
@@ -714,6 +735,16 @@ class LASTileProcessor:
             # 复制 VLRs（包含坐标系信息）
             for vlr in src_header.vlrs:
                 header.vlrs.append(vlr)
+
+            bbox_dict = {"core_bbox": core_bbox.tolist()}
+            bbox_json = json.dumps(bbox_dict).encode('utf-8')
+            bbox_vlr = laspy.VLR(
+                user_id="PointSpace",
+                record_id=1001,
+                description="Core BBox for CNF",
+                record_data=bbox_json
+            )
+            header.vlrs.append(bbox_vlr)
             
             # 复制已有的 extra dimensions
             for extra_dim in src_header.point_format.extra_dimensions:
