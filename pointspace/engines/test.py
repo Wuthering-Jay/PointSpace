@@ -1917,9 +1917,14 @@ class CnfTester(TesterBase):
             # ============================================================
             
             qd = query_dim
-            xy_min = support_coord[:, :qd].min(dim=0).values.cpu()
-            xy_max = support_coord[:, :qd].max(dim=0).values.cpu()
-            support_xy_np = support_coord[:, :qd].cpu().numpy()
+            
+            # 🌟 修复：从原始 fragment_list 提取包含所有类别点云的全量坐标，以确保凸包和BBox覆盖100%区域
+            raw_coords_list = [frag["coord"] for frag in fragment_list]
+            all_raw_coords = torch.cat(raw_coords_list, dim=0)
+            
+            xy_min = all_raw_coords[:, :qd].min(dim=0).values.cpu()
+            xy_max = all_raw_coords[:, :qd].max(dim=0).values.cpu()
+            hull_xy_np = all_raw_coords[:, :qd].cpu().numpy()
 
             # ---------------------------------------------------------
             # Step 1: 构建密集的 Bounding Box 网格 (Fine Query Grid)
@@ -1938,7 +1943,7 @@ class CnfTester(TesterBase):
             )  # (Q_full, 2)
 
             # 如果点数极少（比如刚好只有3、4个点排成一线），直接返回 bbox 网格
-            if support_xy_np.shape[0] < 4:
+            if hull_xy_np.shape[0] < 4:
                 query_xy = query_xy_full
                 total_queries = query_xy.shape[0]
                 logger.info(f"CNF Query grid: {total_queries} points (Fallback to BBox)")
@@ -1948,9 +1953,9 @@ class CnfTester(TesterBase):
                 # ---------------------------------------------------------
                 try:
                     # 计算外围轮廓
-                    hull = ConvexHull(support_xy_np)
+                    hull = ConvexHull(hull_xy_np)
                     # 提取构成外围轮廓的顶点坐标
-                    hull_vertices = support_xy_np[hull.vertices]
+                    hull_vertices = hull_xy_np[hull.vertices]
                     
                     # ---------------------------------------------------------
                     # Step 3: 使用 Ray Casting 算法快速判断哪些网格点在凸包内部
