@@ -1919,8 +1919,8 @@ class CnfTester(TesterBase):
             qd = query_dim
             
             # 🌟 修复：从原始 fragment_list 提取包含所有类别点云的全量坐标，以确保凸包和BBox覆盖100%区域
-            raw_coords_list = [frag["coord"] for frag in fragment_list]
-            all_raw_coords = torch.cat(raw_coords_list, dim=0)
+            raw_coords_list = [frag["coord"] for frag in fragment_list if frag["coord"].shape[0] > 0]
+            all_raw_coords = torch.cat(raw_coords_list, dim=0) if raw_coords_list else support_coord
             
             xy_min = all_raw_coords[:, :qd].min(dim=0).values.cpu()
             xy_max = all_raw_coords[:, :qd].max(dim=0).values.cpu()
