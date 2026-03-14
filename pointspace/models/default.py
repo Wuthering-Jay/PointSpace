@@ -595,20 +595,22 @@ class DefaultCNF(nn.Module):
         """Filter out non-ground points after backbone encoding.
 
         Returns filtered (feat, coord, offset).  When ``filter_non_ground``
-        is False or ``classification`` is absent the inputs are returned
+        is False or ``segment`` is absent the inputs are returned
         unchanged.
         """
         support_offset = input_dict.get("offset")
         if not self.filter_non_ground:
             return support_feat, support_coord, support_offset
 
-        # 支持 "segment" (LasDataset) 和 "classification" 两种 key
-        if "segment" in input_dict:
-            cls_labels = input_dict["segment"].squeeze()
-        elif "classification" in input_dict:
-            cls_labels = input_dict["classification"].squeeze()
-        else:
+        if "segment" not in input_dict:
+            # segment absent at inference time (no GT labels) — skip filtering
+            import logging
+            logging.getLogger(__name__).warning(
+                "DefaultCNF._filter_ground: filter_non_ground=True but 'segment' "
+                "is missing in input_dict. Skipping ground filtering."
+            )
             return support_feat, support_coord, support_offset
+        cls_labels = input_dict["segment"].squeeze()
         ground_mask = (cls_labels == self.ground_class)
 
         if not ground_mask.any():

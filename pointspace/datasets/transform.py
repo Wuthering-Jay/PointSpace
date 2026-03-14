@@ -1949,7 +1949,12 @@ class TerrainImplicitSampler(object):
         # ==========================================
         # 🌟 地面点掩码 (当 ground_class 不为 None 时，仅从地面点中抽 Query)
         # ==========================================
-        if self.ground_class is not None and "segment" in data_dict:
+        if self.ground_class is not None:
+            if "segment" not in data_dict:
+                raise KeyError(
+                    "TerrainImplicitSampler: ground_class is set but 'segment' "
+                    "is missing in data_dict; cannot guarantee ground-only query points."
+                )
             ground_eligible = (data_dict["segment"].flatten() == self.ground_class)
         else:
             ground_eligible = None  # 全部点均可成为 Query
@@ -2017,6 +2022,12 @@ class TerrainImplicitSampler(object):
             else:
                 fallback = np.random.randint(num_points)
             query_mask[fallback] = True
+
+        # 强校验：启用 ground_class 时，Query 必须全部为地面点
+        if ground_eligible is not None and np.any(~ground_eligible[query_mask]):
+            raise RuntimeError(
+                "TerrainImplicitSampler invariant violated: non-ground points found in query set."
+            )
 
         # 最终掩码
         support_mask = ~query_mask

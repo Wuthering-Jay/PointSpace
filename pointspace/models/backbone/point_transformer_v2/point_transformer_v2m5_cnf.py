@@ -659,7 +659,7 @@ class PointTransformerV2(PointModule):
     输出: Point 对象，feat 为解码器最终输出特征，维度 dec_channels[0]。
 
     支持可选的 LAS 语义类别 Embedding (``use_cls_embed``)：
-    从 ``data_dict["classification"]`` 提取逐点类别标签，通过
+    从 ``data_dict["segment"]`` 提取逐点类别标签，通过
     ``nn.Embedding`` 映射为可学习特征后与原始特征拼接。
 
     Args:
@@ -793,8 +793,6 @@ class PointTransformerV2(PointModule):
         if self.use_cls_embed:
             if "segment" in point.keys() and point["segment"] is not None:
                 cls_label = point["segment"]
-            elif "classification" in point.keys() and point["classification"] is not None:
-                cls_label = point["classification"]
             else:
                 cls_label = torch.zeros(coord.shape[0], dtype=torch.long,
                                         device=coord.device)

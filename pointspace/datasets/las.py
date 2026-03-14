@@ -831,7 +831,7 @@ class LasDataset(DefaultDataset):
             # Single result from transform
             data_dict = transform_result
             result_dict = dict(
-                segment=data_dict.pop("segment") if "segment" in data_dict else None,
+                segment=data_dict.get("segment"),  # keep in data_dict so fragments inherit it
                 name=data_dict.get("name", self.get_data_name(idx))
             )
             if "origin_segment" in data_dict:

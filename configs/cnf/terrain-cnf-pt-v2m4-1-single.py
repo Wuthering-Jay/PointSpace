@@ -17,8 +17,8 @@
 # -------------------------------------------------------
 train_data_dir = r"E:\data\云南遥感中心\第二批\disk03\tile\train"
 val_data_dir   = r"E:\data\云南遥感中心\第二批\disk03\tile\val"
-test_data_dir  = r"E:\data\云南遥感中心\第二批\disk03\tile\val"
-pred_save_dir  = r"E:\data\云南遥感中心\第二批\disk03\tile\pred_cnf"
+test_data_dir  = r"E:\data\云南遥感中心\3.13稀疏点云_道尔补全点云\模拟点样例数据\模拟点样例数据\01原始数据\las\tile"
+pred_save_dir  = r"E:\data\云南遥感中心\3.13稀疏点云_道尔补全点云\模拟点样例数据\模拟点样例数据\01原始数据\las\pred_cnf"
 save_path = "exp/cnf/terrain-cnf-pt-v2m4-4-single"
 
 # -------------------------------------------------------
@@ -52,7 +52,7 @@ gradient_accumulation_steps = 4
 # -------------------------------------------------------
 # 4. Training loop
 # -------------------------------------------------------
-epoch = 2
+epoch = 10
 clip_grad = None
 
 # -------------------------------------------------------
@@ -164,8 +164,8 @@ writer = dict(
 
 # CNF test-time parameters
 query_dim = 2
-query_resolution = 0.25
-query_batch_size = 10000
+query_resolution = 0.5
+query_batch_size = 20000
 compute_derivatives = True
 
 # -------------------------------------------------------
@@ -270,6 +270,9 @@ data = dict(
                 type="Collect",
                 keys=["coord", "segment"],
                 optional_keys=["segment"],
+                offset_keys_dict=dict(
+                    offset="coord",
+                ),
                 feat_keys=feature_keys,
             ),
         ],
