@@ -1,15 +1,15 @@
 # ════════════════════════════════════════════════════════════════════════════
-# Terrain CNF — PT-v2m4 Backbone — Single-Branch Head
+# Terrain CNF — PT-v2m4 Backbone — Dual-KNN Single-Branch Head
 #
-# 单分支 CNF 隐式曲面重建：
-#   - ClassFilter 过滤地面点
-#   - TerrainImplicitSampler  (compute_gt_low=False，无低频真值)
-#   - Backbone (PT-v2m4) → per-point features
-#   - SingleBranchCNFHead:
-#       · KNN + IDW anchor
-#       · Linear PE + Fourier PE + relative_z 全部融合在一个分支
-#       · pred_z = z_anchor + MLP(fused_features)
-#   - 损失: SmoothL1(pred_z, query_gt, beta=0.1)
+# 双重 KNN 语义-几何交织架构：
+#   - CategoryAwareDownsample: 地面点全密度保留，非地面点体素降采样
+#   - TerrainImplicitSampler:  开放限制(max_query_ratio=0.9) + 极端大空洞
+#   - Backbone (PT-v2m5) → 全量点(含树冠/建筑) per-point features
+#   - SingleBranchCNFHead (Dual-KNN):
+#       · Ground Branch: 仅地面 KNN → IDW z_anchor + feat_anchor
+#       · Semantic Branch: 全量 KNN → class_embed + Z-Fourier 高差编码
+#       · 交叉注意力融合 → MLP → residual → pred_z = z_anchor + residual
+#   - 损失: SmoothL1(pred_z, query_gt, beta=0.1) + terrain-complexity 加权
 # ════════════════════════════════════════════════════════════════════════════
 
 # -------------------------------------------------------
@@ -81,8 +81,8 @@ model = dict(
     ohem_ratio = 0.5,
     normal_weight=10.0,
     enable_normal_loss=True,
-    filter_non_ground=True,   # post-backbone: keep only ground for head
-    ground_class=ground_class,           # LAS class 2 = ground
+    filter_non_ground=False,
+    ground_class=ground_class,
     backbone=dict(
         type="PT-v2m5",
         in_channels=in_channels,
@@ -119,10 +119,14 @@ model = dict(
         backbone_out_channels=24,   # must match backbone dec_channels[0]
         query_dim=2,                # predict z from (x, y)
         num_targets=1,              # scalar output (terrain height)
-        k_neighbors=24,             # KNN for IDW anchor + grouped features
+        k_neighbors=24,             # KNN per branch (ground & semantic)
         hidden_dim=128,             # fusion hidden dimension
-        num_freqs=6,                # Fourier PE octaves
+        num_freqs=6,                # XY Fourier PE octaves
+        z_num_freqs=4,              # Z-axis height-diff Fourier PE octaves
         mlp_hidden_dims=[64, 32],
+        ground_class=ground_class,  # used by Ground Branch mask
+        num_classes=32,             # matches backbone num_classes (LAS codes)
+        class_embed_dim=16,         # explicit class embedding dim
     ),
     criteria=None,  # use built-in SmoothL1 loss
 )
@@ -196,7 +200,8 @@ data = dict(
                 max_blocks=3,
                 block_size_range=(5.0, 30.0),
                 feature_resolution=2.0,
-                max_query_ratio=0.6,
+                max_query_ratio=0.9,          # 放开限制
+                extreme_hole_prob=0.3,        # 30% 概率触发极端大空洞
                 query_max=4096,
                 compute_gt_low=False,
                 ground_class=ground_class,
@@ -232,7 +237,8 @@ data = dict(
                 max_blocks=3,
                 block_size_range=(5.0, 30.0),
                 feature_resolution=2.0,
-                max_query_ratio=0.6,
+                max_query_ratio=0.9,          # 放开限制
+                extreme_hole_prob=0.3,        # 30% 概率触发极端大空洞
                 query_max=4096,
                 compute_gt_low=False,
                 ground_class=ground_class,
