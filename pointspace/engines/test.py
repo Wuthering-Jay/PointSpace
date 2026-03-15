@@ -1912,27 +1912,31 @@ class CnfTester(TesterBase):
             )
 
             # ============================================================
-            # Phase 2: Build query grid (Convex Hull Masked)
-            # 彻底抛弃形态学，使用凸包确保包容所有内部空洞！
+            # Phase 2: Build query grid (Dual Masking: Core BBox + Convex Hull)
             # ============================================================
-            
+
             qd = query_dim
-            
-            # 🌟 修复：从原始 fragment_list 提取包含所有类别点云的全量坐标，以确保凸包和BBox覆盖100%区域
+
+            # 1. 提取包含 Buffer 的全量点云坐标，用于计算物理凸包
             raw_coords_list = [frag["coord"] for frag in fragment_list]
             all_raw_coords = torch.cat(raw_coords_list, dim=0)
-            
-            xy_min = all_raw_coords[:, :qd].min(dim=0).values.cpu()
-            xy_max = all_raw_coords[:, :qd].max(dim=0).values.cpu()
             hull_xy_np = all_raw_coords[:, :qd].cpu().numpy()
 
-            # ---------------------------------------------------------
-            # Step 1: 构建密集的 Bounding Box 网格 (Fine Query Grid)
-            # ---------------------------------------------------------
+            # 2. 从 data_dict 中获取当前 Tile 的核心边界 (Core BBox)
+            if "core_bbox" in data_dict:
+                core_bbox = data_dict["core_bbox"]
+                xy_min = torch.tensor(core_bbox[:qd], dtype=torch.float32)
+                xy_max = torch.tensor(core_bbox[qd:qd * 2], dtype=torch.float32)
+            else:
+                # 兼容老数据：退回到实际包围盒
+                xy_min = all_raw_coords[:, :qd].min(dim=0).values.cpu()
+                xy_max = all_raw_coords[:, :qd].max(dim=0).values.cpu()
+
+            # 3. 第一道掩码 (方刀)：仅在 Core BBox 内生成密集的初始网格
             axes = [
                 torch.arange(
                     lo.item(),
-                    hi.item() + query_resolution,
+                    hi.item() + query_resolution,  # 包含上限，确保相邻块无缝拼接
                     query_resolution,
                 )
                 for lo, hi in zip(xy_min, xy_max)
@@ -1942,44 +1946,35 @@ class CnfTester(TesterBase):
                 [g.flatten() for g in grids], dim=1
             )  # (Q_full, 2)
 
-            # 如果点数极少（比如刚好只有3、4个点排成一线），直接返回 bbox 网格
+            # 如果点数极少，直接返回方形网格
             if hull_xy_np.shape[0] < 4:
                 query_xy = query_xy_full
                 total_queries = query_xy.shape[0]
-                logger.info(f"CNF Query grid: {total_queries} points (Fallback to BBox)")
+                logger.info(f"CNF Query grid: {total_queries} points (Fallback to Core BBox)")
             else:
-                # ---------------------------------------------------------
-                # Step 2: 计算二维凸包 (Convex Hull) 作为绝对密封的边界
-                # ---------------------------------------------------------
+                # 4. 第二道掩码 (剪刀)：使用全量点计算凸包，裁剪掉伸出真实边界的悬空网格
                 try:
-                    # 计算外围轮廓
+                    from scipy.spatial import ConvexHull
+                    from matplotlib.path import Path
+
                     hull = ConvexHull(hull_xy_np)
-                    # 提取构成外围轮廓的顶点坐标
                     hull_vertices = hull_xy_np[hull.vertices]
-                    
-                    # ---------------------------------------------------------
-                    # Step 3: 使用 Ray Casting 算法快速判断哪些网格点在凸包内部
-                    # matplotlib.path.Path 是底层 C++ 实现的，速度极快
-                    # ---------------------------------------------------------
+
                     poly_path = Path(hull_vertices)
-                    
-                    # 传入所有的 Query 坐标 (N, 2)，返回布尔掩码
-                    # radius=query_resolution 相当于在边界外向外扩张一点点容差，防止边缘点被误杀
+                    # radius 设置为分辨率的一半，防止边缘真实网格点被误杀
                     keep_mask = poly_path.contains_points(
-                        query_xy_full.numpy(), 
-                        radius=query_resolution * 0.5 
+                        query_xy_full.numpy(),
+                        radius=query_resolution * 0.5,
                     )
-                    
                     query_xy = query_xy_full[keep_mask]
-                    
+
                 except Exception as e:
-                    # 如果算凸包失败（比如所有点都在一条直线上），退回到 BBox
-                    logger.warning(f"Convex hull failed: {e}. Falling back to BBox grid.")
+                    logger.warning(f"Convex hull failed: {e}. Falling back to Core BBox grid.")
                     query_xy = query_xy_full
 
                 total_queries = query_xy.shape[0]
                 logger.info(
-                    "CNF Query grid: {} points (bbox {} -> hull masked {})".format(
+                    "CNF Query grid: {} points (core bbox {} -> hull masked {})".format(
                         total_queries,
                         query_xy_full.shape[0],
                         total_queries,

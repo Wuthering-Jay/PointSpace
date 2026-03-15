@@ -198,8 +198,13 @@ class NormalizeCoord(object):
             # modified from pointnet2
             centroid = np.mean(data_dict["coord"], axis=0)
             data_dict["coord"] -= centroid
+            if "core_bbox" in data_dict:
+                data_dict["core_bbox"][0::2] -= centroid[0]
+                data_dict["core_bbox"][1::2] -= centroid[1]
             m = np.max(np.sqrt(np.sum(data_dict["coord"] ** 2, axis=1)))
             data_dict["coord"] = data_dict["coord"] / m
+            if "core_bbox" in data_dict:
+                data_dict["core_bbox"] /= m
         return data_dict
 
 
@@ -209,6 +214,9 @@ class PositiveShift(object):
         if "coord" in data_dict.keys():
             coord_min = np.min(data_dict["coord"], 0)
             data_dict["coord"] -= coord_min
+            if "core_bbox" in data_dict:
+                data_dict["core_bbox"][0::2] -= coord_min[0]
+                data_dict["core_bbox"][1::2] -= coord_min[1]
         return data_dict
 
 
@@ -227,6 +235,9 @@ class CenterShift(object):
                 shift = np.array([(x_min + x_max) / 2, (y_min + y_max) / 2, 0])
             data_dict["coord"] -= shift
             data_dict["coord_shift"] = shift
+            if "core_bbox" in data_dict:
+                data_dict["core_bbox"][0::2] -= shift[0]
+                data_dict["core_bbox"][1::2] -= shift[1]
         return data_dict
 
 
@@ -242,6 +253,9 @@ class CentroidShift(object):
                 centroid[2] = 0
             data_dict["coord"] -= centroid
             data_dict["coord_shift"] = centroid
+            if "core_bbox" in data_dict:
+                data_dict["core_bbox"][0::2] -= centroid[0]
+                data_dict["core_bbox"][1::2] -= centroid[1]
         return data_dict
 
 
@@ -257,13 +271,16 @@ class ZPercentileCenterShift(object):
             x_max, y_max = coords[:, 0].max(), coords[:, 1].max()
             z_shift_val = np.percentile(coords[:, 2], self.percentile)
             shift = np.array([
-                (x_min + x_max) / 2.0, 
-                (y_min + y_max) / 2.0, 
+                (x_min + x_max) / 2.0,
+                (y_min + y_max) / 2.0,
                 z_shift_val
             ])
             data_dict["coord"] -= shift
             data_dict["coord_shift"] = shift
-            
+            if "core_bbox" in data_dict:
+                data_dict["core_bbox"][0::2] -= shift[0]
+                data_dict["core_bbox"][1::2] -= shift[1]
+
         return data_dict
 
 
@@ -278,6 +295,9 @@ class RandomShift(object):
             shift_y = np.random.uniform(self.shift[1][0], self.shift[1][1])
             shift_z = np.random.uniform(self.shift[2][0], self.shift[2][1])
             data_dict["coord"] += [shift_x, shift_y, shift_z]
+            if "core_bbox" in data_dict:
+                data_dict["core_bbox"][0::2] += shift_x
+                data_dict["core_bbox"][1::2] += shift_y
         return data_dict
 
 

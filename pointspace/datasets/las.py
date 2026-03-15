@@ -1,4 +1,5 @@
 import os
+import json
 import numpy as np
 import laspy
 from copy import deepcopy
@@ -745,6 +746,19 @@ class LasDataset(DefaultDataset):
                     data_dict["normal"] = np.stack((nx, ny, nz), axis=1)  # (N, 3)
                 except (AttributeError, KeyError):
                     pass  # Normal vectors not available
+
+            # Extract core_bbox from PointSpace VLR (written by tile_las.py buffered tiling)
+            for vlr in las.header.vlrs:
+                if (getattr(vlr, 'user_id', None) == "PointSpace"
+                        and getattr(vlr, 'record_id', None) == 1001):
+                    try:
+                        bbox_data = json.loads(vlr.record_data.decode('utf-8'))
+                        data_dict["core_bbox"] = np.array(
+                            bbox_data["core_bbox"], dtype=np.float32
+                        )  # [xmin, ymin, xmax, ymax]
+                    except (json.JSONDecodeError, KeyError, UnicodeDecodeError):
+                        pass
+                    break
 
         except Exception as e:
             logger = get_root_logger()
