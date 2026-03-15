@@ -654,15 +654,18 @@ class DefaultCNF(nn.Module):
     # Public sub-methods (called by CnfTester)
     # ------------------------------------------------------------------
     def extract_feat(self, input_dict):
-        """[Inference] Run backbone only, return ``{feat, coord, offset}``."""
+        """[Inference] Run backbone only, return ``{feat, coord, offset, segment}``."""
         feat, coord = self._run_backbone(input_dict)
-        feat, coord, offset = self._filter_ground(feat, coord, input_dict)
+        offset = input_dict.get("offset")
         result = dict(feat=feat, coord=coord)
         if offset is not None:
             result["offset"] = offset
+        if "segment" in input_dict:
+            result["segment"] = input_dict["segment"]
         return result
 
-    def query_forward(self, support_coord, support_feat, query_coord):
+    def query_forward(self, support_coord, support_feat, query_coord,
+                      support_segment=None):
         """[Inference] Run head only, return final prediction.
 
         Used by :class:`CnfTester` for chunked dense queries.
@@ -672,7 +675,8 @@ class DefaultCNF(nn.Module):
         was_training = self.head.training
         self.head.eval()
         result = self.head(
-            support_coord, support_feat, query_coord
+            support_coord, support_feat, query_coord,
+            support_segment=support_segment,
         )
         if was_training:
             self.head.train()
@@ -855,9 +859,10 @@ class DefaultCNF(nn.Module):
             Returns ``dict(support_feat=..., support_coord=...)``.
         """
         support_feat, support_coord = self._run_backbone(input_dict)
-        support_feat, support_coord, support_offset = self._filter_ground(
-            support_feat, support_coord, input_dict
-        )
+        support_offset = input_dict.get("offset")
+
+        # Extract segment labels for Dual-KNN head (no hard filtering)
+        support_segment = input_dict.get("segment", None)
 
         if self.training:
             query_coord = input_dict["query_coord"]
@@ -868,6 +873,7 @@ class DefaultCNF(nn.Module):
                 support_coord, support_feat, query_coord,
                 support_offset=support_offset,
                 query_offset=input_dict.get("query_offset"),
+                support_segment=support_segment,
             )
             return self.compute_loss(head_output, input_dict,
                                      query_coord=query_coord)
@@ -879,6 +885,7 @@ class DefaultCNF(nn.Module):
                 support_coord, support_feat, query_coord,
                 support_offset=support_offset,
                 query_offset=input_dict.get("query_offset"),
+                support_segment=support_segment,
             )
             if isinstance(head_output, tuple):
                 pred_final = head_output[0] + head_output[1]

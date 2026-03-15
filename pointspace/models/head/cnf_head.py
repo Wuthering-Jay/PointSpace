@@ -167,7 +167,8 @@ class DualBranchCNFHead(nn.Module):
         self.mlp_detail = nn.Sequential(*layers_d)
 
     def forward(self, support_coord, support_feat, query_coord,
-                support_offset=None, query_offset=None):
+                support_offset=None, query_offset=None,
+                support_segment=None):
         """
         Args:
             support_coord: (N, 3) support point positions (x, y, z).
@@ -250,30 +251,28 @@ class DualBranchCNFHead(nn.Module):
 
 @MODELS.register_module()
 class SingleBranchCNFHead(nn.Module):
-    """Unified single-stream CNF head for terrain surface reconstruction.
+    """Dual-KNN CNF head with semantic-geometry interleaving.
 
-    Combines all techniques from the dual-branch design into one fused
-    representation:
-
-    1. **KNN** in physical XY → gather K nearest support neighbours.
-    2. **IDW anchor** → smooth local height datum ``z_anchor``.
-    3. **Linear PE** on relative XY (learnable low-freq embedding).
-    4. **Fourier PE** on relative XY (high-freq positional encoding).
-    5. **Relative Z** = ``support_z - z_anchor`` (local micro-relief).
-    6. **Concatenate** backbone features + linear PE + Fourier PE +
-       relative_z → fuse → max-pool → MLP → residual.
-    7. ``pred_z = z_anchor + residual``.
-
-    All activations are Softplus(β=100) for C² smoothness.
+    Architecture overview:
+    - **Ground Branch** (pure ground KNN): extracts local height datum
+      ``z_anchor`` and ground-only feature anchor ``feat_anchor``.
+    - **Semantic Branch** (full-class KNN): gathers all-class neighbours,
+      injects explicit class embeddings and Z-axis relative Fourier encoding
+      to reason about canopy/building height differences.
+    - Cross-attention fusion of both streams → MLP → residual on z_anchor.
 
     Args:
-        backbone_out_channels (int): Feature dim from backbone (*C*).
-        query_dim (int): Coordinate dim for queries (2 = XY).
-        num_targets (int): Output values per query (1 = scalar z).
-        k_neighbors (int): KNN neighbours.
-        hidden_dim (int): Hidden dimension after fusion.
-        num_freqs (int): Fourier PE octaves.
-        mlp_hidden_dims (list[int]): MLP hidden layer sizes.
+        backbone_out_channels: Feature dim from backbone (*C*).
+        query_dim: Coordinate dim for queries (2 = XY).
+        num_targets: Output values per query (1 = scalar z).
+        k_neighbors: KNN neighbours per branch.
+        hidden_dim: Hidden dimension after fusion.
+        num_freqs: Fourier PE octaves for XY relative encoding.
+        z_num_freqs: Fourier PE octaves for Z-axis height difference.
+        mlp_hidden_dims: MLP hidden layer sizes.
+        ground_class: Ground class label in ``segment``.
+        num_classes: Total number of semantic classes (for embedding).
+        class_embed_dim: Dimensionality of class embedding.
     """
 
     def __init__(
@@ -284,7 +283,11 @@ class SingleBranchCNFHead(nn.Module):
         k_neighbors=16,
         hidden_dim=256,
         num_freqs=6,
+        z_num_freqs=4,
         mlp_hidden_dims=None,
+        ground_class=2,
+        num_classes=20,
+        class_embed_dim=16,
     ):
         super().__init__()
         if mlp_hidden_dims is None:
@@ -293,37 +296,41 @@ class SingleBranchCNFHead(nn.Module):
         self.query_dim = query_dim
         self.num_targets = num_targets
         self.k_neighbors = k_neighbors
+        self.ground_class = ground_class
 
-        beta = 100  # Softplus sharpness
+        beta = 100
 
-        # ---- Position encodings ----
-        # Linear PE (low-frequency learnable)
+        # Position & height encodings
         self.pe_linear = nn.Sequential(
-            nn.Linear(query_dim, 32),
-            nn.Softplus(beta=beta),
-            nn.Linear(32, 64),
+            nn.Linear(query_dim, 32), nn.Softplus(beta=beta), nn.Linear(32, 64),
         )
-        # Fourier PE (high-frequency)
         self.rfe = RelativeFourierEncoding(in_dim=query_dim, num_freqs=num_freqs)
-        fourier_dim = self.rfe.output_dim  # in_dim * num_freqs * 2
+        fourier_dim = self.rfe.output_dim
 
-        # ---- Fusion: backbone_feat + linear_pe + fourier_pe + relative_z + local_z_std(1)
-        fuse_in = backbone_out_channels + 64 + fourier_dim + 2
+        self.z_rfe = RelativeFourierEncoding(in_dim=1, num_freqs=z_num_freqs)
+        z_fourier_dim = self.z_rfe.output_dim
 
-        # Value 分支: 提取高维特征内容
+        # Explicit class embedding
+        self.class_embed = nn.Embedding(num_classes, class_embed_dim)
+
+        # Fusion dim: semantic_feat + class_embed + ground_feat_anchor +
+        #             pe_linear + pe_fourier + z_fourier + z_std
+        fuse_in = (
+            backbone_out_channels * 2
+            + 64 + fourier_dim + z_fourier_dim + 1 + class_embed_dim
+        )
+
         self.value_proj = nn.Sequential(
             nn.Linear(fuse_in, hidden_dim),
             nn.Softplus(beta=beta),
-            nn.Linear(hidden_dim, hidden_dim)
+            nn.Linear(hidden_dim, hidden_dim),
         )
-        # Attention 分支: 评估邻居重要性 (发言权重)
         self.attn_proj = nn.Sequential(
             nn.Linear(fuse_in, hidden_dim // 2),
             nn.Softplus(beta=beta),
-            nn.Linear(hidden_dim // 2, 1)
+            nn.Linear(hidden_dim // 2, 1),
         )
 
-        # ---- MLP → residual ----
         layers = []
         d = hidden_dim
         for h in mlp_hidden_dims:
@@ -332,106 +339,159 @@ class SingleBranchCNFHead(nn.Module):
         layers.append(nn.Linear(d, num_targets))
         self.mlp = nn.Sequential(*layers)
 
+    # ------------------------------------------------------------------
+    # KNN helper: sparse assign → dense (Q, K) index matrix
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _to_dense(q_row, s_col, Q, K, device):
+        counts = torch.bincount(q_row, minlength=Q)[:Q]
+        if (counts == K).all():
+            return s_col.reshape(Q, K)
+        dense = torch.zeros((Q, K), dtype=torch.long, device=device)
+        ptr = torch.cat([counts.new_zeros(1), counts.cumsum(0)])[:-1]
+        for k in range(K):
+            valid = counts > k
+            dense[valid, k] = s_col[ptr[valid] + k]
+            mask = (~valid) & (counts > 0)
+            if mask.any():
+                dense[mask, k] = s_col[ptr[mask]]
+        return dense
+
     def forward(self, support_coord, support_feat, query_coord,
-                support_offset=None, query_offset=None):
+                support_offset=None, query_offset=None,
+                support_segment=None):
         """
         Args:
             support_coord: (N, 3) support point positions (x, y, z).
-            support_feat: (N, C) backbone per-point features.
-            query_coord: (Q, query_dim) query positions (x, y).
+            support_feat:  (N, C) backbone per-point features.
+            query_coord:   (Q, query_dim) query positions (x, y).
             support_offset / query_offset: optional (B,) batch boundaries.
-
-        Returns:
-            pred_z: (Q,) or (Q, num_targets) predicted values.
+            support_segment: (N,) or (N, 1) integer class labels.
         """
         qd = self.query_dim
         K = self.k_neighbors
+        Q = query_coord.shape[0]
 
-        s_xy = support_coord[:, :qd].contiguous()
+        # ------------------------------------------------------------------
+        # 0. Ground mask
+        # ------------------------------------------------------------------
+        if support_segment is not None:
+            ground_mask = (support_segment.squeeze() == self.ground_class)
+            if not ground_mask.any():
+                ground_mask = torch.ones_like(ground_mask)
+        else:
+            ground_mask = torch.ones(
+                support_coord.shape[0], dtype=torch.bool,
+                device=support_coord.device,
+            )
+
         q_xy = query_coord[:, :qd].contiguous()
+        s_coord_g = support_coord[ground_mask]
+        s_feat_g = support_feat[ground_mask]
+        s_xy_g = s_coord_g[:, :qd].contiguous()
+        s_xy_full = support_coord[:, :qd].contiguous()
 
-        # Batch indices
         if support_offset is not None and query_offset is not None:
-            batch_s = offset2batch(support_offset)
+            batch_s_full = offset2batch(support_offset)
+            batch_s_g = batch_s_full[ground_mask]
             batch_q = offset2batch(query_offset)
         else:
-            batch_s = torch.zeros(s_xy.shape[0], dtype=torch.long, device=s_xy.device)
-            batch_q = torch.zeros(q_xy.shape[0], dtype=torch.long, device=q_xy.device)
+            batch_s_full = torch.zeros(
+                support_coord.shape[0], dtype=torch.long,
+                device=support_coord.device,
+            )
+            batch_s_g = torch.zeros(
+                s_coord_g.shape[0], dtype=torch.long,
+                device=s_coord_g.device,
+            )
+            batch_q = torch.zeros(Q, dtype=torch.long, device=q_xy.device)
 
-        # 1. KNN in physical XY space
-        assign = torch_cluster.knn(
-            x=s_xy, y=q_xy, k=K,
-            batch_x=batch_s, batch_y=batch_q,
+        # ------------------------------------------------------------------
+        # 1. Ground Branch: height datum + feature anchor
+        # ------------------------------------------------------------------
+        assign_g = torch_cluster.knn(
+            x=s_xy_g, y=q_xy, k=K,
+            batch_x=batch_s_g, batch_y=batch_q,
         )
-        q_row, s_col = assign[0], assign[1]
-        Q = q_xy.shape[0]
+        s_col_g_dense = self._to_dense(assign_g[0], assign_g[1], Q, K, q_xy.device)
 
-        counts = torch.bincount(q_row, minlength=Q)
-        if (counts == K).all():
-            # 数据良好，直接 reshape (摒弃危险的 view(..., -1))
-            s_col_dense = s_col.reshape(Q, K)
-        else:
-            # 遭遇极端稀疏切块，开启自动复制补齐
-            s_col_dense = torch.zeros((Q, K), dtype=torch.long, device=s_xy.device)
-            ptr = torch.cat([counts.new_zeros(1), counts.cumsum(0)])
-            ptr_q = ptr[:-1]  # per-query start offsets, shape [Q]
-            for k in range(K):
-                # 存在第 k 个邻居的 query
-                valid = counts > k
-                s_col_dense[valid, k] = s_col[ptr_q[valid] + k]
-                
-                # 不存在第 k 个邻居的 query，用它自己的第 0 个邻居(最近点)安全垫底
-                invalid = ~valid
-                has_any = counts > 0
-                mask = invalid & has_any
-                if mask.any():
-                    s_col_dense[mask, k] = s_col[ptr_q[mask]]
+        grouped_coords_g = s_coord_g[s_col_g_dense]   # (Q, K, 3)
+        grouped_feats_g = s_feat_g[s_col_g_dense]     # (Q, K, C)
 
-        # 2. Gather neighbour data
-        # 使用安全的 [Q, K] 二维索引数组，绝对保证最后取出来是 [Q, K, 3] 和 [Q, K, C]
-        grouped_coords = support_coord[s_col_dense]        # (Q, K, 3)
-        grouped_feats = support_feat[s_col_dense]          # (Q, K, C)
+        relative_xy_g = grouped_coords_g[:, :, :qd] - q_xy.unsqueeze(1)
+        dist_sq_g = torch.sum(relative_xy_g ** 2, dim=-1)
+        weights_g = 1.0 / (dist_sq_g + 1e-6)
+        weights_g = weights_g / weights_g.sum(dim=-1, keepdim=True)
 
-        # 3. Relative XY: neighbour − query
-        relative_xy = grouped_coords[:, :, :qd] - q_xy.unsqueeze(1)  # (Q, K, qd)
-
-        # 4. IDW anchor: smooth physical height datum
-        dist_sq = torch.sum(relative_xy ** 2, dim=-1)                # (Q, K)
-        weights = 1.0 / (dist_sq + 1e-6)
-        weights = weights / weights.sum(dim=-1, keepdim=True)
         local_z_anchor = torch.sum(
-            grouped_coords[:, :, 2] * weights, dim=-1, keepdim=True
+            grouped_coords_g[:, :, 2] * weights_g, dim=-1, keepdim=True
         )  # (Q, 1)
+        local_feat_anchor = torch.sum(
+            grouped_feats_g * weights_g.unsqueeze(-1), dim=1
+        )  # (Q, C)
+        local_feat_anchor_exp = local_feat_anchor.unsqueeze(1).expand(-1, K, -1)
 
-        # 5. Position encodings
-        pe_lin = self.pe_linear(relative_xy)                          # (Q, K, 64)
-        pe_four = self.rfe(relative_xy)                               # (Q, K, fourier_dim)
+        # ------------------------------------------------------------------
+        # 2. Semantic Branch: full-class context + class embed + Z Fourier
+        # ------------------------------------------------------------------
+        assign_f = torch_cluster.knn(
+            x=s_xy_full, y=q_xy, k=K,
+            batch_x=batch_s_full, batch_y=batch_q,
+        )
+        s_col_f_dense = self._to_dense(assign_f[0], assign_f[1], Q, K, q_xy.device)
 
-        # 6. Relative Z (local micro-relief)
-        relative_z = grouped_coords[:, :, 2:3] - local_z_anchor.unsqueeze(1)  # (Q, K, 1)
+        grouped_coords_f = support_coord[s_col_f_dense]   # (Q, K, 3)
+        grouped_feats_f = support_feat[s_col_f_dense]      # (Q, K, C)
 
-        # 🌟 地形粗糙度探雷器 (防 NaN 处理)
-        local_z_std = torch.std(grouped_coords[:, :, 2], dim=1, unbiased=False, keepdim=True) 
-        local_z_std = local_z_std.unsqueeze(1).expand(-1, K, -1)      # (Q, K, 1)
+        # Explicit class embedding
+        if support_segment is not None:
+            grouped_seg = support_segment.squeeze()[s_col_f_dense]  # (Q, K)
+        else:
+            grouped_seg = torch.full(
+                (Q, K), self.ground_class, dtype=torch.long,
+                device=q_xy.device,
+            )
+        grouped_class_embed = self.class_embed(grouped_seg)  # (Q, K, D_cls)
 
-        # 7. 🌟 交叉注意力无损融合 (取代 MaxPool)
-        feat_cat = torch.cat([grouped_feats, pe_lin, pe_four, relative_z, local_z_std], dim=-1)
-        
+        relative_xy_f = grouped_coords_f[:, :, :qd] - q_xy.unsqueeze(1)
+        pe_lin = self.pe_linear(relative_xy_f)     # (Q, K, 64)
+        pe_four = self.rfe(relative_xy_f)          # (Q, K, fourier_dim)
+
+        # Z-axis relative Fourier encoding
+        relative_z_f = grouped_coords_f[:, :, 2:3] - local_z_anchor.unsqueeze(1)
+        pe_z_four = self.z_rfe(relative_z_f)       # (Q, K, z_fourier_dim)
+
+        local_z_std = torch.std(
+            grouped_coords_f[:, :, 2], dim=1, unbiased=False, keepdim=True
+        )
+        local_z_std = local_z_std.unsqueeze(1).expand(-1, K, -1)  # (Q, K, 1)
+
+        # ------------------------------------------------------------------
+        # 3. Cross-attention fusion & decode
+        # ------------------------------------------------------------------
+        feat_cat = torch.cat([
+            grouped_feats_f,          # implicit backbone semantics
+            grouped_class_embed,      # explicit class signal
+            local_feat_anchor_exp,    # ground-only feature anchor
+            pe_lin,
+            pe_four,
+            pe_z_four,                # Z-axis height ruler
+            local_z_std,
+        ], dim=-1)
+
         value = self.value_proj(feat_cat)           # (Q, K, H)
         attn_logits = self.attn_proj(feat_cat)      # (Q, K, 1)
-        
-        attn_weights = torch.softmax(attn_logits, dim=1)  # 邻居权重归一化 (Q, K, 1)
-        q_feat = torch.sum(value * attn_weights, dim=1)   # 加权求和融合 -> (Q, H)
 
-        residual = self.mlp(q_feat)                                   # (Q, num_targets)
-        pred_z = local_z_anchor + residual                            # (Q, num_targets)
+        attn_weights = torch.softmax(attn_logits, dim=1)
+        q_feat = torch.sum(value * attn_weights, dim=1)  # (Q, H)
 
-        # Squeeze scalar output
+        residual = self.mlp(q_feat)                       # (Q, num_targets)
+        pred_z = local_z_anchor + residual                # (Q, num_targets)
+
         if self.num_targets == 1:
             pred_z = pred_z.squeeze(-1)
             local_z_anchor = local_z_anchor.squeeze(-1)
 
-        # Training: also return IDW anchor for terrain-complexity weighting
         if self.training:
             return pred_z, local_z_anchor
         return pred_z

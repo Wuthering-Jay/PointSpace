@@ -1778,16 +1778,17 @@ class TerrainImplicitSampler(object):
     针对连续地形隐式重建(Continuous DEM)的多策略混合数据采样器。
     该模块会将输入的点云划分为 Support(支撑点，用于提取特征) 和 Query(查询点，用于监督隐式网络)。
     """
-    def __init__(self, 
+    def __init__(self,
                  random_ratio=0.1,             # 策略1: 纯随机抽取的比例
                  feature_ratio=0.1,            # 策略2: 基于地形特征(山脊/陡坎)抽取的比例
                  max_blocks=5,                 # 策略3: 矩形空洞的最大数量
                  block_size_range=(2.0, 15.0), # 矩形空洞的长宽边长范围(米)
                  feature_resolution=2.0,       # 极速地形特征提取的 2.5D 栅格分辨率(米)
-                 max_query_ratio=0.6,          # 安全阈值: 确保 Query 点不超过总点的比例，防止 Backbone 无点可用
+                 max_query_ratio=0.9,          # 放开限制，允许挖走 90% 的点
                  compute_gt_low=True,          # 是否计算低频平滑真值 (双分支需要, 单分支可关闭)
                  query_max=None,
                  ground_class=None,            # 若非 None，仅从该类别的地面点中抽取 Query
+                 extreme_hole_prob=0.3,        # 以此概率触发一个覆盖瓦片50%-80%范围的极端大空洞
                  ):
         self.random_ratio = random_ratio
         self.feature_ratio = feature_ratio
@@ -1798,6 +1799,7 @@ class TerrainImplicitSampler(object):
         self.compute_gt_low = compute_gt_low
         self.query_max = query_max
         self.ground_class = ground_class
+        self.extreme_hole_prob = extreme_hole_prob
 
     def _fast_topographic_weights(self, coord):
         """
@@ -1981,6 +1983,22 @@ class TerrainImplicitSampler(object):
 
         # 全局掩码，标记哪些点被挖走作为 Query
         query_mask = np.zeros(num_points, dtype=bool)
+
+        # ==========================================
+        # 策略 0: 极端大空洞 (模拟密林/水面造成的巨大地面缺失)
+        # ==========================================
+        if np.random.rand() < self.extreme_hole_prob:
+            extent = coord.max(axis=0)[:2] - coord.min(axis=0)[:2]
+            frac = np.random.uniform(0.5, 0.8)
+            w = max(extent[0] * frac, 1.0)
+            h = max(extent[1] * frac, 1.0)
+            cx = np.random.uniform(coord[:, 0].min(), coord[:, 0].max())
+            cy = np.random.uniform(coord[:, 1].min(), coord[:, 1].max())
+            extreme_mask = (
+                (np.abs(coord[:, 0] - cx) <= w / 2.0)
+                & (np.abs(coord[:, 1] - cy) <= h / 2.0)
+            )
+            query_mask |= extreme_mask
 
         # ==========================================
         # 策略 1: 随机数量、随机长宽的矩形空洞抽取 (模拟遮挡/水面)
