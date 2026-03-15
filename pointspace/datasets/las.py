@@ -829,7 +829,9 @@ class LasDataset(DefaultDataset):
                 result_dict["inverse"] = transform_result[0].pop("inverse")
             if "coord_shift" in transform_result[0]:
                 result_dict["coord_shift"] = transform_result[0].pop("coord_shift")
-            
+            if "core_bbox" in transform_result[0]:
+                result_dict["core_bbox"] = transform_result[0].pop("core_bbox")
+
             # Apply aug_transform and post_transform to each fragment
             fragment_list = []
             for data_part in transform_result:
@@ -854,6 +856,8 @@ class LasDataset(DefaultDataset):
                 result_dict["inverse"] = data_dict.pop("inverse")
             if "coord_shift" in data_dict:
                 result_dict["coord_shift"] = data_dict.pop("coord_shift")
+            if "core_bbox" in data_dict:
+                result_dict["core_bbox"] = data_dict.pop("core_bbox")
             # Pop regression target for the tester
             if target_key and target_key in data_dict:
                 result_dict["regression_target"] = data_dict.pop(target_key)
