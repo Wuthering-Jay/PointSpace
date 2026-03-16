@@ -12,6 +12,7 @@ Components
 
 import math
 
+import einops
 import torch
 import torch.nn as nn
 import torch_cluster
@@ -62,6 +63,97 @@ class RelativeFourierEncoding(nn.Module):
             encoded.append(torch.sin(x * freq * math.pi))
             encoded.append(torch.cos(x * freq * math.pi))
         return torch.cat(encoded, dim=-1)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CrossGroupedVectorAttention
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class CrossGroupedVectorAttention(nn.Module):
+    """Grouped vector attention from query → key/value neighbors.
+
+    Uses positional multiplier and bias (linear_p_multiplier / linear_p_bias)
+    to modulate relation_qk and value by 3-D relative position.
+
+    Args:
+        q_channels: Feature dims of query (Q, q_channels).
+        kv_channels: Feature dims of key/value neighbors (Q, K, kv_channels).
+        embed_channels: Internal attention dimension. Must be divisible by groups.
+        groups: Number of attention heads.
+        attn_drop_rate: Dropout rate on attention weights.
+    """
+
+    def __init__(self, q_channels, kv_channels, embed_channels, groups,
+                 attn_drop_rate=0.0):
+        super().__init__()
+        self.groups = groups
+        assert embed_channels % groups == 0, (
+            f"embed_channels ({embed_channels}) must be divisible by groups ({groups})"
+        )
+
+        self.linear_q = nn.Sequential(
+            nn.Linear(q_channels, embed_channels),
+            nn.LayerNorm(embed_channels),
+            nn.ReLU(inplace=True),
+        )
+        self.linear_k = nn.Sequential(
+            nn.Linear(kv_channels, embed_channels),
+            nn.LayerNorm(embed_channels),
+            nn.ReLU(inplace=True),
+        )
+        self.linear_v = nn.Linear(kv_channels, embed_channels)
+
+        self.linear_p_multiplier = nn.Sequential(
+            nn.Linear(3, embed_channels),
+            nn.LayerNorm(embed_channels),
+            nn.ReLU(inplace=True),
+            nn.Linear(embed_channels, embed_channels),
+        )
+        self.linear_p_bias = nn.Sequential(
+            nn.Linear(3, embed_channels),
+            nn.LayerNorm(embed_channels),
+            nn.ReLU(inplace=True),
+            nn.Linear(embed_channels, embed_channels),
+        )
+
+        self.weight_encoding = nn.Sequential(
+            nn.Linear(embed_channels, groups),
+            nn.LayerNorm(groups),
+            nn.ReLU(inplace=True),
+            nn.Linear(groups, groups),
+        )
+        self.softmax = nn.Softmax(dim=1)
+        self.attn_drop = nn.Dropout(attn_drop_rate)
+
+    def forward(self, q_feat, grouped_kv_feat, relative_pos):
+        """
+        Args:
+            q_feat: (Q, q_channels) query features.
+            grouped_kv_feat: (Q, K, kv_channels) neighbor key/value features.
+            relative_pos: (Q, K, 3) 3-D relative position (neighbor − query).
+
+        Returns:
+            (Q, embed_channels) attended features.
+        """
+        query = self.linear_q(q_feat)            # (Q, C)
+        key = self.linear_k(grouped_kv_feat)     # (Q, K, C)
+        value = self.linear_v(grouped_kv_feat)   # (Q, K, C)
+
+        relation_qk = key - query.unsqueeze(1)   # (Q, K, C)
+        pem = self.linear_p_multiplier(relative_pos)   # (Q, K, C)
+        peb = self.linear_p_bias(relative_pos)         # (Q, K, C)
+
+        relation_qk = relation_qk * pem + peb    # (Q, K, C)
+        value = value + peb                      # (Q, K, C)
+
+        weight = self.weight_encoding(relation_qk)   # (Q, K, G)
+        weight = self.attn_drop(self.softmax(weight))  # (Q, K, G)
+
+        value = einops.rearrange(value, "q k (g i) -> q k g i", g=self.groups)
+        feat = torch.einsum("q k g i, q k g -> q g i", value, weight)
+        feat = einops.rearrange(feat, "q g i -> q (g i)")  # (Q, C)
+        return feat
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -245,34 +337,51 @@ class DualBranchCNFHead(nn.Module):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# SingleBranchCNFHead
+# SingleBranchCNFHead  (Cross-GVA + FiLM + RBF Gaussian ground anchor)
 # ──────────────────────────────────────────────────────────────────────────────
 
 
 @MODELS.register_module()
 class SingleBranchCNFHead(nn.Module):
-    """Dual-KNN CNF head with semantic-geometry interleaving.
+    """Dual-KNN CNF head: Cross-GVA + FiLM modulation + learnable RBF anchor.
 
     Architecture overview:
-    - **Ground Branch** (pure ground KNN): extracts local height datum
-      ``z_anchor`` and ground-only feature anchor ``feat_anchor``.
-    - **Semantic Branch** (full-class KNN): gathers all-class neighbours,
-      injects explicit class embeddings and Z-axis relative Fourier encoding
-      to reason about canopy/building height differences.
-    - Cross-attention fusion of both streams → MLP → residual on z_anchor.
+
+    **Ground Branch** (wider KNN, K_g = K × 3):
+      - RBF Gaussian kernel (learnable σ) instead of IDW
+      - Outputs z_anchor (height datum) + feat_anchor (local feature mean)
+      - Computes macro-terrain stats: z_range, z_skew, local_z_std
+
+    **Semantic Branch** (K nearest overall):
+      - Gathers all-class neighbours
+      - Concatenates explicit class embedding + Z-Fourier PE
+
+    **Fusion (Cross-GVA + FiLM)**:
+      - CrossGroupedVectorAttention(q=feat_anchor, kv=semantic_neighbors)
+        with 3-D relative position modulation
+      - FiLM (Frequency-based Input Layerwise Modulation): γ·F + β
+        conditioned on macro terrain stats (range, skew, std)
+      - MLP → residual on z_anchor → pred_z
+
+    **No-segment fallback**:
+      When ``support_segment`` is None or contains no ground-class points,
+      uses the lowest 2–7 % of z values as a robust pseudo-ground set
+      (strips the very lowest percentile to exclude noise/water returns).
 
     Args:
         backbone_out_channels: Feature dim from backbone (*C*).
         query_dim: Coordinate dim for queries (2 = XY).
         num_targets: Output values per query (1 = scalar z).
-        k_neighbors: KNN neighbours per branch.
-        hidden_dim: Hidden dimension after fusion.
-        num_freqs: Fourier PE octaves for XY relative encoding.
+        k_neighbors: KNN neighbours for semantic branch (K). Ground branch
+            uses 3K to capture wider terrain context.
+        hidden_dim: Internal attention dimension and FiLM dimension.
         z_num_freqs: Fourier PE octaves for Z-axis height difference.
         mlp_hidden_dims: MLP hidden layer sizes.
         ground_class: Ground class label in ``segment``.
-        num_classes: Total number of semantic classes (for embedding).
+        num_classes: Total semantic classes (for class embedding table).
         class_embed_dim: Dimensionality of class embedding.
+        attn_groups: Number of attention head groups in Cross-GVA.
+            Must divide hidden_dim.
     """
 
     def __init__(
@@ -282,12 +391,12 @@ class SingleBranchCNFHead(nn.Module):
         num_targets=1,
         k_neighbors=16,
         hidden_dim=256,
-        num_freqs=6,
         z_num_freqs=4,
         mlp_hidden_dims=None,
         ground_class=2,
         num_classes=20,
         class_embed_dim=16,
+        attn_groups=4,
     ):
         super().__init__()
         if mlp_hidden_dims is None:
@@ -298,43 +407,37 @@ class SingleBranchCNFHead(nn.Module):
         self.k_neighbors = k_neighbors
         self.ground_class = ground_class
 
-        beta = 100
+        # Learnable Gaussian kernel bandwidth (RBF)
+        self.sigma = nn.Parameter(torch.tensor([1.0]))
 
-        # Position & height encodings
-        self.pe_linear = nn.Sequential(
-            nn.Linear(query_dim, 32), nn.Softplus(beta=beta), nn.Linear(32, 64),
-        )
-        self.rfe = RelativeFourierEncoding(in_dim=query_dim, num_freqs=num_freqs)
-        fourier_dim = self.rfe.output_dim
-
+        self.class_embed = nn.Embedding(num_classes, class_embed_dim)
         self.z_rfe = RelativeFourierEncoding(in_dim=1, num_freqs=z_num_freqs)
         z_fourier_dim = self.z_rfe.output_dim
 
-        # Explicit class embedding
-        self.class_embed = nn.Embedding(num_classes, class_embed_dim)
-
-        # Fusion dim: semantic_feat + class_embed + ground_feat_anchor +
-        #             pe_linear + pe_fourier + z_fourier + z_std
-        fuse_in = (
-            backbone_out_channels * 2
-            + 64 + fourier_dim + z_fourier_dim + 1 + class_embed_dim
+        # Cross-GVA: q ← feat_anchor (C), kv ← [feat, class_embed, z_pe]
+        kv_channels = backbone_out_channels + class_embed_dim + z_fourier_dim
+        self.cross_gva = CrossGroupedVectorAttention(
+            q_channels=backbone_out_channels,
+            kv_channels=kv_channels,
+            embed_channels=hidden_dim,
+            groups=attn_groups,
         )
 
-        self.value_proj = nn.Sequential(
-            nn.Linear(fuse_in, hidden_dim),
-            nn.Softplus(beta=beta),
-            nn.Linear(hidden_dim, hidden_dim),
+        # FiLM conditioning network (input: range, skew, std — 3 scalars)
+        self.film_mlp = nn.Sequential(
+            nn.Linear(3, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim * 2),  # outputs γ and β
         )
-        self.attn_proj = nn.Sequential(
-            nn.Linear(fuse_in, hidden_dim // 2),
-            nn.Softplus(beta=beta),
-            nn.Linear(hidden_dim // 2, 1),
-        )
+        # Identity-mapping init: γ → 1, β → 0 so early training is stable
+        nn.init.zeros_(self.film_mlp[2].weight)
+        nn.init.zeros_(self.film_mlp[2].bias)
+        self.film_mlp[2].bias.data[:hidden_dim] = 1.0  # front half = γ
 
         layers = []
         d = hidden_dim
         for h in mlp_hidden_dims:
-            layers.extend([nn.Linear(d, h), nn.Softplus(beta=beta)])
+            layers.extend([nn.Linear(d, h), nn.Softplus(beta=100)])
             d = h
         layers.append(nn.Linear(d, num_targets))
         self.mlp = nn.Sequential(*layers)
@@ -370,20 +473,34 @@ class SingleBranchCNFHead(nn.Module):
         """
         qd = self.query_dim
         K = self.k_neighbors
+        K_g = K * 3  # wider ground-branch receptive field
         Q = query_coord.shape[0]
 
         # ------------------------------------------------------------------
-        # 0. Ground mask
+        # 0. Ground mask: class-based or robust 2–7 % lowest-z fallback
         # ------------------------------------------------------------------
         if support_segment is not None:
             ground_mask = (support_segment.squeeze() == self.ground_class)
             if not ground_mask.any():
-                ground_mask = torch.ones_like(ground_mask)
+                # No class-2 points → take robust lowest-z slice
+                z_vals = support_coord[:, 2]
+                n = z_vals.shape[0]
+                i0 = max(1, int(0.02 * n))
+                i1 = max(i0 + 1, int(0.07 * n))
+                sorted_idx = torch.argsort(z_vals)
+                ground_mask = torch.zeros_like(ground_mask)
+                ground_mask[sorted_idx[i0:i1]] = True
         else:
-            ground_mask = torch.ones(
+            z_vals = support_coord[:, 2]
+            n = z_vals.shape[0]
+            i0 = max(1, int(0.02 * n))
+            i1 = max(i0 + 1, int(0.07 * n))
+            sorted_idx = torch.argsort(z_vals)
+            ground_mask = torch.zeros(
                 support_coord.shape[0], dtype=torch.bool,
                 device=support_coord.device,
             )
+            ground_mask[sorted_idx[i0:i1]] = True
 
         q_xy = query_coord[:, :qd].contiguous()
         s_coord_g = support_coord[ground_mask]
@@ -407,21 +524,23 @@ class SingleBranchCNFHead(nn.Module):
             batch_q = torch.zeros(Q, dtype=torch.long, device=q_xy.device)
 
         # ------------------------------------------------------------------
-        # 1. Ground Branch: height datum + feature anchor
+        # 1. Ground Branch: wide-KNN + learnable RBF anchor
         # ------------------------------------------------------------------
         assign_g = torch_cluster.knn(
-            x=s_xy_g, y=q_xy, k=K,
+            x=s_xy_g, y=q_xy, k=K_g,
             batch_x=batch_s_g, batch_y=batch_q,
         )
-        s_col_g_dense = self._to_dense(assign_g[0], assign_g[1], Q, K, q_xy.device)
+        s_col_g_dense = self._to_dense(assign_g[0], assign_g[1], Q, K_g, q_xy.device)
 
-        grouped_coords_g = s_coord_g[s_col_g_dense]   # (Q, K, 3)
-        grouped_feats_g = s_feat_g[s_col_g_dense]     # (Q, K, C)
+        grouped_coords_g = s_coord_g[s_col_g_dense]   # (Q, K_g, 3)
+        grouped_feats_g = s_feat_g[s_col_g_dense]     # (Q, K_g, C)
 
         relative_xy_g = grouped_coords_g[:, :, :qd] - q_xy.unsqueeze(1)
-        dist_sq_g = torch.sum(relative_xy_g ** 2, dim=-1)
-        weights_g = 1.0 / (dist_sq_g + 1e-6)
-        weights_g = weights_g / weights_g.sum(dim=-1, keepdim=True)
+        dist_sq_g = torch.sum(relative_xy_g ** 2, dim=-1)             # (Q, K_g)
+
+        # Learnable Gaussian (RBF) kernel weights
+        weights_g = torch.exp(-dist_sq_g / (2 * self.sigma ** 2 + 1e-6))
+        weights_g = weights_g / (weights_g.sum(dim=-1, keepdim=True) + 1e-6)
 
         local_z_anchor = torch.sum(
             grouped_coords_g[:, :, 2] * weights_g, dim=-1, keepdim=True
@@ -429,10 +548,15 @@ class SingleBranchCNFHead(nn.Module):
         local_feat_anchor = torch.sum(
             grouped_feats_g * weights_g.unsqueeze(-1), dim=1
         )  # (Q, C)
-        local_feat_anchor_exp = local_feat_anchor.unsqueeze(1).expand(-1, K, -1)
+
+        # Macro terrain statistics for FiLM conditioning
+        macro_z_max = grouped_coords_g[:, :, 2].max(dim=1, keepdim=True).values
+        macro_z_min = grouped_coords_g[:, :, 2].min(dim=1, keepdim=True).values
+        macro_z_range = macro_z_max - macro_z_min                              # (Q, 1)
+        macro_z_skew = grouped_coords_g[:, :, 2].mean(dim=1, keepdim=True) - local_z_anchor  # (Q, 1)
 
         # ------------------------------------------------------------------
-        # 2. Semantic Branch: full-class context + class embed + Z Fourier
+        # 2. Semantic Branch: full-class KNN + class embed + Z Fourier PE
         # ------------------------------------------------------------------
         assign_f = torch_cluster.knn(
             x=s_xy_full, y=q_xy, k=K,
@@ -441,9 +565,8 @@ class SingleBranchCNFHead(nn.Module):
         s_col_f_dense = self._to_dense(assign_f[0], assign_f[1], Q, K, q_xy.device)
 
         grouped_coords_f = support_coord[s_col_f_dense]   # (Q, K, 3)
-        grouped_feats_f = support_feat[s_col_f_dense]      # (Q, K, C)
+        grouped_feats_f = support_feat[s_col_f_dense]     # (Q, K, C)
 
-        # Explicit class embedding
         if support_segment is not None:
             grouped_seg = support_segment.squeeze()[s_col_f_dense]  # (Q, K)
         else:
@@ -453,40 +576,40 @@ class SingleBranchCNFHead(nn.Module):
             )
         grouped_class_embed = self.class_embed(grouped_seg)  # (Q, K, D_cls)
 
-        relative_xy_f = grouped_coords_f[:, :, :qd] - q_xy.unsqueeze(1)
-        pe_lin = self.pe_linear(relative_xy_f)     # (Q, K, 64)
-        pe_four = self.rfe(relative_xy_f)          # (Q, K, fourier_dim)
-
         # Z-axis relative Fourier encoding
         relative_z_f = grouped_coords_f[:, :, 2:3] - local_z_anchor.unsqueeze(1)
-        pe_z_four = self.z_rfe(relative_z_f)       # (Q, K, z_fourier_dim)
+        pe_z_four = self.z_rfe(relative_z_f)            # (Q, K, z_fourier_dim)
 
         local_z_std = torch.std(
             grouped_coords_f[:, :, 2], dim=1, unbiased=False, keepdim=True
-        )
-        local_z_std = local_z_std.unsqueeze(1).expand(-1, K, -1)  # (Q, K, 1)
+        )  # (Q, 1)
+
+        # 3-D relative position for Cross-GVA position modulation
+        query_xyz = torch.cat([q_xy, local_z_anchor], dim=-1)          # (Q, 3)
+        relative_pos_f = grouped_coords_f - query_xyz.unsqueeze(1)     # (Q, K, 3)
 
         # ------------------------------------------------------------------
-        # 3. Cross-attention fusion & decode
+        # 3. Cross-GVA fusion + FiLM modulation
         # ------------------------------------------------------------------
-        feat_cat = torch.cat([
-            grouped_feats_f,          # implicit backbone semantics
-            grouped_class_embed,      # explicit class signal
-            local_feat_anchor_exp,    # ground-only feature anchor
-            pe_lin,
-            pe_four,
-            pe_z_four,                # Z-axis height ruler
-            local_z_std,
-        ], dim=-1)
+        neighbor_kv = torch.cat(
+            [grouped_feats_f, grouped_class_embed, pe_z_four], dim=-1
+        )  # (Q, K, kv_channels)
 
-        value = self.value_proj(feat_cat)           # (Q, K, H)
-        attn_logits = self.attn_proj(feat_cat)      # (Q, K, 1)
+        F_query = self.cross_gva(
+            q_feat=local_feat_anchor,
+            grouped_kv_feat=neighbor_kv,
+            relative_pos=relative_pos_f,
+        )  # (Q, hidden_dim)
 
-        attn_weights = torch.softmax(attn_logits, dim=1)
-        q_feat = torch.sum(value * attn_weights, dim=1)  # (Q, H)
+        S_terrain = torch.cat(
+            [macro_z_range, macro_z_skew, local_z_std], dim=-1
+        )  # (Q, 3)
+        film_params = self.film_mlp(S_terrain)                # (Q, hidden_dim * 2)
+        gamma, beta = torch.chunk(film_params, 2, dim=-1)     # each (Q, hidden_dim)
 
-        residual = self.mlp(q_feat)                       # (Q, num_targets)
-        pred_z = local_z_anchor + residual                # (Q, num_targets)
+        F_modulated = gamma * F_query + beta                  # (Q, hidden_dim)
+        residual = self.mlp(F_modulated)                      # (Q, num_targets)
+        pred_z = local_z_anchor + residual                    # (Q, num_targets)
 
         if self.num_targets == 1:
             pred_z = pred_z.squeeze(-1)

@@ -116,17 +116,16 @@ model = dict(
     ),
     head=dict(
         type="SingleBranchCNFHead",
-        backbone_out_channels=24,   # must match backbone dec_channels[0]
-        query_dim=2,                # predict z from (x, y)
-        num_targets=1,              # scalar output (terrain height)
-        k_neighbors=24,             # KNN per branch (ground & semantic)
-        hidden_dim=128,             # fusion hidden dimension
-        num_freqs=6,                # XY Fourier PE octaves
-        z_num_freqs=4,              # Z-axis height-diff Fourier PE octaves
-        mlp_hidden_dims=[64, 32],
-        ground_class=ground_class,  # used by Ground Branch mask
-        num_classes=32,             # matches backbone num_classes (LAS codes)
-        class_embed_dim=16,         # explicit class embedding dim
+        backbone_out_channels=64,
+        query_dim=2,
+        num_targets=1,
+        k_neighbors=16,
+        hidden_dim=256,
+        z_num_freqs=4,
+        ground_class=2,
+        num_classes=32,
+        class_embed_dim=16,
+        attn_groups=4,
     ),
     criteria=None,  # use built-in SmoothL1 loss
 )
