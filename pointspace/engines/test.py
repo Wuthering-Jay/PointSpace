@@ -1839,6 +1839,7 @@ class CnfTester(TesterBase):
             # ============================================================
             support_feat_parts = []
             support_coord_parts = []
+            support_seg_parts = []   # class labels: integer, no averaging
             num_fragments = len(fragment_list)
             frag_batch_num = int(np.ceil(num_fragments / batch_size_test))
 
@@ -1867,6 +1868,10 @@ class CnfTester(TesterBase):
                 support_coord_parts.append(
                     (frag_idx, enc["coord"].cpu())
                 )
+                if "segment" in enc:
+                    support_seg_parts.append(
+                        (frag_idx, enc["segment"].cpu().squeeze())
+                    )
 
                 logger.info(
                     "CNF Encode: {}/{}-{}, Fragment: {}/{}".format(
@@ -1904,6 +1909,18 @@ class CnfTester(TesterBase):
             else:
                 support_feat = feat_sum[valid_mask].cuda()
                 support_coord = coord_sum[valid_mask].cuda()
+
+            # Merge segment labels (last-write-wins; labels don't change across augmentations)
+            if support_seg_parts:
+                seg_buf = torch.zeros(N, dtype=torch.long)
+                for frag_idx, frag_seg in support_seg_parts:
+                    seg_buf[frag_idx] = frag_seg
+                if "inverse" in data_dict:
+                    support_segment = seg_buf[data_dict["inverse"]].cuda()
+                else:
+                    support_segment = seg_buf[valid_mask].cuda()
+            else:
+                support_segment = None
 
             logger.info(
                 "CNF Encode done: {} support points, feat shape {}".format(
@@ -2001,7 +2018,8 @@ class CnfTester(TesterBase):
                 )
                 with ctx, auto_cast():
                     pz = raw_model.query_forward(
-                        support_coord, support_feat, q_batch
+                        support_coord, support_feat, q_batch,
+                        support_segment=support_segment,
                     )
 
                     if compute_derivatives:

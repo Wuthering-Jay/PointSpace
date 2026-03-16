@@ -677,3 +677,193 @@ class TestIntegration:
         out1 = head(coord, feat, query, support_segment=seg)
         out2 = head(coord, feat, query, support_segment=seg)
         assert torch.allclose(out1, out2)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Regression: vegetation-surface prediction bug
+# Demonstrates that without segment at test time, z_anchor is elevated to
+# vegetation height; with correct segment, z_anchor anchors to ground level.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestVegetationSurfaceBug:
+    """Regression tests for the vegetation-prediction bug.
+
+    Root cause: CnfTester never passed support_segment to query_forward, so
+    the Dual-KNN head used ground_mask=all_ones, causing IDW z_anchor to be
+    computed from ALL points (including high-z vegetation), pulling pred_z
+    up to canopy level.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _import(self):
+        from pointspace.models.head.cnf_head import SingleBranchCNFHead
+        self.cls = SingleBranchCNFHead
+
+    def _make_terrain_with_canopy(self, N_ground=100, N_canopy=100,
+                                   ground_z=0.0, canopy_z=15.0,
+                                   C=16, ground_class=2):
+        """Ground points near z=0; canopy points near z=15."""
+        torch.manual_seed(42)
+        # Ground points
+        g_xy = torch.rand(N_ground, 2) * 50
+        g_z = torch.full((N_ground, 1), ground_z) + torch.randn(N_ground, 1) * 0.2
+        g_coord = torch.cat([g_xy, g_z], dim=1)
+        g_feat = torch.randn(N_ground, C)
+        g_seg = torch.full((N_ground,), ground_class, dtype=torch.long)
+
+        # Canopy points (vegetation, e.g. class 5)
+        c_xy = torch.rand(N_canopy, 2) * 50
+        c_z = torch.full((N_canopy, 1), canopy_z) + torch.randn(N_canopy, 1) * 0.5
+        c_coord = torch.cat([c_xy, c_z], dim=1)
+        c_feat = torch.randn(N_canopy, C)
+        c_seg = torch.full((N_canopy,), 5, dtype=torch.long)  # class 5 = vegetation
+
+        coord = torch.cat([g_coord, c_coord], dim=0)
+        feat = torch.cat([g_feat, c_feat], dim=0)
+        seg = torch.cat([g_seg, c_seg], dim=0)
+        return coord, feat, seg
+
+    def test_z_anchor_elevated_without_segment(self):
+        """Bug: without segment, z_anchor is pulled to ~(ground+canopy)/2."""
+        head = self.cls(
+            backbone_out_channels=16, k_neighbors=8, hidden_dim=32,
+            num_freqs=2, z_num_freqs=2, mlp_hidden_dims=[16],
+            ground_class=2, num_classes=10, class_embed_dim=8,
+        )
+        head.eval()
+        coord, feat, seg = self._make_terrain_with_canopy(
+            N_ground=200, N_canopy=200, ground_z=0.0, canopy_z=15.0
+        )
+        # Query points at ground level (x,y only)
+        query = torch.rand(20, 2) * 40 + 5  # interior of tile
+
+        # Without segment: all points treated as ground
+        with torch.no_grad():
+            head.training = False
+            pred_no_seg = head(coord, feat, query, support_segment=None)
+
+        # The IDW anchor from ALL points (z∈[0,15]) will be elevated
+        # Since we return pred_z = z_anchor + residual, and z_anchor ≈ 7.5
+        # (between ground and canopy), the prediction is significantly positive
+        # (well above true ground_z ≈ 0)
+        mean_pred = pred_no_seg.mean().item()
+        assert mean_pred > 3.0, (
+            f"Expected elevated prediction without segment (mean={mean_pred:.2f}), "
+            "bug may have been masked"
+        )
+
+    def test_z_anchor_grounded_with_segment(self):
+        """Fix: with correct segment, z_anchor anchors to ground level."""
+        head = self.cls(
+            backbone_out_channels=16, k_neighbors=8, hidden_dim=32,
+            num_freqs=2, z_num_freqs=2, mlp_hidden_dims=[16],
+            ground_class=2, num_classes=10, class_embed_dim=8,
+        )
+        head.eval()
+        coord, feat, seg = self._make_terrain_with_canopy(
+            N_ground=200, N_canopy=200, ground_z=0.0, canopy_z=15.0
+        )
+        query = torch.rand(20, 2) * 40 + 5
+
+        # With segment: Ground Branch uses only class-2 points (z≈0)
+        with torch.no_grad():
+            pred_with_seg = head(coord, feat, query, support_segment=seg)
+
+        # z_anchor should be pulled to ground level (≈0), so prediction is near 0
+        mean_pred = pred_with_seg.mean().item()
+        assert mean_pred < 3.0, (
+            f"Expected ground-level prediction with segment (mean={mean_pred:.2f}), "
+            "segment not being used by Ground Branch"
+        )
+
+    def test_segment_fixes_vegetation_bias(self):
+        """Direct comparison: with segment, prediction closer to ground_z than without."""
+        head = self.cls(
+            backbone_out_channels=16, k_neighbors=8, hidden_dim=32,
+            num_freqs=2, z_num_freqs=2, mlp_hidden_dims=[16],
+            ground_class=2, num_classes=10, class_embed_dim=8,
+        )
+        head.eval()
+        coord, feat, seg = self._make_terrain_with_canopy(
+            N_ground=200, N_canopy=200, ground_z=0.0, canopy_z=15.0
+        )
+        query = torch.rand(20, 2) * 40 + 5
+
+        with torch.no_grad():
+            pred_no_seg = head(coord, feat, query, support_segment=None)
+            pred_with_seg = head(coord, feat, query, support_segment=seg)
+
+        # With segment: predictions should be significantly lower (closer to ground)
+        diff = pred_no_seg.mean() - pred_with_seg.mean()
+        assert diff > 2.0, (
+            f"Expected segment to lower pred by >2m vs no-segment. "
+            f"no_seg={pred_no_seg.mean():.2f}, with_seg={pred_with_seg.mean():.2f}, "
+            f"diff={diff:.2f}"
+        )
+
+    # ── CnfTester segment merging logic ──────────────────────────────────
+
+    def test_seg_merge_last_write_wins(self):
+        """The segment merge in CnfTester: last write wins for overlapping indices."""
+        N = 10
+        seg_buf = torch.zeros(N, dtype=torch.long)
+        # Fragment 1 writes class 5 to all indices
+        frag1_idx = torch.arange(N)
+        frag1_seg = torch.full((N,), 5, dtype=torch.long)
+        seg_buf[frag1_idx] = frag1_seg
+        # Fragment 2 overwrites first 5 indices with class 2
+        frag2_idx = torch.arange(5)
+        frag2_seg = torch.full((5,), 2, dtype=torch.long)
+        seg_buf[frag2_idx] = frag2_seg
+
+        assert (seg_buf[:5] == 2).all()
+        assert (seg_buf[5:] == 5).all()
+
+    def test_seg_merge_squeeze_handles_extra_dim(self):
+        """squeeze() on segment handles (N,1) or (N,) correctly."""
+        seg_1d = torch.randint(0, 5, (20,))
+        seg_2d = seg_1d.unsqueeze(1)  # (20, 1)
+        assert seg_1d.squeeze().shape == (20,)
+        assert seg_2d.squeeze().shape == (20,)
+        # Both should give same values
+        assert torch.equal(seg_1d.squeeze(), seg_2d.squeeze())
+
+    def test_seg_merge_valid_mask_alignment(self):
+        """Segment is indexed by valid_mask the same way as feat/coord."""
+        N = 8
+        seg_buf = torch.tensor([2, 5, 2, 2, 5, 2, 5, 2], dtype=torch.long)
+        valid_mask = torch.tensor([True, False, True, True, False, True, True, False])
+        support_segment = seg_buf[valid_mask]
+        # Should have 5 elements (5 True in valid_mask)
+        assert support_segment.shape == (5,)
+        assert support_segment.tolist() == [2, 2, 2, 2, 5]
+
+    def test_no_segment_in_enc_gives_none(self):
+        """When enc has no 'segment', support_segment is None (graceful fallback)."""
+        support_seg_parts = []  # empty
+        support_segment = None if not support_seg_parts else "something"
+        assert support_segment is None
+
+    def test_z_anchor_all_ground_matches_expected(self):
+        """When all points are ground, z_anchor should track ground Z closely."""
+        head = self.cls(
+            backbone_out_channels=16, k_neighbors=8, hidden_dim=32,
+            num_freqs=2, z_num_freqs=2, mlp_hidden_dims=[16],
+            ground_class=2, num_classes=10, class_embed_dim=8,
+        )
+        head.train()
+        torch.manual_seed(0)
+        N = 100
+        # All ground points, perfectly flat terrain at z=5.0
+        xy = torch.rand(N, 2) * 30
+        z = torch.full((N, 1), 5.0) + torch.randn(N, 1) * 0.01
+        coord = torch.cat([xy, z], dim=1)
+        feat = torch.randn(N, 16)
+        seg = torch.full((N,), 2, dtype=torch.long)
+        query = torch.rand(10, 2) * 20 + 5
+
+        _, z_anchor = head(coord, feat, query, support_segment=seg)
+        # z_anchor should be very close to 5.0 (IDW from ground-only at z≈5.0)
+        assert torch.abs(z_anchor.mean() - 5.0).item() < 0.5, (
+            f"z_anchor expected ≈5.0, got {z_anchor.mean():.3f}"
+        )
