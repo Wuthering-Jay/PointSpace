@@ -95,32 +95,32 @@ class CrossGroupedVectorAttention(nn.Module):
         self.linear_q = nn.Sequential(
             nn.Linear(q_channels, embed_channels),
             nn.LayerNorm(embed_channels),
-            nn.ReLU(inplace=True),
+            nn.Softplus(beta=100),
         )
         self.linear_k = nn.Sequential(
             nn.Linear(kv_channels, embed_channels),
             nn.LayerNorm(embed_channels),
-            nn.ReLU(inplace=True),
+            nn.Softplus(beta=100),
         )
         self.linear_v = nn.Linear(kv_channels, embed_channels)
 
         self.linear_p_multiplier = nn.Sequential(
             nn.Linear(3, embed_channels),
             nn.LayerNorm(embed_channels),
-            nn.ReLU(inplace=True),
+            nn.Softplus(beta=100),
             nn.Linear(embed_channels, embed_channels),
         )
         self.linear_p_bias = nn.Sequential(
             nn.Linear(3, embed_channels),
             nn.LayerNorm(embed_channels),
-            nn.ReLU(inplace=True),
+            nn.Softplus(beta=100),
             nn.Linear(embed_channels, embed_channels),
         )
 
         self.weight_encoding = nn.Sequential(
             nn.Linear(embed_channels, groups),
             nn.LayerNorm(groups),
-            nn.ReLU(inplace=True),
+            nn.Softplus(beta=100),
             nn.Linear(groups, groups),
         )
         self.softmax = nn.Softmax(dim=1)
@@ -426,7 +426,7 @@ class SingleBranchCNFHead(nn.Module):
         # FiLM conditioning network (input: range, skew, std — 3 scalars)
         self.film_mlp = nn.Sequential(
             nn.Linear(3, hidden_dim),
-            nn.GELU(),
+            nn.Softplus(beta=100),
             nn.Linear(hidden_dim, hidden_dim * 2),  # outputs γ and β
         )
         # Identity-mapping init: γ → 1, β → 0 so early training is stable

@@ -148,7 +148,7 @@ hooks = [
     dict(type="ModelHook"),
     dict(type="IterationTimer", warmup_iter=2),
     dict(type="InformationWriter", interval=10),
-    dict(type="CacheCleaner", time_multiplier=5, step_clean_interval=250),
+    dict(type="CacheCleaner", time_multiplier=5, step_clean_interval=250, abs_threshold_sec=10),
     dict(type="CnfEvaluator", log_interval=10),
     dict(type="CheckpointSaver", save_freq=None),
 ]
