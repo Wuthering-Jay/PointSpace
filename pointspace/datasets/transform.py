@@ -2214,3 +2214,70 @@ class GridCoordinate(object):
         if "grid_coord" not in data_dict["index_valid_keys"]:
             data_dict["index_valid_keys"].append("grid_coord")
         return data_dict
+    
+
+class NonGroundSmoother(object):
+    """
+    实时树冠平滑器：拦截输入点云，提取局部 DSM，进行高斯滤波，
+    并强行覆盖植被点的 Z 坐标，让高频噪声永远无法进入 Backbone。
+    """
+    def __init__(self, grid_size=1.0, sigma=2.0, ground_class=2):
+        """
+        :param grid_size: 内部构建迷你栅格的分辨率（如 1.0 米）
+        :param sigma: 高斯滤波的强度（如 2.0，对应强力平滑）
+        :param ground_class: 地面类别的标签 ID
+        """
+        self.grid_size = grid_size
+        self.sigma = sigma
+        self.ground_class = ground_class
+
+    def __call__(self, input_dict):
+        coord = input_dict["coord"]      # [N, 3]
+        segment = input_dict.get("segment", None) # [N, 1]
+
+        # 如果没有语义标签，为了安全起见，不执行强行覆盖
+        if segment is None:
+            return input_dict
+
+        segment = segment.squeeze()
+        
+        # 1. 找到非地面点（植被、建筑等）的掩码
+        non_ground_mask = (segment != self.ground_class)
+        if not np.any(non_ground_mask):
+            return input_dict # 全是地面，直接返回
+
+        # 2. 构建局部的相对 2D 坐标系
+        min_x, min_y = np.min(coord[:, 0]), np.min(coord[:, 1])
+        max_x, max_y = np.max(coord[:, 0]), np.max(coord[:, 1])
+        
+        width = int(np.ceil((max_x - min_x) / self.grid_size)) + 1
+        height = int(np.ceil((max_y - min_y) / self.grid_size)) + 1
+
+        # 初始化 DSM 栅格，使用一个极低的值保底
+        dsm_grid = np.full((width, height), -9999.0, dtype=np.float32)
+
+        # 3. 将所有点投影到栅格，提取 Max Z (纯正的粗糙 DSM)
+        grid_x = np.clip(((coord[:, 0] - min_x) / self.grid_size).astype(np.int32), 0, width - 1)
+        grid_y = np.clip(((coord[:, 1] - min_y) / self.grid_size).astype(np.int32), 0, height - 1)
+        
+        # 极速向量化计算每个像素的最大 Z 值
+        np.maximum.at(dsm_grid, (grid_x, grid_y), coord[:, 2])
+
+        # 填补没有点的空洞像素（使用最近邻或全区均值，简单起见这里用非空均值）
+        valid_mask = (dsm_grid > -9999.0)
+        if np.any(valid_mask):
+            mean_z = np.mean(dsm_grid[valid_mask])
+            dsm_grid[~valid_mask] = mean_z
+
+        # 4. 🌟 核心：执行离线级别的 2D 高斯平滑
+        smoothed_dsm = gaussian_filter(dsm_grid, sigma=self.sigma)
+
+        # 5. 映射回点云：查找每个点对应的平滑后 Z 值
+        smoothed_z = smoothed_dsm[grid_x, grid_y]
+
+        # 6. 🌟 物理覆盖：只把非地面点（树冠）的真实 Z 坐标，替换为平滑后的 Z！
+        # 真实地面点保持毫米级精度不变
+        coord[non_ground_mask, 2] = smoothed_z[non_ground_mask]
+
+        input_dict["coord"] = coord
+        return input_dict

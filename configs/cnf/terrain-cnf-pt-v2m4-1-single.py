@@ -168,7 +168,7 @@ writer = dict(
 # CNF test-time parameters
 query_dim = 2
 query_resolution = 0.5
-query_batch_size = 20000
+query_batch_size = 10000
 compute_derivatives = True
 
 # -------------------------------------------------------

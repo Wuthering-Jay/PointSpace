@@ -542,12 +542,8 @@ class SingleBranchCNFHead(nn.Module):
         weights_g = torch.exp(-dist_sq_g / (2 * self.sigma ** 2 + 1e-6))
         weights_g = weights_g / (weights_g.sum(dim=-1, keepdim=True) + 1e-6)
 
-        local_z_anchor = torch.sum(
-            grouped_coords_g[:, :, 2] * weights_g, dim=-1, keepdim=True
-        )  # (Q, 1)
-        local_feat_anchor = torch.sum(
-            grouped_feats_g * weights_g.unsqueeze(-1), dim=1
-        )  # (Q, C)
+        local_feat_anchor = torch.bmm(weights_g.unsqueeze(1), grouped_feats_g).squeeze(1)
+        local_z_anchor = torch.bmm(weights_g.unsqueeze(1), grouped_coords_g[:, :, 2:3]).squeeze(1) # (Q, 1)
 
         # Macro terrain statistics for FiLM conditioning
         macro_z_max = grouped_coords_g[:, :, 2].max(dim=1, keepdim=True).values

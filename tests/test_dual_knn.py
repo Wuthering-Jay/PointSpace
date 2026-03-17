@@ -426,12 +426,12 @@ class TestSingleBranchCNFHeadDualKNN:
             num_targets=1,
             k_neighbors=4,
             hidden_dim=32,
-            num_freqs=2,
             z_num_freqs=2,
             mlp_hidden_dims=[16],
             ground_class=2,
             num_classes=5,
             class_embed_dim=8,
+            attn_groups=4,   # 32 / 4 == 8, valid
         )
         defaults.update(kw)
         return self.cls(**defaults)
@@ -442,8 +442,9 @@ class TestSingleBranchCNFHeadDualKNN:
         head = self._make_head()
         assert hasattr(head, "class_embed")
         assert hasattr(head, "z_rfe")
-        assert hasattr(head, "rfe")
-        assert hasattr(head, "pe_linear")
+        assert hasattr(head, "cross_gva")    # Cross-GVA fusion module
+        assert hasattr(head, "film_mlp")     # FiLM conditioning network
+        assert hasattr(head, "sigma")        # learnable RBF bandwidth
 
     def test_new_params_exist(self):
         head = self._make_head()
@@ -456,16 +457,13 @@ class TestSingleBranchCNFHeadDualKNN:
         assert head.z_rfe.output_dim == 1 * 4 * 2  # in_dim=1
 
     def test_value_proj_input_dim(self):
-        """Verify fuse_in is computed correctly."""
+        """Verify kv_channels fed into Cross-GVA is computed correctly."""
         C = 24
-        fourier_dim = 2 * 2 * 2    # in_dim=2, num_freqs=2, * 2
-        z_fourier_dim = 1 * 2 * 2  # in_dim=1, z_num_freqs=2, * 2
-        pe_linear_dim = 64
-        z_std_dim = 1
+        z_fourier_dim = 1 * 2 * 2   # in_dim=1, z_num_freqs=2, * 2
         cls_dim = 8
-        expected = C * 2 + pe_linear_dim + fourier_dim + z_fourier_dim + z_std_dim + cls_dim
+        expected_kv = C + z_fourier_dim + cls_dim  # 24 + 4 + 8 = 36
         head = self._make_head()
-        assert head.value_proj[0].in_features == expected
+        assert head.cross_gva.linear_k[0].in_features == expected_kv
 
     # ── forward shape tests ───────────────────────────────────────────────
 
@@ -599,10 +597,62 @@ class TestSingleBranchCNFHeadDualKNN:
         out = head.z_rfe(z_diff)
         assert out.shape == (5, 4, 1 * 3 * 2)
 
+    # ── new architecture-specific tests ───────────────────────────────────
+
+    def test_sigma_is_learnable_parameter(self):
+        """sigma (RBF bandwidth) must be an nn.Parameter."""
+        head = self._make_head()
+        assert isinstance(head.sigma, nn.Parameter)
+        assert head.sigma.shape == (1,)
+
+    def test_sigma_gradient_flows(self):
+        """sigma receives gradient through the RBF weighting."""
+        head = self._make_head()
+        head.train()
+        coord, feat, query, seg = self._make_inputs()
+        pred_z, _ = head(coord, feat, query, support_segment=seg)
+        pred_z.sum().backward()
+        assert head.sigma.grad is not None
+
+    def test_film_init_gamma_one_beta_zero(self):
+        """FiLM init: gamma bias ≈ 1, beta bias ≈ 0, all weights ≈ 0."""
+        head = self._make_head()
+        H = 32  # hidden_dim
+        last = head.film_mlp[2]
+        # All weights should be zero after identity init
+        assert torch.allclose(last.weight, torch.zeros_like(last.weight))
+        # First H bias values (gamma) should be 1.0
+        assert torch.allclose(last.bias[:H], torch.ones(H))
+        # Second H bias values (beta) should be 0.0
+        assert torch.allclose(last.bias[H:], torch.zeros(H))
+
+    def test_attn_groups_configurable(self):
+        """attn_groups=2 works as long as hidden_dim is divisible by it."""
+        head = self._make_head(attn_groups=2)
+        head.eval()
+        coord, feat, query, seg = self._make_inputs()
+        pred_z = head(coord, feat, query, support_segment=seg)
+        assert pred_z.shape == (20,)
+
+    def test_no_segment_fallback_uses_percentile(self):
+        """No-segment fallback selects lowest-z percentile not all points."""
+        head = self._make_head()
+        head.eval()
+        N = 200
+        # All points at z=10 except lowest 1 at z=0
+        coord = torch.full((N, 3), 10.0)
+        coord[0, 2] = 0.0  # one very-low point
+        feat = torch.randn(N, 24)
+        query = torch.zeros(5, 2)
+        # Without segment, fallback should find the low-z points
+        pred_z = head(coord, feat, query, support_segment=None)
+        assert pred_z.shape == (5,)
+        assert torch.isfinite(pred_z).all()
+
     # ── gradient flow ─────────────────────────────────────────────────────
 
     def test_gradient_flows_through_both_branches(self):
-        """Gradients flow through class_embed, z_rfe, and ground anchor."""
+        """Gradients flow through class_embed, z_rfe, cross_gva, and film_mlp."""
         head = self._make_head()
         head.train()
         coord = torch.randn(30, 3, requires_grad=True)
@@ -615,8 +665,8 @@ class TestSingleBranchCNFHeadDualKNN:
         loss.backward()
         # class_embed should have gradients
         assert head.class_embed.weight.grad is not None
-        # z_rfe is buffer-based (no learnable params), but value_proj should
-        assert head.value_proj[0].weight.grad is not None
+        # Cross-GVA query projection should have gradients
+        assert head.cross_gva.linear_q[0].weight.grad is not None
 
     def test_residual_structure(self):
         """pred_z = z_anchor + residual, so pred_z != z_anchor in general."""
@@ -725,7 +775,7 @@ class TestIntegration:
 
         head = SingleBranchCNFHead(
             backbone_out_channels=24, k_neighbors=4,
-            hidden_dim=32, num_freqs=2, z_num_freqs=2,
+            hidden_dim=32, z_num_freqs=2,
             mlp_hidden_dims=[16], num_classes=5, class_embed_dim=8,
             ground_class=2,
         )
@@ -742,7 +792,7 @@ class TestIntegration:
 
         head = SingleBranchCNFHead(
             backbone_out_channels=16, k_neighbors=4,
-            hidden_dim=32, num_freqs=2, z_num_freqs=2,
+            hidden_dim=32, z_num_freqs=2,
             mlp_hidden_dims=[16], num_classes=5, class_embed_dim=8,
         )
         head.eval()
@@ -803,39 +853,38 @@ class TestVegetationSurfaceBug:
         return coord, feat, seg
 
     def test_z_anchor_elevated_without_segment(self):
-        """Bug: without segment, z_anchor is pulled to ~(ground+canopy)/2."""
+        """New robust fallback: even without segment, z_anchor is NOT elevated.
+
+        The new head uses the lowest 2–7 % percentile of z values as pseudo-ground
+        when segment is absent. In a 50/50 ground-vs-canopy cloud (z=0 / z=15),
+        the percentile window picks purely ground points, so z_anchor stays near 0.
+        """
         head = self.cls(
             backbone_out_channels=16, k_neighbors=8, hidden_dim=32,
-            num_freqs=2, z_num_freqs=2, mlp_hidden_dims=[16],
+            z_num_freqs=2, mlp_hidden_dims=[16],
             ground_class=2, num_classes=10, class_embed_dim=8,
         )
         head.eval()
         coord, feat, seg = self._make_terrain_with_canopy(
             N_ground=200, N_canopy=200, ground_z=0.0, canopy_z=15.0
         )
-        # Query points at ground level (x,y only)
-        query = torch.rand(20, 2) * 40 + 5  # interior of tile
+        query = torch.rand(20, 2) * 40 + 5
 
-        # Without segment: all points treated as ground
         with torch.no_grad():
-            head.training = False
             pred_no_seg = head(coord, feat, query, support_segment=None)
 
-        # The IDW anchor from ALL points (z∈[0,15]) will be elevated
-        # Since we return pred_z = z_anchor + residual, and z_anchor ≈ 7.5
-        # (between ground and canopy), the prediction is significantly positive
-        # (well above true ground_z ≈ 0)
+        # Robust fallback (lowest percentile) → z_anchor stays near ground (≈0)
         mean_pred = pred_no_seg.mean().item()
-        assert mean_pred > 3.0, (
-            f"Expected elevated prediction without segment (mean={mean_pred:.2f}), "
-            "bug may have been masked"
+        assert mean_pred < 5.0, (
+            f"Expected near-ground prediction with robust fallback (mean={mean_pred:.2f}), "
+            "fallback percentile logic may be broken"
         )
 
     def test_z_anchor_grounded_with_segment(self):
         """Fix: with correct segment, z_anchor anchors to ground level."""
         head = self.cls(
             backbone_out_channels=16, k_neighbors=8, hidden_dim=32,
-            num_freqs=2, z_num_freqs=2, mlp_hidden_dims=[16],
+            z_num_freqs=2, mlp_hidden_dims=[16],
             ground_class=2, num_classes=10, class_embed_dim=8,
         )
         head.eval()
@@ -856,10 +905,10 @@ class TestVegetationSurfaceBug:
         )
 
     def test_segment_fixes_vegetation_bias(self):
-        """Direct comparison: with segment, prediction closer to ground_z than without."""
+        """Both robust fallback and segment-guided anchor stay near ground."""
         head = self.cls(
             backbone_out_channels=16, k_neighbors=8, hidden_dim=32,
-            num_freqs=2, z_num_freqs=2, mlp_hidden_dims=[16],
+            z_num_freqs=2, mlp_hidden_dims=[16],
             ground_class=2, num_classes=10, class_embed_dim=8,
         )
         head.eval()
@@ -872,12 +921,14 @@ class TestVegetationSurfaceBug:
             pred_no_seg = head(coord, feat, query, support_segment=None)
             pred_with_seg = head(coord, feat, query, support_segment=seg)
 
-        # With segment: predictions should be significantly lower (closer to ground)
-        diff = pred_no_seg.mean() - pred_with_seg.mean()
-        assert diff > 2.0, (
-            f"Expected segment to lower pred by >2m vs no-segment. "
-            f"no_seg={pred_no_seg.mean():.2f}, with_seg={pred_with_seg.mean():.2f}, "
-            f"diff={diff:.2f}"
+        # Both approaches should produce near-ground predictions (< 5 m).
+        # The new no-segment fallback selects the lowest z percentile, just as
+        # the segment-guided path uses class-2 points; neither should reach canopy.
+        assert pred_with_seg.mean() < 5.0, (
+            f"Segment-guided prediction elevated: {pred_with_seg.mean():.2f}"
+        )
+        assert pred_no_seg.mean() < 5.0, (
+            f"Robust-fallback prediction elevated: {pred_no_seg.mean():.2f}"
         )
 
     # ── CnfTester segment merging logic ──────────────────────────────────
@@ -927,7 +978,7 @@ class TestVegetationSurfaceBug:
         """When all points are ground, z_anchor should track ground Z closely."""
         head = self.cls(
             backbone_out_channels=16, k_neighbors=8, hidden_dim=32,
-            num_freqs=2, z_num_freqs=2, mlp_hidden_dims=[16],
+            z_num_freqs=2, mlp_hidden_dims=[16],
             ground_class=2, num_classes=10, class_embed_dim=8,
         )
         head.train()

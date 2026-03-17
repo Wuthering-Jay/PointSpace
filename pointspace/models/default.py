@@ -575,7 +575,7 @@ class DefaultCNF(nn.Module):
 
     def __init__(self, backbone=None, head=None, criteria=None,
                  reg_weight=0.01, terrain_alpha=2.0, ohem_ratio=0.5,
-                 normal_weight=0.0, enable_normal_loss=True,
+                 normal_weight=0.0, enable_normal_loss=True, normal_ratio=0.5,
                  filter_non_ground=False, ground_class=2):
         super().__init__()
         self.backbone = build_model(backbone) if backbone is not None else None
@@ -586,6 +586,7 @@ class DefaultCNF(nn.Module):
         self.ohem_ratio = ohem_ratio
         self.normal_weight = normal_weight
         self.enable_normal_loss = enable_normal_loss
+        self.normal_ratio = normal_ratio
         self.filter_non_ground = filter_non_ground
         self.ground_class = ground_class
     # ------------------------------------------------------------------
@@ -769,35 +770,51 @@ class DefaultCNF(nn.Module):
             loss_z_final = 1.0 *loss_l1 + 0.5 * loss_l2 + 1.0 * loss_max_e
 
             # ==========================================================
-            # 🌟 5. 法向量约束 (Normal constraint via autograd)
+            # 🌟 5. 法向量约束 (Normal constraint via autograd) - 极速稀疏版
             # ==========================================================
             loss_normal = torch.tensor(0.0, device=pz.device)
-            if (self.enable_normal_loss
+            if (hasattr(self, 'enable_normal_loss') and self.enable_normal_loss
                     and self.normal_weight > 0
                     and query_coord is not None
                     and "query_normal_gt" in input_dict):
-                gt_normal = input_dict["query_normal_gt"]  # (Q, 3), L2-normalised
-                dz_dxy = torch.autograd.grad(
-                    outputs=pz,
+                
+                gt_normal = input_dict["query_normal_gt"]  # (Q, 3)
+                Q = pz.shape[0]
+
+                # 🌟 显存拯救者：仅抽取 15% 的点进行极其昂贵的二阶求导
+                num_samples = max(1, int(Q * self.normal_ratio))
+                rand_idx = torch.randperm(Q, device=pz.device)[:num_samples]
+
+                sampled_pz = pz[rand_idx]                 # (num_samples, 1)
+                sampled_gt_normal = gt_normal[rand_idx]   # (num_samples, 3)
+
+                # 计算梯度 (注意 inputs 依然是完整的 query_coord，因为它是叶子节点)
+                gradients = torch.autograd.grad(
+                    outputs=sampled_pz,
                     inputs=query_coord,
-                    grad_outputs=torch.ones_like(pz),
+                    grad_outputs=torch.ones_like(sampled_pz),
                     create_graph=True,
                     retain_graph=True,
-                )[0]  # (Q, 2)
+                    only_inputs=True
+                )[0]  # 返回形状依然是 (Q, 2)，但非采样点的梯度全是 0 且无计算图开销
+
+                # 仅提取抽样点的有效梯度
+                dz_dxy = gradients[rand_idx]  # (num_samples, 2)
+
                 # analytical surface normal: n = (-dz/dx, -dz/dy, 1)
                 analytical_normal = torch.stack(
                     [-dz_dxy[:, 0], -dz_dxy[:, 1], torch.ones_like(dz_dxy[:, 0])],
                     dim=-1,
-                )  # (Q, 3)
+                )  # (num_samples, 3)
+                
                 analytical_normal = F.normalize(analytical_normal, p=2, dim=-1)
-                cos_sim = F.cosine_similarity(analytical_normal, gt_normal, dim=-1)
-                raw_normal_loss = 1.0 - cos_sim  # (Q,)
-                # OHEM on normal loss
+                cos_sim = F.cosine_similarity(analytical_normal, sampled_gt_normal, dim=-1)
+                raw_normal_loss = 1.0 - cos_sim  # (num_samples,)
+
+                # OHEM on normal loss (在抽样后的点里再进行 OHEM)
                 num_keep_n = int(raw_normal_loss.shape[0] * self.ohem_ratio)
                 if num_keep_n > 0:
-                    loss_normal = torch.mean(
-                        torch.topk(raw_normal_loss, k=num_keep_n)[0]
-                    )
+                    loss_normal = torch.mean(torch.topk(raw_normal_loss, k=num_keep_n)[0])
                 else:
                     loss_normal = torch.mean(raw_normal_loss)
 

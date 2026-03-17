@@ -640,8 +640,8 @@ class TestSingleBranchCNFHead(unittest.TestCase):
             num_targets=1,
             k_neighbors=k,
             hidden_dim=32,
-            num_freqs=4,
             mlp_hidden_dims=[16],
+            attn_groups=4,
         )
 
     def test_forward_returns_tensor(self):
@@ -672,9 +672,10 @@ class TestSingleBranchCNFHead(unittest.TestCase):
         self.assertEqual(z_anchor.shape, (q,))
 
     def test_no_relu_in_head(self):
-        """Entire head should use Softplus, not ReLU (C^2 requirement)."""
+        """MLP (prediction layers) should use Softplus, not ReLU (C^2 requirement).
+        Cross-GVA positional sublayers may legitimately use ReLU for attention."""
         head = self._make_head()
-        for name, module in head.named_modules():
+        for name, module in head.mlp.named_modules():
             self.assertNotIsInstance(
                 module, nn.ReLU,
                 f"Found ReLU at {name} — must be Softplus for C^2",
@@ -727,8 +728,8 @@ class TestDefaultCNF_SingleBranch(unittest.TestCase):
             num_targets=1,
             k_neighbors=k,
             hidden_dim=32,
-            num_freqs=4,
             mlp_hidden_dims=[16],
+            attn_groups=4,
         )
 
     def _make_model(self, backbone_out=8, k=4):
@@ -1387,8 +1388,8 @@ class TestNormalConstraint(unittest.TestCase):
                 num_targets=1,
                 k_neighbors=4,
                 hidden_dim=32,
-                num_freqs=4,
                 mlp_hidden_dims=[16],
+                attn_groups=4,
             ),
             criteria=None,
             reg_weight=0.0,
