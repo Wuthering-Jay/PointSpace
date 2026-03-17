@@ -15,6 +15,7 @@ import math
 import einops
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch_cluster
 
 from pointspace.models.utils import offset2batch
@@ -382,6 +383,8 @@ class SingleBranchCNFHead(nn.Module):
         class_embed_dim: Dimensionality of class embedding.
         attn_groups: Number of attention head groups in Cross-GVA.
             Must divide hidden_dim.
+        predict_normals: If True, add a normal_mlp to predict surface normals.
+            Training returns (pred_z, z_anchor, pred_normal) instead of 2-tuple.
     """
 
     def __init__(
@@ -397,6 +400,7 @@ class SingleBranchCNFHead(nn.Module):
         num_classes=20,
         class_embed_dim=16,
         attn_groups=4,
+        predict_normals=False,
     ):
         super().__init__()
         if mlp_hidden_dims is None:
@@ -441,6 +445,21 @@ class SingleBranchCNFHead(nn.Module):
             d = h
         layers.append(nn.Linear(d, num_targets))
         self.mlp = nn.Sequential(*layers)
+
+        # Normal prediction head (optional)
+        self.predict_normals = predict_normals
+        if predict_normals:
+            self.normal_mlp = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim // 2),
+                nn.Softplus(beta=100),
+                nn.Linear(hidden_dim // 2, 3),
+            )
+            # Initialize for upward-facing default normal (0, 0, 1)
+            nn.init.normal_(self.normal_mlp[0].weight, std=0.01)
+            nn.init.zeros_(self.normal_mlp[0].bias)
+            nn.init.normal_(self.normal_mlp[2].weight, std=0.01)
+            nn.init.zeros_(self.normal_mlp[2].bias)
+            self.normal_mlp[2].bias.data[2] = 1.0
 
     # ------------------------------------------------------------------
     # KNN helper: sparse assign → dense (Q, K) index matrix
@@ -607,10 +626,18 @@ class SingleBranchCNFHead(nn.Module):
         residual = self.mlp(F_modulated)                      # (Q, num_targets)
         pred_z = local_z_anchor + residual                    # (Q, num_targets)
 
+        # Predict normals if enabled
+        pred_normal = None
+        if self.predict_normals:
+            raw_normal = self.normal_mlp(F_modulated)         # (Q, 3)
+            pred_normal = F.normalize(raw_normal, p=2, dim=-1)  # unit normal
+
         if self.num_targets == 1:
             pred_z = pred_z.squeeze(-1)
             local_z_anchor = local_z_anchor.squeeze(-1)
 
         if self.training:
-            return pred_z, local_z_anchor
+            if self.predict_normals:
+                return pred_z, local_z_anchor, pred_normal    # 3-tuple
+            return pred_z, local_z_anchor                     # 2-tuple
         return pred_z

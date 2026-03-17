@@ -668,6 +668,50 @@ class TestSingleBranchCNFHeadDualKNN:
         # Cross-GVA query projection should have gradients
         assert head.cross_gva.linear_q[0].weight.grad is not None
 
+    # ── normal prediction tests ───────────────────────────────────────────
+
+    def test_forward_train_with_normals_shape(self):
+        """With predict_normals=True, training returns 3-tuple."""
+        head = self._make_head(predict_normals=True)
+        head.train()
+        coord, feat, query, seg = self._make_inputs()
+        result = head(coord, feat, query, support_segment=seg)
+        assert isinstance(result, tuple) and len(result) == 3
+        pred_z, anchor, pred_normal = result
+        assert pred_z.shape == (20,)
+        assert anchor.shape == (20,)
+        assert pred_normal.shape == (20, 3)
+
+    def test_predicted_normals_are_unit_vectors(self):
+        """Predicted normals should be L2-normalized."""
+        head = self._make_head(predict_normals=True)
+        head.train()
+        coord, feat, query, seg = self._make_inputs()
+        _, _, pred_normal = head(coord, feat, query, support_segment=seg)
+        norms = pred_normal.norm(dim=-1)
+        assert torch.allclose(norms, torch.ones_like(norms), atol=1e-5)
+
+    def test_normal_mlp_exists_when_enabled(self):
+        """normal_mlp should exist only when predict_normals=True."""
+        head_with = self._make_head(predict_normals=True)
+        head_without = self._make_head(predict_normals=False)
+        assert hasattr(head_with, "normal_mlp")
+        assert not hasattr(head_without, "normal_mlp")
+
+    def test_gradient_flows_through_normal_mlp(self):
+        """Gradients should flow through normal_mlp."""
+        head = self._make_head(predict_normals=True)
+        head.train()
+        coord = torch.randn(30, 3, requires_grad=True)
+        feat = torch.randn(30, 24, requires_grad=True)
+        query = torch.randn(10, 2)
+        seg = torch.randint(0, 5, (30,))
+        seg[:15] = 2
+        pred_z, _, pred_normal = head(coord, feat, query, support_segment=seg)
+        loss = pred_normal.sum()
+        loss.backward()
+        assert head.normal_mlp[0].weight.grad is not None
+
     def test_residual_structure(self):
         """pred_z = z_anchor + residual, so pred_z != z_anchor in general."""
         head = self._make_head()

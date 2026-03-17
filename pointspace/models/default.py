@@ -688,20 +688,16 @@ class DefaultCNF(nn.Module):
     # ------------------------------------------------------------------
     # Loss
     # ------------------------------------------------------------------
-    def compute_loss(self, head_output, input_dict, query_coord=None):
+    def compute_loss(self, head_output, input_dict):
         """Compute loss for both single-branch and dual-branch heads.
 
         For single-branch heads (training), *head_output* is
-        ``(pred_z, local_z_anchor)``; the IDW anchor is used for
-        terrain-complexity adaptive weighting.
+        ``(pred_z, local_z_anchor)`` or ``(pred_z, local_z_anchor, pred_normal)``
+        when ``predict_normals=True``.
         For dual-branch heads, *head_output* is ``(pred_base, pred_detail)``.
 
         If ``self.criteria`` is set, delegates entirely to that module.
         Otherwise uses the appropriate built-in loss.
-
-        Args:
-            query_coord: Only needed in training when ``normal_weight > 0``
-                to compute analytical normals via autograd.
         """
         if self.criteria is not None:
             return self.criteria(head_output, input_dict)
@@ -709,10 +705,17 @@ class DefaultCNF(nn.Module):
         # ---- Single-branch loss with terrain-complexity weighting ----
         if isinstance(self.head, SingleBranchCNFHead):
             if isinstance(head_output, tuple):
-                pred_z, local_z_anchor = head_output
+                if len(head_output) == 3:
+                    # New 3-tuple: (pred_z, local_z_anchor, pred_normal)
+                    pred_z, local_z_anchor, pred_normal = head_output
+                else:
+                    # Legacy 2-tuple: (pred_z, local_z_anchor)
+                    pred_z, local_z_anchor = head_output
+                    pred_normal = None
             else:
                 pred_z = head_output
                 local_z_anchor = None
+                pred_normal = None
 
             query_gt = input_dict["query_gt"]
             if query_gt.dim() == 1:
@@ -769,34 +772,17 @@ class DefaultCNF(nn.Module):
             loss_z_final = 1.0 *loss_l1 + 0.5 * loss_l2 + 1.0 * loss_max_e
 
             # ==========================================================
-            # 🌟 5. 法向量约束 (Normal constraint) - 恢复全量密集计算
+            # 🌟 5. 法向量约束 (Normal constraint) - 使用直接预测替代autograd
             # ==========================================================
             loss_normal = torch.tensor(0.0, device=pz.device)
-            if (hasattr(self, 'enable_normal_loss') and self.enable_normal_loss
-                    and self.normal_weight > 0
-                    and query_coord is not None
+            if (self.normal_weight > 0
+                    and pred_normal is not None
                     and "query_normal_gt" in input_dict):
-                
+
                 gt_normal = input_dict["query_normal_gt"]  # (Q, 3)
 
-                # 必须全量计算！稀疏采样会破坏表面张力导致网络学出“微观褶皱”
-                gradients = torch.autograd.grad(
-                    outputs=pz,
-                    inputs=query_coord,
-                    grad_outputs=torch.ones_like(pz),
-                    create_graph=True,
-                    retain_graph=True,
-                    only_inputs=True
-                )[0]  # 返回形状: (Q, 2) 或 (Q, 3)
-
-                # 解析表面法向量: n = (-dz/dx, -dz/dy, 1)
-                analytical_normal = torch.stack(
-                    [-gradients[:, 0], -gradients[:, 1], torch.ones_like(gradients[:, 0])],
-                    dim=-1,
-                )  # (Q, 3)
-                
-                analytical_normal = F.normalize(analytical_normal, p=2, dim=-1)
-                cos_sim = F.cosine_similarity(analytical_normal, gt_normal, dim=-1)
+                # Direct cosine similarity between predicted and GT normals
+                cos_sim = F.cosine_similarity(pred_normal, gt_normal, dim=-1)
                 raw_normal_loss = 1.0 - cos_sim  # (Q,)
 
                 # OHEM on normal loss (挖掘法向量误差最大的区域进行重点惩罚)
@@ -871,17 +857,15 @@ class DefaultCNF(nn.Module):
 
         if self.training:
             query_coord = input_dict["query_coord"]
-            # Enable gradient tracking on query_coord for normal loss
-            if self.normal_weight > 0 and self.enable_normal_loss:
-                query_coord = query_coord.detach().requires_grad_(True)
+            # NOTE: No longer need requires_grad_(True) for normal loss
+            # Normals are now predicted directly by a dedicated head branch
             head_output = self.head(
                 support_coord, support_feat, query_coord,
                 support_offset=support_offset,
                 query_offset=input_dict.get("query_offset"),
                 support_segment=support_segment,
             )
-            return self.compute_loss(head_output, input_dict,
-                                     query_coord=query_coord)
+            return self.compute_loss(head_output, input_dict)
 
         # ---- Eval / Test ----
         if "query_coord" in input_dict:

@@ -126,6 +126,7 @@ model = dict(
         num_classes=16,
         class_embed_dim=16,
         attn_groups=4,
+        predict_normals=True,  # Enable direct normal prediction (replaces autograd)
     ),
     criteria=None,  # use built-in SmoothL1 loss
 )

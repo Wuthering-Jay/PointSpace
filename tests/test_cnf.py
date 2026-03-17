@@ -1376,7 +1376,7 @@ class TestRegistryCompleteness(unittest.TestCase):
 class TestNormalConstraint(unittest.TestCase):
     """Tests for normal vector constraint in DefaultCNF."""
 
-    def _make_model(self, normal_weight=0.1):
+    def _make_model(self, normal_weight=0.1, predict_normals=True):
         from pointspace.models.default import DefaultCNF
 
         model = DefaultCNF(
@@ -1390,6 +1390,7 @@ class TestNormalConstraint(unittest.TestCase):
                 hidden_dim=32,
                 mlp_hidden_dims=[16],
                 attn_groups=4,
+                predict_normals=predict_normals,
             ),
             criteria=None,
             reg_weight=0.0,
@@ -1471,6 +1472,15 @@ class TestNormalConstraint(unittest.TestCase):
             for p in model.parameters() if p.requires_grad
         )
         self.assertTrue(has_grad)
+
+    def test_predict_normals_false_backward_compat(self):
+        """With predict_normals=False, head returns 2-tuple, no normal loss."""
+        model = self._make_model(normal_weight=0.1, predict_normals=False)
+        model.train()
+        inp = self._make_input(with_normals=True)
+        out = model(inp)
+        self.assertIn("normal", out)
+        self.assertEqual(out["normal"].item(), 0.0)  # No normal predicted
 
 
 if __name__ == "__main__":
