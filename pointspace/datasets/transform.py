@@ -2215,7 +2215,7 @@ class GridCoordinate(object):
             data_dict["index_valid_keys"].append("grid_coord")
         return data_dict
     
-
+@TRANSFORMS.register_module()
 class NonGroundSmoother(object):
     """
     实时树冠平滑器：拦截输入点云，提取局部 DSM，进行高斯滤波，
@@ -2280,4 +2280,34 @@ class NonGroundSmoother(object):
         coord[non_ground_mask, 2] = smoothed_z[non_ground_mask]
 
         input_dict["coord"] = coord
+        return input_dict
+
+@TRANSFORMS.register_module()
+class ClassLabelClamp(object):
+    """
+    类别标签安全替换器：拦截异常的语义 ID。
+    将所有小于 0 或大于等于 num_classes 的野生 ID，统一替换为指定的 clamp_id。
+    """
+    def __init__(self, num_classes=32, clamp_id=0):
+        """
+        :param num_classes: 数据集中有效类别的总数（上限排他，即有效范围 0 到 num_classes-1）
+        :param clamp_id: 超出范围时赋予的默认 ID。建议使用 0 (通常代表 Unclassified) 
+                         或 num_classes - 1 (需确保该类专门留作"其他/噪点"类)
+        """
+        self.num_classes = num_classes
+        self.clamp_id = clamp_id
+
+    def __call__(self, input_dict):
+        if "segment" in input_dict and input_dict["segment"] is not None:
+            segment = input_dict["segment"]
+            
+            # 找到所有不合法的野生 ID 的掩码 (Mask)
+            invalid_mask = (segment < 0) | (segment >= self.num_classes)
+            
+            # 将它们统一替换为 clamp_id
+            if np.any(invalid_mask):
+                segment[invalid_mask] = self.clamp_id
+                
+            input_dict["segment"] = segment
+            
         return input_dict

@@ -847,8 +847,8 @@ class LASTileProcessor:
 if __name__ == "__main__":
     processor = LASTileProcessor(
         # 路径与格式配置
-        input_path=r"E:\data\DALES\dales_las\test",  # 原始数据路径
-        output_dir=r"E:\data\DALES\dales_las\tile\test1", # 输出路径
+        input_path=r"E:\data\云南遥感中心\第一批\val",  # 原始数据路径
+        output_dir=r"E:\data\云南遥感中心\第一批\tile\val", # 输出路径
         output_format='las',          # 输出格式
 
         # 分块参数
@@ -858,10 +858,10 @@ if __name__ == "__main__":
         min_points=5000,              # 最小点数
         max_points=None,              # 最大点数限制（None=不限制）
         save_orig_idx=True,           # 保存原始点索引
-        buffer_size=10,
+        buffer_size=0,
 
         # 法向量参数
-        calc_normals=False,           # 启用法向量计算
+        calc_normals=True,           # 启用法向量计算
         normal_on_source=True,        # 在原始点云计算法向量（推荐，避免边界效应）
         normal_k_neighbors=30,        # 法向量 K 近邻数
         normal_class=[2],              # 仅使用地面点计算法向量（如果 None 则使用全部点）

@@ -15,26 +15,26 @@
 # -------------------------------------------------------
 # 0. Path settings
 # -------------------------------------------------------
-train_data_dir = r"E:\data\云南遥感中心\第二批\disk03\tile\train"
-val_data_dir   = r"E:\data\云南遥感中心\第二批\disk03\tile\val"
+train_data_dir = r"E:\data\云南遥感中心\第一批\tile\train"
+val_data_dir   = r"E:\data\云南遥感中心\第一批\tile\val"
 test_data_dir  = r"E:\data\云南遥感中心\3.13稀疏点云_道尔补全点云\模拟点样例数据\模拟点样例数据\01原始数据\las\tile"
 pred_save_dir  = r"E:\data\云南遥感中心\3.13稀疏点云_道尔补全点云\模拟点样例数据\模拟点样例数据\01原始数据\las\pred_cnf"
-save_path = "exp/cnf/terrain-cnf-pt-v2m4-4-single"
+save_path = "exp/cnf/terrain-cnf-pt-v2m4-8-single"
 
 # -------------------------------------------------------
 # 1. General settings
 # -------------------------------------------------------
-grid_size = 1.0
+grid_size = 1.5
 ignore_index = -1
 dataset_type = "LasDataset"
 ground_class = 2
-feature_keys = ["coord"]
-in_channels = 3
+feature_keys = ["coord","echo"]
+in_channels = 5
 
 # -------------------------------------------------------
 # 2. Checkpoint / run control
 # -------------------------------------------------------
-weight = "exp/cnf/terrain-cnf-pt-v2m4-4-single/model/model_last.pth"
+weight = "exp/cnf/terrain-cnf-pt-v2m4-8-single/model/model_last.pth"
 resume = True
 evaluate = True
 test_only = False
@@ -52,7 +52,7 @@ gradient_accumulation_steps = 4
 # -------------------------------------------------------
 # 4. Training loop
 # -------------------------------------------------------
-epoch = 10
+epoch = 4
 clip_grad = None
 
 # -------------------------------------------------------
@@ -77,17 +77,17 @@ mix_prob = 0.0
 model = dict(
     type="DefaultCNF",
     reg_weight=0.0,       # no regularization for single branch
-    terrain_alpha=2.0,    # terrain complexity weighting: W = 1 + alpha * |gt - z_anchor|
+    terrain_alpha=0.0,    # terrain complexity weighting: W = 1 + alpha * |gt - z_anchor|
     ohem_ratio = 0.5,
     normal_weight=10.0,
-    enable_normal_loss=True,
+    enable_normal_loss=False,
     filter_non_ground=False,
     ground_class=ground_class,
     backbone=dict(
         type="PT-v2m5",
         in_channels=in_channels,
         use_cls_embed=True,       # LAS semantic class embedding
-        num_classes=32,           # max LAS classification code
+        num_classes=16,           # max LAS classification code
         cls_embed_dim=16,         # embedding dimension
         patch_embed_depth=1,
         patch_embed_channels=24,
@@ -116,14 +116,14 @@ model = dict(
     ),
     head=dict(
         type="SingleBranchCNFHead",
-        backbone_out_channels=64,
+        backbone_out_channels=24,
         query_dim=2,
         num_targets=1,
         k_neighbors=16,
-        hidden_dim=256,
+        hidden_dim=128,
         z_num_freqs=4,
         ground_class=2,
-        num_classes=32,
+        num_classes=16,
         class_embed_dim=16,
         attn_groups=4,
     ),
@@ -187,6 +187,8 @@ data = dict(
         weighted_sampler="terrain",
         transform=[
             dict(type="ZPercentileCenterShift", percentile=2.0),
+            dict(type="ClassLabelClamp", num_classes=16),
+            dict(type="NonGroundSmoother",grid_size=grid_size, sigma=2.0, ground_class=ground_class),
             dict(type="CategoryAwareDownsample", grid_size=grid_size, ground_class=ground_class),
             dict(type="RandomRotate", angle=[-1, 1], axis="z", center=[0, 0, 0], p=0.5),
             dict(type="RandomScale", scale=[0.9, 1.1]),
@@ -196,12 +198,12 @@ data = dict(
                 type="TerrainImplicitSampler",
                 random_ratio=0.1,
                 feature_ratio=0.1,
-                max_blocks=3,
+                max_blocks=6,
                 block_size_range=(5.0, 30.0),
                 feature_resolution=2.0,
-                max_query_ratio=0.9,          # 放开限制
-                extreme_hole_prob=0.3,        # 30% 概率触发极端大空洞
-                query_max=4096,
+                max_query_ratio=0.75,          # 放开限制
+                extreme_hole_prob=0.0,        # 30% 概率触发极端大空洞
+                query_max=None,
                 compute_gt_low=False,
                 ground_class=ground_class,
             ),
@@ -228,17 +230,19 @@ data = dict(
         loop=4,
         transform=[
             dict(type="ZPercentileCenterShift", percentile=2.0),
+            dict(type="ClassLabelClamp", num_classes=16),
+            dict(type="NonGroundSmoother",grid_size=grid_size, sigma=2.0, ground_class=ground_class),
             dict(type="CategoryAwareDownsample", grid_size=grid_size, ground_class=ground_class),
             dict(
                 type="TerrainImplicitSampler",
                 random_ratio=0.1,
                 feature_ratio=0.1,
-                max_blocks=3,
+                max_blocks=6,
                 block_size_range=(5.0, 30.0),
                 feature_resolution=2.0,
-                max_query_ratio=0.9,          # 放开限制
-                extreme_hole_prob=0.3,        # 30% 概率触发极端大空洞
-                query_max=4096,
+                max_query_ratio=0.75,          # 放开限制
+                extreme_hole_prob=0.0,        # 30% 概率触发极端大空洞
+                query_max=None,
                 compute_gt_low=False,
                 ground_class=ground_class,
             ),
@@ -264,6 +268,8 @@ data = dict(
         test_mode=True,
         transform=[
             dict(type="ZPercentileCenterShift", percentile=2.0),
+            dict(type="ClassLabelClamp", num_classes=16),
+            dict(type="NonGroundSmoother",grid_size=grid_size, sigma=2.0, ground_class=ground_class),
             dict(type="CategoryAwareDownsample", grid_size=grid_size, ground_class=ground_class),
         ],
         aug_transform=[
