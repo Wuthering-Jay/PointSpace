@@ -32,7 +32,7 @@ def default_argument_parser(epilog=None):
         epilog=epilog,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--config-file", default=r"configs\cnf\terrain-cnf-pt-v2m4-1-single.py", metavar="FILE", help="path to config file")
+    parser.add_argument("--config-file", default=r"configs\dales\semseg-deeplanet-v2-0.py", metavar="FILE", help="path to config file")
     parser.add_argument("--num-gpus", type=int, default=1, help="number of gpus *per machine*")
     parser.add_argument("--num-machines", type=int, default=1, help="total number of machines")
     parser.add_argument("--machine-rank", type=int, default=0, help="the rank of this machine (unique per machine)",)
