@@ -558,8 +558,8 @@ class SingleBranchCNFHead(nn.Module):
         dist_sq_g = torch.sum(relative_xy_g ** 2, dim=-1)             # (Q, K_g)
 
         # Learnable Gaussian (RBF) kernel weights
-        weights_g = torch.exp(-dist_sq_g / (2 * self.sigma ** 2 + 1e-6))
-        weights_g = weights_g / (weights_g.sum(dim=-1, keepdim=True) + 1e-6)
+        logits_g = -dist_sq_g / (2 * self.sigma ** 2 + 1e-6)
+        weights_g = torch.nn.functional.softmax(logits_g, dim=-1) # [Q, K_g]
 
         local_feat_anchor = torch.bmm(weights_g.unsqueeze(1), grouped_feats_g).squeeze(1)
         local_z_anchor = torch.bmm(weights_g.unsqueeze(1), grouped_coords_g[:, :, 2:3]).squeeze(1) # (Q, 1)

@@ -725,7 +725,8 @@ class DefaultCNF(nn.Module):
             # ==========================================================
             # 🌟 1. 基础 MAE 保底 (保细节、保锐利)
             # ==========================================================
-            l1_error = torch.abs(pz - query_gt)
+            # l1_error = torch.abs(pz - query_gt)
+            l1_error = torch.nn.functional.smooth_l1_loss(pz, query_gt, reduction='none', beta=1.0)
             
             # 结合您的地形复杂度加权 (如果有)
             if local_z_anchor is not None:
@@ -748,7 +749,8 @@ class DefaultCNF(nn.Module):
             # 🌟 2. 专杀 RMSE：辅助 MSE Loss
             # 用 L2 的平方特性去压制大误差，但不给太大权重，防止把地形抹平
             # ==========================================================
-            l2_error = (pz - query_gt) ** 2
+            # l2_error = (pz - query_gt) ** 2
+            l2_error = F.mse_loss(pz, query_gt, reduction='none')
             # 为了防止平地的 0.1 米误差也被 L2 过度关注，我们只对 OHEM 选出的 25% 难点施加 L2
             if num_keep_25 > 0:
                 loss_l2 = torch.mean(torch.topk(l2_error.view(-1), k=num_keep_25)[0])

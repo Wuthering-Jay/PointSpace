@@ -16,10 +16,10 @@
 # 0. Path settings
 # -------------------------------------------------------
 train_data_dir = r"E:\data\云南遥感中心\第一批\tile\train"
-val_data_dir   = r"E:\data\云南遥感中心\第一批\tile\val"
+val_data_dir   = r"E:\data\云南遥感中心\第一批\tile\test"
 test_data_dir  = r"E:\data\云南遥感中心\3.13稀疏点云_道尔补全点云\模拟点样例数据\模拟点样例数据\01原始数据\las\tile"
 pred_save_dir  = r"E:\data\云南遥感中心\3.13稀疏点云_道尔补全点云\模拟点样例数据\模拟点样例数据\01原始数据\las\pred_cnf"
-save_path = "exp/cnf/terrain-cnf-pt-v2m4-8-single"
+save_path = "exp/cnf/terrain-cnf-pt-v2m4-9-single"
 
 # -------------------------------------------------------
 # 1. General settings
@@ -34,7 +34,7 @@ in_channels = 5
 # -------------------------------------------------------
 # 2. Checkpoint / run control
 # -------------------------------------------------------
-weight = "exp/cnf/terrain-cnf-pt-v2m4-8-single/model/model_last.pth"
+weight = "exp/cnf/terrain-cnf-pt-v2m4-9-single/model/model_last.pth"
 resume = True
 evaluate = True
 test_only = False
@@ -52,8 +52,8 @@ gradient_accumulation_steps = 4
 # -------------------------------------------------------
 # 4. Training loop
 # -------------------------------------------------------
-epoch = 4
-clip_grad = None
+epoch = 20
+clip_grad = 5.0
 
 # -------------------------------------------------------
 # 5. Precision & performance
@@ -80,7 +80,7 @@ model = dict(
     terrain_alpha=0.0,    # terrain complexity weighting: W = 1 + alpha * |gt - z_anchor|
     ohem_ratio = 0.5,
     normal_weight=10.0,
-    enable_normal_loss=False,
+    enable_normal_loss=True,
     filter_non_ground=False,
     ground_class=ground_class,
     backbone=dict(
@@ -102,9 +102,9 @@ model = dict(
         dec_groups=(4, 6, 12),
         dec_neighbours=(24, 24, 24),
         grid_sizes=(
-            3 * grid_size,
-            7.5 * grid_size,
-            18.75 * grid_size,
+            2 * grid_size,
+            5 * grid_size,
+            12.5 * grid_size,
         ),
         attn_qkv_bias=True,
         pe_multiplier=False,
@@ -112,7 +112,7 @@ model = dict(
         attn_drop_rate=0.0,
         drop_path_rate=0.3,
         enable_checkpoint=False,
-        unpool_backend="interp",
+        unpool_backend="map",
     ),
     head=dict(
         type="SingleBranchCNFHead",
@@ -184,7 +184,7 @@ data = dict(
         split="train",
         data_path=train_data_dir,
         test_mode=False,
-        loop=4,
+        loop=1,
         weighted_sampler="terrain",
         transform=[
             dict(type="ZPercentileCenterShift", percentile=2.0),
@@ -228,7 +228,7 @@ data = dict(
         split="val",
         data_path=val_data_dir,
         test_mode=False,
-        loop=4,
+        loop=1,
         transform=[
             dict(type="ZPercentileCenterShift", percentile=2.0),
             dict(type="ClassLabelClamp", num_classes=16),
