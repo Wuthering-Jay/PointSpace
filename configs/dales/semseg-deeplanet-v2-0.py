@@ -5,7 +5,7 @@ train_data_dir = r"E:\data\DALES\dales_las\tile\train"
 val_data_dir = r"E:\data\DALES\dales_las\tile\test"
 test_data_dir = r"E:\data\DALES\dales_las\tile\test"
 pred_save_dir = r"E:\data\DALES\dales_las\tile\pred"
-save_path = "exp/dales/semseg-deeplanet-v2-0"
+save_path = "exp/dales/semseg-deeplanet-v2-1"
 
 # -------------------------------------------------------
 # 1. General settings
@@ -31,8 +31,8 @@ in_channels = 5
 # -------------------------------------------------------
 # 2. Checkpoint / run control
 # -------------------------------------------------------
-weight = "exp/dales/semseg-deeplanet-v2-0/model/model_last.pth"   # path to pretrained / fine-tune weight
-# weight = None
+# weight = "exp/dales/semseg-deeplanet-v2-1/model/model_last.pth"   # path to pretrained / fine-tune weight
+weight = None
 resume = True      # resume from the latest checkpoint
 evaluate = True     # run evaluation after each training epoch
 test_only = False   # skip training, run test only
@@ -41,7 +41,7 @@ seed = 42           # fixed seed (None = auto-random, value is logged)
 # -------------------------------------------------------
 # 3. Resource & batch settings
 # -------------------------------------------------------
-batch_size_train = 8       # effective batch = micro_batch × gradient_accumulation_steps
+batch_size_train = 6       # effective batch = micro_batch × gradient_accumulation_steps
                            #   micro_batch = batch_size_train // gradient_accumulation_steps
 batch_size_val = 2         # None → auto 1 per GPU (no gradient → less memory than train)
 batch_size_test = 2        # None → auto 1 per GPU; >1 = fragments per forward in SemSegTester
@@ -74,7 +74,7 @@ mix_prob = 0.0      # MixUp / CutMix probability
 # 7. Model
 # -------------------------------------------------------
 model = dict(
-    type="DefaultSegmentorV2",
+    type="DeepLASegmentor",
     num_classes=num_classes,
     backbone_out_channels=64,
     backbone=dict(
@@ -83,10 +83,10 @@ model = dict(
         patch_embed_depth=1,
         patch_embed_channels=32,
         patch_embed_neighbours=16,
-        enc_depths=(4, 4, 12, 4),
+        enc_depths=(20, 20, 60, 20),
         enc_channels=(64, 128, 256, 512),
         enc_neighbours=(16, 16, 16, 16),
-        dec_depths=(1, 1, 1, 1),
+        dec_depths=(4, 4, 12, 4),
         dec_channels=(64, 128, 256, 512),
         dec_neighbours=(16, 16, 16, 16),
         grid_sizes=(
@@ -98,11 +98,25 @@ model = dict(
         drop_path_rate=0.2,
         enable_checkpoint=False,
         unpool_backend="interp",
+        # 深层网络稳定性优化
+        enable_deep_supervision=True,   # 启用 HDS (混合深监督)
+        enable_layer_scale=True,        # 启用 LayerScale
+        layer_scale_init_value=1e-5,    # LayerScale 初始值
     ),
     criteria=[
         dict(type="CrossEntropyLoss", loss_weight=1.0, ignore_index=-1, auto_class_weight=True),
         dict(type="LovaszLoss", mode="multiclass", loss_weight=1.0, ignore_index=-1),
     ],
+    # 辅助损失配置 (Hybrid Deep Supervision)
+    # loss_weight=0.4 相当于原来的 hds_alpha
+    aux_criteria=[
+        dict(type="CrossEntropyLoss", loss_weight=0.4, ignore_index=-1, auto_class_weight=True),
+    ],
+    # 辅助头通道数，需与 enc_channels 对应
+    aux_channels=(64, 128, 256, 512),
+    aux_dropout=0.1,
+    # 各 stage 的辅助损失权重比例 (越深的层权重越大)
+    aux_weights=(0.1, 0.2, 0.3, 0.4),
 )
 
 # -------------------------------------------------------

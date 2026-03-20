@@ -317,12 +317,15 @@ class Block(nn.Module):
     网络模块单位，结合LFA和BottleNeck对pxo进行处理
     使用 LocalFeatureAggregation 替代 GroupedVectorAttention
     基于 Stage-Level Position Embedding 优化
+    深层网络优化: 零初始化 + LayerScale 提升训练稳定性
 
     Args:
         embed_channels: 输入输出维度
         num_neighbors: 邻域点数量
         drop_path_rate: BottleNeck的drop比例
         enable_checkpoint: checkpoint机制，以时间换空间
+        enable_layer_scale: 是否启用 LayerScale (深层网络建议开启)
+        layer_scale_init_value: LayerScale 初始值 (默认 1e-5，120层建议 1e-6)
     """
 
     def __init__(
@@ -331,6 +334,8 @@ class Block(nn.Module):
         num_neighbors=16,
         drop_path_rate=0.0,
         enable_checkpoint=False,
+        enable_layer_scale=False,
+        layer_scale_init_value=1e-5,
     ):
         super(Block, self).__init__()
 
@@ -349,9 +354,21 @@ class Block(nn.Module):
         self.norm3 = PointBatchNorm(embed_channels)
         self.act = nn.ReLU(inplace=True)
         self.enable_checkpoint = enable_checkpoint
+        self.enable_layer_scale = enable_layer_scale
         self.drop_path = (
             DropPath(drop_path_rate) if drop_path_rate > 0.0 else nn.Identity()
         )
+
+        # 【深层网络优化 1】零初始化: 强制残差分支初始化输出为 0
+        # 让网络初始时接近恒等映射，训练更稳定
+        nn.init.constant_(self.norm3.norm.weight, 0.0)
+
+        # 【深层网络优化 2】LayerScale: 可学习的极小缩放因子
+        # 在残差相加前乘以 gamma，压制深层残差幅度
+        if self.enable_layer_scale:
+            self.gamma = nn.Parameter(
+                layer_scale_init_value * torch.ones(embed_channels)
+            )
 
     def forward(self, points, pe, reference_index):
         """
@@ -376,7 +393,12 @@ class Block(nn.Module):
 
         feat = self.act(self.norm2(feat))  # [n, c]
         feat = self.norm3(self.fc3(feat))  # [n, c]
-        feat = identity + self.drop_path(feat)  # [n, c], bottleneck设计
+
+        # 残差连接: 应用 LayerScale (如果启用)
+        if self.enable_layer_scale:
+            feat = identity + self.drop_path(feat * self.gamma)  # [n, c], bottleneck设计
+        else:
+            feat = identity + self.drop_path(feat)  # [n, c], bottleneck设计
         feat = self.act(feat)  # [n, c]
         return [coord, feat, offset]  # [[n,3],[n,c],[b]]
 
@@ -389,12 +411,18 @@ class BlockSequence(nn.Module):
     2. 通过 StagePositionalEncoding 一次性映射为高维 PE [n, k, d]
     3. 所有 Block 共享高维 PE，避免每层重复计算 MLP
 
+    深层网络优化 (零初始化 + LayerScale):
+      - 所有残差块初始输出为 0 (零初始化)
+      - LayerScale 可学习地缩放残差幅度 (可选)
+
     Args:
         depth: Block数量
         embed_channels: 特征维度
         neighbours: 邻域点数量
         drop_path_rate: BottleNeck的drop比例
         enable_checkpoint: checkpoint机制
+        enable_layer_scale: 是否启用 LayerScale (深层网络建议开启)
+        layer_scale_init_value: LayerScale 初始值 (默认 1e-5，120层建议 1e-6)
     """
 
     def __init__(
@@ -404,6 +432,8 @@ class BlockSequence(nn.Module):
         neighbours=16,
         drop_path_rate=0.0,
         enable_checkpoint=False,
+        enable_layer_scale=False,
+        layer_scale_init_value=1e-5,
     ):
         super(BlockSequence, self).__init__()
 
@@ -435,6 +465,8 @@ class BlockSequence(nn.Module):
                 num_neighbors=neighbours,
                 drop_path_rate=drop_path_rates[i],
                 enable_checkpoint=enable_checkpoint,
+                enable_layer_scale=enable_layer_scale,
+                layer_scale_init_value=layer_scale_init_value,
             )
             self.blocks.append(block)
 
@@ -609,6 +641,8 @@ class Encoder(nn.Module):
         neighbours: 邻域大小
         drop_path_rate: BottleNeck的drop比例
         enable_checkpoint: checkpoint机制
+        enable_layer_scale: 是否启用 LayerScale
+        layer_scale_init_value: LayerScale 初始值
     """
 
     def __init__(
@@ -620,6 +654,8 @@ class Encoder(nn.Module):
         neighbours=16,
         drop_path_rate=None,
         enable_checkpoint=False,
+        enable_layer_scale=False,
+        layer_scale_init_value=1e-5,
     ):
         super(Encoder, self).__init__()
 
@@ -635,6 +671,8 @@ class Encoder(nn.Module):
             neighbours=neighbours,
             drop_path_rate=drop_path_rate if drop_path_rate is not None else 0.0,
             enable_checkpoint=enable_checkpoint,
+            enable_layer_scale=enable_layer_scale,
+            layer_scale_init_value=layer_scale_init_value,
         )
 
     def forward(self, points):
@@ -663,6 +701,8 @@ class Decoder(nn.Module):
         drop_path_rate: BottleNeck的drop比例
         enable_checkpoint: checkpoint机制
         unpool_backend: 上采样方式
+        enable_layer_scale: 是否启用 LayerScale
+        layer_scale_init_value: LayerScale 初始值
     """
 
     def __init__(
@@ -675,6 +715,8 @@ class Decoder(nn.Module):
         drop_path_rate=None,
         enable_checkpoint=False,
         unpool_backend="map",
+        enable_layer_scale=False,
+        layer_scale_init_value=1e-5,
     ):
         super(Decoder, self).__init__()
 
@@ -691,6 +733,8 @@ class Decoder(nn.Module):
             neighbours=neighbours,
             drop_path_rate=drop_path_rate if drop_path_rate is not None else 0.0,
             enable_checkpoint=enable_checkpoint,
+            enable_layer_scale=enable_layer_scale,
+            layer_scale_init_value=layer_scale_init_value,
         )
 
     def forward(self, points, skip_points, cluster):
@@ -715,6 +759,7 @@ class LFAPatchEmbed(nn.Module):
     核心优化:
     - 使用 StagePositionalEncoding 在 PatchEmbed 阶段一次性计算高维 PE
     - lfa_embed 直接使用高维 PE [n, k, d]，不再内部计算 MLP
+    - 深层网络优化: 零初始化 + LayerScale
 
     Args:
         depth: 编码器深度
@@ -723,6 +768,8 @@ class LFAPatchEmbed(nn.Module):
         neighbours: 邻域大小
         drop_path_rate: BottleNeck的drop比例
         enable_checkpoint: checkpoint机制
+        enable_layer_scale: 是否启用 LayerScale
+        layer_scale_init_value: LayerScale 初始值
     """
 
     def __init__(
@@ -733,6 +780,8 @@ class LFAPatchEmbed(nn.Module):
         neighbours=16,
         drop_path_rate=0.0,
         enable_checkpoint=False,
+        enable_layer_scale=False,
+        layer_scale_init_value=1e-5,
     ):
         super(LFAPatchEmbed, self).__init__()
         self.in_channels = in_channels
@@ -763,6 +812,8 @@ class LFAPatchEmbed(nn.Module):
             neighbours=neighbours,
             drop_path_rate=drop_path_rate,
             enable_checkpoint=enable_checkpoint,
+            enable_layer_scale=enable_layer_scale,
+            layer_scale_init_value=layer_scale_init_value,
         )
 
     def forward(self, points):
@@ -800,10 +851,13 @@ class DeepLANetV1(PointModule):
     DeepLANet V1 Backbone
 
     使用 LocalFeatureAggregation 替代 GroupedVectorAttention 的点云处理backbone
+    深层网络优化: 零初始化 + LayerScale 提升训练稳定性
+    混合深监督: 返回中间特征用于辅助损失计算
 
     作为纯 backbone 使用，不包含 seg_head。
     输入: data_dict (dict) 或 Point 对象，需包含 coord, feat, offset。
     输出: Point 对象，feat 为解码器最终输出特征，维度 dec_channels[0]。
+           如果启用深监督，Point 对象额外包含 aux_outputs 字段存储中间特征。
 
     Args:
         in_channels: 输入特征维度
@@ -820,6 +874,9 @@ class DeepLANetV1(PointModule):
         drop_path_rate: BottleNeck的drop比例
         enable_checkpoint: checkpoint机制
         unpool_backend: 上采样方式
+        enable_layer_scale: 是否启用 LayerScale (深层网络建议开启)
+        layer_scale_init_value: LayerScale 初始值 (默认 1e-5，120层建议 1e-6)
+        enable_deep_supervision: 是否启用混合深监督 (返回中间特征用于辅助损失)
     """
 
     def __init__(
@@ -838,10 +895,14 @@ class DeepLANetV1(PointModule):
         drop_path_rate=0,
         enable_checkpoint=False,
         unpool_backend="map",
+        enable_layer_scale=False,
+        layer_scale_init_value=1e-5,
+        enable_deep_supervision=False,
     ):
         super(DeepLANetV1, self).__init__()
         self.in_channels = in_channels
         self.num_stages = len(enc_depths)
+        self.enable_deep_supervision = enable_deep_supervision
 
         assert self.num_stages == len(dec_depths)
         assert self.num_stages == len(enc_channels)
@@ -857,6 +918,8 @@ class DeepLANetV1(PointModule):
             depth=patch_embed_depth,
             neighbours=patch_embed_neighbours,
             enable_checkpoint=enable_checkpoint,
+            enable_layer_scale=enable_layer_scale,
+            layer_scale_init_value=layer_scale_init_value,
         )
 
         # drop率逐渐提高
@@ -886,6 +949,8 @@ class DeepLANetV1(PointModule):
                     sum(enc_depths[:i]): sum(enc_depths[:i + 1])
                 ],
                 enable_checkpoint=enable_checkpoint,
+                enable_layer_scale=enable_layer_scale,
+                layer_scale_init_value=layer_scale_init_value,
             )
             dec = Decoder(
                 depth=dec_depths[i],
@@ -898,6 +963,8 @@ class DeepLANetV1(PointModule):
                 ],
                 enable_checkpoint=enable_checkpoint,
                 unpool_backend=unpool_backend,
+                enable_layer_scale=enable_layer_scale,
+                layer_scale_init_value=layer_scale_init_value,
             )
             self.enc_stages.append(enc)
             self.dec_stages.append(dec)
@@ -909,6 +976,7 @@ class DeepLANetV1(PointModule):
 
         Returns:
             Point 对象, feat 为解码器最终输出特征 [n, dec_channels[0]]
+            如果启用深监督，Point.aux_outputs 包含中间特征列表用于辅助损失计算
         """
         # 兼容 dict 和 Point 两种输入
         if not isinstance(data_dict, Point):
@@ -923,11 +991,18 @@ class DeepLANetV1(PointModule):
         points = [coord, feat, offset]
         points = self.patch_embed(points)
 
+        # 用于深监督的中间特征
+        aux_outputs = []
+
         skips = [[points]]
         for i in range(self.num_stages):
             points, cluster = self.enc_stages[i](points)
             skips[-1].append(cluster)
             skips.append([points])
+
+            # 如果启用深监督，保存每个 encoder stage 的输出
+            if self.enable_deep_supervision:
+                aux_outputs.append(points)
 
         points = skips.pop(-1)[0]
         for i in reversed(range(self.num_stages)):
@@ -937,4 +1012,9 @@ class DeepLANetV1(PointModule):
         coord, feat, offset = points
 
         point.feat = feat
+
+        # 如果启用深监督，将中间特征附加到 Point 对象
+        if self.enable_deep_supervision:
+            point.aux_outputs = aux_outputs
+
         return point

@@ -399,6 +399,15 @@ class Trainer(TrainerBase):
                 f"(len={len(class_weight)}) into criteria"
             )
 
+        # Also inject into aux_criteria if it exists (for DeepLASegmentor HDS)
+        aux_criteria = getattr(model, "aux_criteria", None)
+        if aux_criteria is not None and hasattr(aux_criteria, "set_class_weight"):
+            aux_criteria.set_class_weight(class_weight)
+            self.logger.info(
+                f"Injected dataset class_weight "
+                f"(len={len(class_weight)}) into aux_criteria"
+            )
+
     def build_val_loader(self):
         val_loader = None
         if self.cfg.evaluate:
