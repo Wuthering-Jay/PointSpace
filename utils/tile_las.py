@@ -750,7 +750,13 @@ class LASTileProcessor:
             
             # 复制已有的 extra dimensions
             for extra_dim in src_header.point_format.extra_dimensions:
-                header.add_extra_dim(extra_dim)
+                header.add_extra_dim(laspy.ExtraBytesParams(
+                    name=extra_dim.name,
+                    type=extra_dim.dtype,
+                    description=extra_dim.description,
+                    offsets=extra_dim.offsets,
+                    scales=extra_dim.scales
+                ))
             
             # 添加 orig_idx 字段
             existing_names = [ed.name for ed in header.point_format.extra_dimensions]
@@ -847,12 +853,12 @@ class LASTileProcessor:
 if __name__ == "__main__":
     processor = LASTileProcessor(
         # 路径与格式配置
-        input_path=r"E:\data\云南遥感中心\第一批\val",  # 原始数据路径
-        output_dir=r"E:\data\云南遥感中心\第一批\tile\val", # 输出路径
+        input_path=r"E:\data\LASDU\train_sparse",  # 原始数据路径
+        output_dir=r"E:\data\LASDU\tile\train_sparse", # 输出路径
         output_format='las',          # 输出格式
 
         # 分块参数
-        window_size=(200.0, 200.0),   # 分块大小
+        window_size=(100.0, 100.0),   # 分块大小
         overlap=True,                 # 启用重叠
         overlap_factor=1,             # 重叠因子
         min_points=5000,              # 最小点数
@@ -861,7 +867,7 @@ if __name__ == "__main__":
         buffer_size=0,
 
         # 法向量参数
-        calc_normals=True,           # 启用法向量计算
+        calc_normals=False,           # 启用法向量计算
         normal_on_source=True,        # 在原始点云计算法向量（推荐，避免边界效应）
         normal_k_neighbors=30,        # 法向量 K 近邻数
         normal_class=[2],              # 仅使用地面点计算法向量（如果 None 则使用全部点）

@@ -32,7 +32,7 @@ def default_argument_parser(epilog=None):
         epilog=epilog,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--config-file", default=r"configs\dales\semseg-deeplanet-v2-0.py", metavar="FILE", help="path to config file")
+    parser.add_argument("--config-file", default=r"configs\lasdu\semseg-deeplanet-v2-0.py", metavar="FILE", help="path to config file")
     parser.add_argument("--num-gpus", type=int, default=1, help="number of gpus *per machine*")
     parser.add_argument("--num-machines", type=int, default=1, help="total number of machines")
     parser.add_argument("--machine-rank", type=int, default=0, help="the rank of this machine (unique per machine)",)
@@ -48,12 +48,6 @@ def main_worker(cfg):
     cfg = default_setup(cfg)
     trainer = TRAINERS.build(dict(type=cfg.train.type, cfg=cfg))
     trainer.train()
-    # After training, run the test phase if a test config is present
-    # and test_only is not set (test_only would have skipped training entirely).
-    if hasattr(cfg, "test") and cfg.test is not None and not getattr(cfg, "test_only", False):
-        test_cfg = dict(cfg=cfg, **cfg.test)
-        tester = TESTERS.build(test_cfg)
-        tester.test()
 
 
 def main():
