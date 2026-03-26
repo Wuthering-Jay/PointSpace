@@ -31,3 +31,6 @@ from .masked_scene_contrast import *
 from .point_prompt_training import *
 from .sonata import *
 from .concerto import *
+
+# EZ-SP (GPU-accelerated superpoint segmentation)
+from .ezsp import *
