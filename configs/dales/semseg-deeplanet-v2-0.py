@@ -5,7 +5,7 @@ train_data_dir = r"E:\data\DALES\dales_las\tile\train"
 val_data_dir = r"E:\data\DALES\dales_las\tile\test"
 test_data_dir = r"E:\data\DALES\dales_las\tile\test"
 pred_save_dir = r"E:\data\DALES\dales_las\tile\pred"
-save_path = "exp/dales/semseg-deeplanet-v2-1"
+save_path = "exp/dales/semseg-deeplanet-v2-superpoint"
 
 # -------------------------------------------------------
 # 1. General settings
@@ -83,10 +83,10 @@ model = dict(
         patch_embed_depth=1,
         patch_embed_channels=32,
         patch_embed_neighbours=16,
-        enc_depths=(20, 20, 60, 20),
+        enc_depths=(10, 10, 30, 10),
         enc_channels=(64, 128, 256, 512),
         enc_neighbours=(16, 16, 16, 16),
-        dec_depths=(4, 4, 12, 4),
+        dec_depths=(1, 1, 1, 1),
         dec_channels=(64, 128, 256, 512),
         dec_neighbours=(16, 16, 16, 16),
         grid_sizes=(
@@ -117,6 +117,20 @@ model = dict(
     aux_dropout=0.1,
     # 各 stage 的辅助损失权重比例 (越深的层权重越大)
     aux_weights=(0.1, 0.2, 0.3, 0.4),
+    # 超点一致性损失配置 (仅训练时生效，需要数据中包含 superpoint 字段)
+    # conflict_margin: 冲突容忍阈值，越小越保守 (0.05~0.2)
+    # loss_weight: 损失权重
+    # train_only: 仅在训练时生效
+    # warmup_epochs: 预热轮数，前 N 个 epoch 不启用此损失，让网络先稳定
+    sp_criteria=[
+        dict(
+            type="SuperpointConsistencyLoss",
+            conflict_margin=0.2,
+            loss_weight=1.0,
+            train_only=True,
+            warmup_epochs=0,  # 前 3 个 epoch 不启用
+        ),
+    ],
 )
 
 # -------------------------------------------------------
@@ -134,6 +148,7 @@ param_dicts = None # example: [dict(keyword="block", lr_scale=0.1)]
 # -------------------------------------------------------
 hooks = [
     dict(type="CheckpointLoader"),
+    dict(type="RuntimeInfoHook"),  # 维护全局 epoch/step 状态，供 SuperpointConsistencyLoss 读取
     dict(type="ModelHook"),
     dict(type="IterationTimer", warmup_iter=2),
     dict(type="InformationWriter", interval=10),
@@ -188,7 +203,8 @@ data = dict(
             dict(type="ToTensor"),
             dict(
                 type="Collect",
-                keys=["coord", "segment"],  # 只需要coord和segment
+                keys=["coord", "segment", "superpoint"],  # superpoint用于一致性损失
+                optional_keys=["superpoint"],  # superpoint字段可选，如果不存在不报错
                 feat_keys=feature_keys,
             ),
         ],
@@ -222,7 +238,8 @@ data = dict(
             dict(type="ToTensor"),
             dict(
                 type="Collect",
-                keys=["coord", "segment"],  # 只需要coord和segment
+                keys=["coord", "segment", "superpoint"],  # superpoint用于一致性损失
+                optional_keys=["superpoint"],  # superpoint字段可选，如果不存在不报错
                 feat_keys=feature_keys,
             ),
         ],

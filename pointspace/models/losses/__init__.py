@@ -12,3 +12,4 @@ from .misc import (
     HuberLoss,
 )
 from .lovasz import LovaszLoss
+from .superpoint import SuperpointConsistencyLoss

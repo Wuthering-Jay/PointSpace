@@ -1,37 +1,34 @@
 # -------------------------------------------------------
 # 0. Path settings
 # -------------------------------------------------------
-train_data_dir = r"E:\data\DALES\dales_las\tile\train"
-val_data_dir = r"E:\data\DALES\dales_las\tile\test"
-test_data_dir = r"E:\data\DALES\dales_las\tile\test"
-pred_save_dir = r"E:\data\DALES\dales_las\tile\pred"
-save_path = "exp/dales/semseg-pt-v2m4-2-superpoint"
+train_data_dir = r"E:\data\LASDU\tile\train_noisy"
+val_data_dir = r"E:\data\LASDU\tile\test"
+test_data_dir = r"E:\data\LASDU\tile\test"
+pred_save_dir = r"E:\data\LASDU\tile\pred_lnl"
+save_path = "exp/lasdu/semseg-deeplanet-v2-lnl"
 
 # -------------------------------------------------------
 # 1. General settings
 # -------------------------------------------------------
-num_classes = 8
+num_classes = 5
 grid_size = 0.5
 ignore_index = -1
 dataset_type = "LasDataset"
-required_classes = [1, 2, 3, 4, 5, 6, 7, 8]
+required_classes = [0, 1, 2, 3, 4]
 class_names = [
     "ground",
-    "vegetation",
-    "cars",
-    "trucks",
-    "power lines",
-    "fences",
-    "poles",
     "buildings",
+    "trees",
+    "low vegetation",
+    "artifacts",
 ]
-feature_keys = ["coord", "echo"]
-in_channels = 5
+feature_keys = ["coord", "echo", "intensity"]
+in_channels = 6
 
 # -------------------------------------------------------
 # 2. Checkpoint / run control
 # -------------------------------------------------------
-# weight = "exp/dales/semseg-pt-v2m4-2-base/model/model_last.pth"   # path to pretrained / fine-tune weight
+# weight = "exp/lasdu/semseg-deeplanet-v2-sparse/model/model_best.pth"   # path to pretrained / fine-tune weight
 weight = None
 resume = True      # resume from the latest checkpoint
 evaluate = True     # run evaluation after each training epoch
@@ -43,15 +40,15 @@ seed = 42           # fixed seed (None = auto-random, value is logged)
 # -------------------------------------------------------
 batch_size_train = 8       # effective batch = micro_batch × gradient_accumulation_steps
                            #   micro_batch = batch_size_train // gradient_accumulation_steps
-batch_size_val = 4         # None → auto 1 per GPU (no gradient → less memory than train)
+batch_size_val = 2         # None → auto 1 per GPU (no gradient → less memory than train)
 batch_size_test = 2        # None → auto 1 per GPU; >1 = fragments per forward in SemSegTester
-num_worker = 4            # total dataloader workers across all GPUs
+num_worker = 0            # total dataloader workers across all GPUs
 gradient_accumulation_steps = 2  # effective batch = 2, micro_batch per step = 3
 
 # -------------------------------------------------------
 # 4. Training loop
 # -------------------------------------------------------
-epoch = 10        # total epochs; val runs after every epoch
+epoch = 100        # total epochs; val runs after every epoch
 clip_grad = None    # gradient clipping (None = disabled)
 
 # -------------------------------------------------------
@@ -66,7 +63,7 @@ find_unused_parameters = False
 # 6. Logging & augmentation
 # -------------------------------------------------------
 enable_wandb = False
-wandb_project = "pointspace-dales"
+wandb_project = "pointspace-lasdu"
 wandb_key = None    # set or run `wandb login` beforehand
 mix_prob = 0.0      # MixUp / CutMix probability
 
@@ -74,51 +71,54 @@ mix_prob = 0.0      # MixUp / CutMix probability
 # 7. Model
 # -------------------------------------------------------
 model = dict(
-    type="DefaultSegmentorV2",
+    type="DeepLNLSegmentor",
     num_classes=num_classes,
-    backbone_out_channels=24,
+    backbone_out_channels=64,
     backbone=dict(
-        type="PT-v2m4",
+        type="DeepLANet-v2",
         in_channels=in_channels,
         patch_embed_depth=1,
-        patch_embed_channels=24,
-        patch_embed_groups=6,
-        patch_embed_neighbours=24,
-        enc_depths=(2, 2, 2),
-        enc_channels=(48, 96, 192),
-        enc_groups=(6, 12, 24),
-        enc_neighbours=(32, 32, 32),
-        dec_depths=(1, 1, 1),
-        dec_channels=(24, 48, 96),
-        dec_groups=(4, 6, 12),
-        dec_neighbours=(32, 32, 32),
+        patch_embed_channels=32,
+        patch_embed_neighbours=16,
+        enc_depths=(4, 4, 12, 4),
+        enc_channels=(64, 128, 256, 512),
+        enc_neighbours=(16, 16, 16, 16),
+        dec_depths=(1, 1, 1, 1),
+        dec_channels=(64, 128, 256, 512),
+        dec_neighbours=(16, 16, 16, 16),
         grid_sizes=(
-            3 * grid_size,
-            7.5 * grid_size,
-            18.75 * grid_size,
-            # 45.875 * grid_size,
+            3 * grid_size / 2,
+            7.5 * grid_size / 2,
+            15 * grid_size / 2,
+            37.5 * grid_size / 2,
         ),  # x3, x2.5, x2.5, x2.5
-        attn_qkv_bias=True,
-        pe_multiplier=False,
-        pe_bias=True,
-        attn_drop_rate=0.0,
-        drop_path_rate=0.3,
+        drop_path_rate=0.2,
         enable_checkpoint=False,
-        unpool_backend="interp",  # map / interp
+        unpool_backend="interp",
+        # 深层网络稳定性优化
+        enable_deep_supervision=True,   # 启用 HDS (混合深监督)
+        enable_layer_scale=True,        # 启用 LayerScale
+        layer_scale_init_value=1e-5,    # LayerScale 初始值
     ),
     criteria=[
         dict(type="CrossEntropyLoss", loss_weight=1.0, ignore_index=-1, auto_class_weight=True),
-        dict(type="LovaszLoss", mode="multiclass", loss_weight=1.0, ignore_index=-1),
+        #dict(type="LovaszLoss", mode="multiclass", loss_weight=1.0, ignore_index=-1),
     ],
-    sp_criteria=[
-        dict(
-            type="SuperpointConsistencyLoss",
-            conflict_margin=0.2,
-            loss_weight=5,
-            train_only=True,
-            warmup_epochs=1,  # 前 3 个 epoch 不启用
-        ),
+    # 辅助损失配置 (Hybrid Deep Supervision)
+    aux_criteria=[
+        dict(type="CrossEntropyLoss", loss_weight=0.4, ignore_index=-1, auto_class_weight=True),
     ],
+    aux_channels=(64, 128, 256, 512), # 辅助头通道数，需与 enc_channels 对应
+    aux_dropout=0.1,
+    aux_weights=(0.1, 0.2, 0.3, 0.4), # 各 stage 的辅助损失权重比例 (越深的层权重越大)
+    shallow_stage=2,      # 物理 Stage 2 (提供纯净局部几何先验)
+    bottleneck_stage=4,   # 物理 Stage 4 (Encoder最深处，提供纯净全局语义)
+    max_alpha=2.0,        # [V3新增] CDCS 散度衰减的最大系数
+    warmup_epochs=4,     # [V3调整] 前 N 个 epoch 为纯热身期 (alpha=0)
+    rampup_epochs=15,     # [V3新增] 热身期结束后，alpha 爬升的过渡期轮数
+    base_tau_pseudo=0.90, # [V3调整] 基础伪标签阈值 (结合自适应机制)
+    pseudo_weight=0.1,    # PSSM 伪标签损失权重
+    ignore_index=ignore_index,      # 数据集中的未分类/忽略标签 ID
 )
 
 # -------------------------------------------------------
@@ -136,8 +136,8 @@ param_dicts = None # example: [dict(keyword="block", lr_scale=0.1)]
 # -------------------------------------------------------
 hooks = [
     dict(type="CheckpointLoader"),
-    dict(type="RuntimeInfoHook"),
     dict(type="ModelHook"),
+    dict(type="RuntimeInfoHook"),
     dict(type="IterationTimer", warmup_iter=2),
     dict(type="InformationWriter", interval=10),
     dict(type="CacheCleaner", time_multiplier=5, step_clean_interval=100),
@@ -167,18 +167,19 @@ data = dict(
         required_class=required_classes,  # Filter unwanted classes
         remap_class=True,              # Remap to continuous
         class_weight='sqrt',           # Recommended: sqrt method
-        weight_sample=0.2,             # Use 20% of data for weight computation
+        weight_sample=1.0,             # Use 100% of data for weight computation
         weighted_sampler=True,         # Enable WeightedRandomSampler
         test_mode=False,
-        loop=5,
+        loop=2,
         # Data augmentation
         transform=[
             dict(type="ZPercentileCenterShift", percentile=2.0),
+            dict(type="RobustLogIntensity", clip_min=-3.0, clip_max=3.0),
             dict(type="RandomDropout", dropout_ratio=0.2, dropout_application_ratio=0.2),
             dict(type="RandomRotate", angle=[-1, 1], axis="z", center=[0, 0, 0], p=0.5),
             dict(type="RandomScale", scale=[0.9, 1.1]),
             dict(type="RandomFlip", p=0.5),
-            dict(type="RandomJitter", sigma=0.005, clip=0.02),
+            dict(type="RandomJitter", sigma=0.05, clip=0.1),
             dict(
                 type="GridSample",
                 grid_size=grid_size,
@@ -191,29 +192,29 @@ data = dict(
             dict(type="ToTensor"),
             dict(
                 type="Collect",
-                keys=["coord", "segment", "superpoint"],  # superpoint用于一致性损失
-                optional_keys=["superpoint"],  # superpoint字段可选，如果不存在不报错
+                keys=["coord", "segment"],  # 只需要coord和segment
                 feat_keys=feature_keys,
             ),
         ],
     ),
     val=dict(
         type=dataset_type,
-        split="val",
+        split="test",
         data_path=val_data_dir,  # Use specific val path
         required_class=required_classes,
         remap_class=True,
         ignore_index=ignore_index,
         test_mode=False,
-        loop=5,  # Validation doesn't need loop
+        loop=2,  # Validation doesn't need loop
         # Validation uses minimal transforms (no random augmentation for deterministic eval)
         transform=[
             dict(type="ZPercentileCenterShift", percentile=2.0),
+            dict(type="RobustLogIntensity", clip_min=-3.0, clip_max=3.0),
             dict(type="RandomDropout", dropout_ratio=0.2, dropout_application_ratio=0.2),
             dict(type="RandomRotate", angle=[-1, 1], axis="z", center=[0, 0, 0], p=0.5),
             dict(type="RandomScale", scale=[0.9, 1.1]),
             dict(type="RandomFlip", p=0.5),
-            dict(type="RandomJitter", sigma=0.005, clip=0.02),
+            dict(type="RandomJitter", sigma=0.05, clip=0.1),
             dict(
                 type="GridSample",
                 grid_size=grid_size,
@@ -226,7 +227,7 @@ data = dict(
             dict(type="ToTensor"),
             dict(
                 type="Collect",
-                keys=["coord", "segment"],  # superpoint用于一致性损失
+                keys=["coord", "segment"],  # 只需要coord和segment
                 feat_keys=feature_keys,
             ),
         ],
@@ -242,6 +243,7 @@ data = dict(
         # Base transform
         transform=[
             dict(type="ZPercentileCenterShift", percentile=2.0),
+            dict(type="RobustLogIntensity", clip_min=-3.0, clip_max=3.0),
             dict(
                 type="GridSample",
                 grid_size=grid_size,

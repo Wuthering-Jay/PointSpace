@@ -28,8 +28,8 @@ in_channels = 6
 # -------------------------------------------------------
 # 2. Checkpoint / run control
 # -------------------------------------------------------
-# weight = "exp/lasdu/semseg-deeplanet-v2-sparse/model/model_best.pth"   # path to pretrained / fine-tune weight
-weight = None
+weight = "exp/lasdu/semseg-deeplanet-v2-dtnl/model/model_last.pth"   # path to pretrained / fine-tune weight
+# weight = None
 resume = True      # resume from the latest checkpoint
 evaluate = True     # run evaluation after each training epoch
 test_only = False   # skip training, run test only

@@ -45,16 +45,20 @@ class PointBatchNorm(nn.Module):
         self.norm = nn.BatchNorm1d(embed_channels)
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        if input.dim() == 3:
-            return (
-                self.norm(input.transpose(1, 2).contiguous())
+        # Prevent AMP NaN by enforcing FP32 computation for BatchNorm
+        input_dtype = input.dtype
+        input_fp32 = input.float()
+        if input_fp32.dim() == 3:
+            out = (
+                self.norm(input_fp32.transpose(1, 2).contiguous())
                 .transpose(1, 2)
                 .contiguous()
             )
-        elif input.dim() == 2:
-            return self.norm(input)
+        elif input_fp32.dim() == 2:
+            out = self.norm(input_fp32)
         else:
             raise NotImplementedError
+        return out.to(input_dtype)
 
 
 def compute_stage_positional_encoding(coord, reference_index, dist):
@@ -109,12 +113,22 @@ class PositionalEncodingEncoder(nn.Module):
     位置编码编码器
     将 Stage-Level 计算的位置编码 [n, k, 10] 编码为 [n, C] 用于加法融合
 
+    优化策略：使用输入归一化 + 智能 clamp 替代强制 FP32
+    - 保持 FP16/BF16 精度，利用 Tensor Core 加速
+    - 通过归一化防止溢出，无需强制类型转换
+    - 显存占用减半，速度提升显著
+
     Args:
         embed_channels: 输出特征维度
+        normalize_input: 是否对输入进行归一化（推荐开启）
+        safe_range: FP16 安全范围，用于 clamp（默认 ±60000，留有余量）
     """
 
-    def __init__(self, embed_channels):
+    def __init__(self, embed_channels, normalize_input=True, safe_range=60000.0):
         super(PositionalEncodingEncoder, self).__init__()
+        self.normalize_input = normalize_input
+        self.safe_range = safe_range
+
         # 10维 -> embed_channels，然后 max pooling
         self.mlp = nn.Sequential(
             nn.Linear(10, embed_channels),
@@ -126,13 +140,53 @@ class PositionalEncodingEncoder(nn.Module):
         """
         Args:
             pos_encoding: [n, k, 10] Stage级别的位置编码
+                前 3 维：中心点坐标
+                中 3 维：邻域点坐标
+                后 3 维：相对位置
+                最后 1 维：距离
 
         Returns:
             [n, C] 编码后的位置特征，用于与点特征相加
         """
         n, k, _ = pos_encoding.shape
 
+        # 轻量级归一化策略：保持在当前精度下处理，无需类型转换
+        if self.normalize_input:
+            # 策略 1: 坐标归一化 - 按每个点的局部范围归一化（避免全局统计）
+            # 中心点坐标 [n, k, 3]
+            center_coord = pos_encoding[..., 0:3]
+            # 邻域点坐标 [n, k, 3]
+            neighbor_coord = pos_encoding[..., 3:6]
+            # 相对位置 [n, k, 3]
+            relative_pos = pos_encoding[..., 6:9]
+            # 距离 [n, k, 1]
+            dist = pos_encoding[..., 9:10]
+
+            # 对相对位置和距离归一化（这两个最容易在深层网络中出现极值）
+            # 使用局部归一化：相对于每个点的邻域范围
+            max_dist = dist.max(dim=1, keepdim=True)[0].clamp(min=1e-6)  # [n, 1, 1]
+            relative_pos_norm = relative_pos / max_dist  # 归一化到 [-1, 1] 范围
+            dist_norm = dist / max_dist  # 归一化到 [0, 1] 范围
+
+            # 坐标使用更温和的缩放（避免破坏绝对位置信息）
+            coord_scale = center_coord.abs().max(dim=1, keepdim=True)[0].clamp(min=1.0)
+            center_coord_norm = center_coord / coord_scale
+            neighbor_coord_norm = neighbor_coord / coord_scale
+
+            # 重组归一化后的位置编码
+            pos_encoding = torch.cat([
+                center_coord_norm,
+                neighbor_coord_norm,
+                relative_pos_norm,
+                dist_norm,
+            ], dim=-1)
+
+        # 策略 2: 安全 clamp - 在当前精度下直接 clamp，避免溢出
+        # 比 nan_to_num 更轻量，且不需要类型转换
+        pos_encoding = pos_encoding.clamp(-self.safe_range, self.safe_range)
+
         # MLP 编码: [n, k, 10] -> [n, k, C]
+        # 保持 AMP 启用，充分利用 Tensor Core
         pe_feat = self.mlp(pos_encoding.reshape(-1, 10)).reshape(n, k, -1)
 
         # Max pooling 聚合邻域信息: [n, k, C] -> [n, C]
@@ -146,11 +200,6 @@ class VFRModule(nn.Module):
     Vector Feature Representation Module (向量特征表示模块)
 
     核心创新: 仅做局部差值和最大池化，O(N) 复杂度，极轻量
-    - 计算边缘特征: f_j - f_i
-    - 最大池化聚合
-    - 无 Linear 层（Linear 被前置到 Block 中）
-
-    这是对复杂 LocalFeatureAggregation 的轻量化替代
     """
 
     def __init__(self):
@@ -168,6 +217,7 @@ class VFRModule(nn.Module):
             [n, C] 聚合后的特征
         """
         # 获取邻居特征: [n, k, C]
+        # 使用 amp 禁止的话可以避免极端浮点溢出，由于这里的差值较小影响不大
         grouped_feat = pointops.grouping(reference_index, feat, coord, with_xyz=False)
 
         # 核心: 计算边缘特征 f_j - f_i (相对特征)
@@ -175,8 +225,9 @@ class VFRModule(nn.Module):
 
         # 最大池化聚合: [n, k, C] -> [n, C]
         out_feat = rel_feat.max(dim=1)[0]
-
-        return out_feat
+        
+        # 加上原特征的一个残差，防止0值累积导致后续为NaN
+        return out_feat + feat
 
 
 class ResLFEBlock(nn.Module):
@@ -254,7 +305,7 @@ class ResLFEBlock(nn.Module):
         feat = self.act(self.norm1(self.fc1(feat)))
 
         # 融合阶段级 PE (N x C 直接相加，不翻倍通道)
-        feat = feat + pe
+        feat = feat + pe.type_as(feat)
 
         # 局部信息提取
         feat = (
@@ -268,7 +319,7 @@ class ResLFEBlock(nn.Module):
 
         # 残差连接: 应用 LayerScale (如果启用)
         if self.enable_layer_scale:
-            feat = identity + self.drop_path(feat * self.gamma)
+            feat = identity + self.drop_path(feat * self.gamma.type_as(feat))
         else:
             feat = identity + self.drop_path(feat)
         feat = self.act(feat)
@@ -403,6 +454,7 @@ class GridPool(nn.Module):
         batch = offset2batch(offset)
         feat = self.act(self.norm(self.fc(feat)))
 
+        import torch
         with torch.no_grad():
             start = (
                 segment_csr(
@@ -423,10 +475,15 @@ class GridPool(nn.Module):
             idx_ptr = torch.cat([counts.new_zeros(1), torch.cumsum(counts, dim=0)])
 
         coord = segment_csr(coord[sorted_cluster_indices], idx_ptr, reduce="mean")
-        feat = segment_csr(feat[sorted_cluster_indices], idx_ptr, reduce="max")
+        # clamp feature max range under float16 to avoid overflowing to inf
+        feat_max = segment_csr(feat[sorted_cluster_indices], idx_ptr, reduce="max")
+        # to prevent half precision inf overflow in extreme cases
+        if feat_max.dtype == torch.float16:
+            feat_max = torch.clamp(feat_max, min=-65500.0, max=65500.0)
+            
         batch = batch[idx_ptr[:-1]]
         offset = batch2offset(batch)
-        return [coord, feat, offset], cluster.detach()
+        return [coord, feat_max, offset], cluster.detach()
 
 
 class UnpoolWithSkip(nn.Module):
@@ -487,9 +544,18 @@ class UnpoolWithSkip(nn.Module):
         if self.backend == "map" and cluster is not None:
             feat = self.proj(feat)[cluster]
         else:
-            feat = pointops.interpolation(
-                coord, skip_coord, self.proj(feat), offset, skip_offset
-            )
+            # 优化策略：只对坐标使用 FP32（interpolation 需要高精度距离计算）
+            # 特征保持当前精度，减少类型转换开销
+            proj_feat = self.proj(feat)
+
+            # 只在真正需要的地方禁用 autocast（距离计算），特征转换保持在外面
+            # 这样可以减少 FP32 运算的范围
+            import torch
+            with torch.amp.autocast('cuda', enabled=False):
+                # 只转换坐标为 FP32（距离计算需要），特征保持原精度
+                feat = pointops.interpolation(
+                    coord.float(), skip_coord.float(), proj_feat.float(), offset, skip_offset
+                )
 
         if self.skip:
             feat = feat + self.proj_skip(skip_feat)

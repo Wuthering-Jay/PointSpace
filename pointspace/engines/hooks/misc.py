@@ -31,6 +31,41 @@ from .builder import HOOKS
 
 
 @HOOKS.register_module()
+class RuntimeInfoHook(HookBase):
+    """
+    Hook to record runtime information such as current epoch, step within epoch, 
+    and global step into a shared global state, so models/other components 
+    can access them without dragging trainer passing everywhere.
+    """
+    
+    # Global state accessible by anyone (e.g. models) via `RuntimeInfoHook.state`
+    state = {
+        "epoch": 0,
+        "step": 0,
+        "global_step": 0,
+        "max_epoch": 0,
+        "max_step": 0,
+    }
+
+    def before_train(self):
+        RuntimeInfoHook.state["max_epoch"] = self.trainer.max_epoch
+        RuntimeInfoHook.state["max_step"] = len(self.trainer.train_loader)
+        RuntimeInfoHook.state["global_step"] = self.trainer.start_epoch * len(self.trainer.train_loader)
+
+    def before_epoch(self):
+        RuntimeInfoHook.state["epoch"] = self.trainer.epoch
+        RuntimeInfoHook.state["step"] = 0
+
+    def before_step(self):
+        # step and global_step are incremented at the end of the step logically,
+        # but trainer.comm_info['iter'] can be used for the current step inside the loader.
+        RuntimeInfoHook.state["step"] = self.trainer.comm_info["iter"]
+
+    def after_step(self):
+        RuntimeInfoHook.state["global_step"] += 1
+
+
+@HOOKS.register_module()
 class IterationTimer(HookBase):
     def __init__(self, warmup_iter=1):
         self._warmup_iter = warmup_iter
@@ -255,7 +290,19 @@ class CheckpointSaver(HookBase):
                 },
                 filename + ".tmp",
             )
-            os.replace(filename + ".tmp", filename)
+            # 在 Windows 系统上，os.replace 可能会因为文件被占用抛出权限错误
+            # 所以可以选择先删除已存在的文件（确保忽略错误），然后再重命名
+            import builtins
+            try:
+                os.replace(filename + ".tmp", filename)
+            except PermissionError:
+                if os.path.exists(filename):
+                    try:
+                        os.remove(filename)
+                    except OSError:
+                        pass
+                os.rename(filename + ".tmp", filename)
+            
             if is_best:
                 shutil.copyfile(
                     filename,
@@ -792,3 +839,38 @@ class CacheCleaner(HookBase):
                 f"step {self._step_count} took {elapsed:.3f}s "
                 f"(abs threshold {self.abs_threshold_sec:.3f}s)"
             )
+
+
+@HOOKS.register_module()
+class SuperpointWarmupHook(HookBase):
+    """
+    Hook to update epoch information for SuperpointConsistencyLoss warmup.
+
+    Traverses all loss modules in the model and calls set_epoch() on any
+    SuperpointConsistencyLoss instances to enable warmup functionality.
+    """
+
+    def before_epoch(self):
+        """Update epoch for all SuperpointConsistencyLoss modules."""
+        epoch = self.trainer.epoch
+        model = self.trainer.model
+
+        # Handle DDP wrapper
+        if hasattr(model, 'module'):
+            model = model.module
+
+        # Recursively find and update all SuperpointConsistencyLoss modules
+        self._update_superpoint_losses(model, epoch)
+
+    def _update_superpoint_losses(self, module, epoch):
+        """Recursively traverse module tree and update SuperpointConsistencyLoss."""
+        # Check if this module itself has set_epoch method (SuperpointConsistencyLoss)
+        if hasattr(module, 'set_epoch') and callable(module.set_epoch):
+            # Additional check: only call if it's likely a loss module
+            # (has loss_weight or conflict_margin attributes)
+            if hasattr(module, 'warmup_epochs'):
+                module.set_epoch(epoch)
+
+        # Recursively check children
+        for child in module.children():
+            self._update_superpoint_losses(child, epoch)

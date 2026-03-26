@@ -8,8 +8,6 @@ import sys
 from pathlib import Path
 # Force UTF-8 output so Unicode chars (e.g. R^2, ², etc.) don't crash on
 # Windows consoles that default to a narrow encoding like GBK / cp936.
-if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace")
 import argparse
@@ -32,7 +30,7 @@ def default_argument_parser(epilog=None):
         epilog=epilog,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--config-file", default=r"configs\lasdu\semseg-deeplanet-v2-0.py", metavar="FILE", help="path to config file")
+    parser.add_argument("--config-file", default=r"configs\dales\semseg-pt-v2m4-0-base.py", metavar="FILE", help="path to config file")
     parser.add_argument("--num-gpus", type=int, default=1, help="number of gpus *per machine*")
     parser.add_argument("--num-machines", type=int, default=1, help="total number of machines")
     parser.add_argument("--machine-rank", type=int, default=0, help="the rank of this machine (unique per machine)",)

@@ -57,6 +57,7 @@ class LasDataset(DefaultDataset):
         "hag",  # Height above ground
         "z_base", # Z_base height
         "normal",  # Normal vectors (normal_x, normal_y, normal_z extra dims)
+        "superpoint",  # Superpoint segment ID
         "segment",
         "instance",
     ]
@@ -746,6 +747,15 @@ class LasDataset(DefaultDataset):
                     data_dict["normal"] = np.stack((nx, ny, nz), axis=1)  # (N, 3)
                 except (AttributeError, KeyError):
                     pass  # Normal vectors not available
+
+            # Extract superpoint segment ID if available (stored as extra dim by tile_las.py)
+            if "superpoint" in las.point_format.dimension_names:
+                try:
+                    superpoint = np.array(las.superpoint, dtype=np.int64)
+                    # Only keep valid superpoints (>= 0), invalid ones (-1) will be handled in loss
+                    data_dict["superpoint"] = superpoint
+                except (AttributeError, KeyError):
+                    pass  # Superpoint not available
 
             # Extract core_bbox from PointSpace VLR (written by tile_las.py buffered tiling)
             for vlr in las.header.vlrs:

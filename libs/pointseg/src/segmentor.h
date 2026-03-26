@@ -47,7 +47,7 @@ public:
 };
 
 // Function prototypes
-universe *segment_graph(int num_vertices, int num_edges, edge *edges, float c);
+universe *segment_graph(int num_vertices, int num_edges, edge *edges, float c, int segMaxVerts = -1);
 vec3f cross(const vec3f &u, const vec3f &v);
 vec3f lerp(const vec3f &a, const vec3f &b, const float v);
 
@@ -69,12 +69,14 @@ vector<int> segment_point_kernel(const float *points_ptr,
                                 const int64_t *edges_ptr,
                                 const size_t edgeCount,
                                 const float kthr,
-                                const int segMinVerts);
+                                const int segMinVerts,
+                                const int segMaxVerts = -1);
 
 torch::Tensor segment_point(torch::Tensor vertices,
                            torch::Tensor normals,
                            torch::Tensor edges,
                            float kthr,
-                           int segMinVerts);
+                           int segMinVerts,
+                           int segMaxVerts = -1);
 
 #endif // SEGMENTATION_H

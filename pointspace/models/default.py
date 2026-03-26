@@ -1,9 +1,10 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch_scatter
 import torch_cluster
-from peft import LoraConfig, get_peft_model
+# from peft import LoraConfig, get_peft_model
 from collections import OrderedDict
 
 from pointspace.models.losses import build_criteria
@@ -14,10 +15,11 @@ from .builder import MODELS, build_model
 
 @MODELS.register_module()
 class DefaultSegmentor(nn.Module):
-    def __init__(self, backbone=None, criteria=None):
+    def __init__(self, backbone=None, criteria=None, sp_criteria=None):
         super().__init__()
         self.backbone = build_model(backbone)
         self.criteria = build_criteria(criteria)
+        self.sp_criteria = build_criteria(sp_criteria) if sp_criteria else None
 
     def forward(self, input_dict):
         if "condition" in input_dict.keys():
@@ -28,6 +30,21 @@ class DefaultSegmentor(nn.Module):
         # train
         if self.training:
             loss = self.criteria(seg_logits, input_dict["segment"])
+
+            # 超点一致性损失（只在配置时才计算和显示）
+            if self.sp_criteria is not None and "superpoint" in input_dict:
+                superpoint = input_dict["superpoint"]
+                sp_loss = None
+                for sp_c in self.sp_criteria.criteria:
+                    sp_loss_item = sp_c(seg_logits, superpoint)
+                    if sp_loss is None:
+                        sp_loss = sp_loss_item
+                    else:
+                        sp_loss = sp_loss + sp_loss_item
+                if sp_loss is not None:
+                    loss = loss + sp_loss
+                    return dict(loss=loss, l_sp=sp_loss)
+
             return dict(loss=loss)
         # eval
         elif "segment" in input_dict.keys():
@@ -46,6 +63,7 @@ class DefaultSegmentorV2(nn.Module):
         backbone_out_channels,
         backbone=None,
         criteria=None,
+        sp_criteria=None,
         freeze_backbone=False,
     ):
         super().__init__()
@@ -56,6 +74,7 @@ class DefaultSegmentorV2(nn.Module):
         )
         self.backbone = build_model(backbone)
         self.criteria = build_criteria(criteria)
+        self.sp_criteria = build_criteria(sp_criteria) if sp_criteria else None
         self.freeze_backbone = freeze_backbone
         if self.freeze_backbone:
             for p in self.backbone.parameters():
@@ -84,6 +103,21 @@ class DefaultSegmentorV2(nn.Module):
         # train
         if self.training:
             loss = self.criteria(seg_logits, input_dict["segment"])
+
+            # 超点一致性损失（只在配置时才计算和显示）
+            if self.sp_criteria is not None and "superpoint" in input_dict:
+                superpoint = input_dict["superpoint"]
+                sp_loss = None
+                for sp_c in self.sp_criteria.criteria:
+                    sp_loss_item = sp_c(seg_logits, superpoint)
+                    if sp_loss is None:
+                        sp_loss = sp_loss_item
+                    else:
+                        sp_loss = sp_loss + sp_loss_item
+                if sp_loss is not None:
+                    loss = loss + sp_loss
+                    return_dict["l_sp"] = sp_loss
+
             return_dict["loss"] = loss
         # eval
         elif "segment" in input_dict.keys():
@@ -96,112 +130,112 @@ class DefaultSegmentorV2(nn.Module):
         return return_dict
 
 
-@MODELS.register_module()
-class DefaultLORASegmentorV2(nn.Module):
-    def __init__(
-        self,
-        num_classes,
-        backbone_out_channels,
-        backbone=None,
-        criteria=None,
-        freeze_backbone=False,
-        use_lora=False,
-        lora_r=8,
-        lora_alpha=16,
-        lora_dropout=0.1,
-        backbone_path=None,
-        keywords=None,
-        replacements=None,
-    ):
-        super().__init__()
-        self.seg_head = (
-            nn.Linear(backbone_out_channels, num_classes)
-            if num_classes > 0
-            else nn.Identity()
-        )
-        self.keywords = keywords
-        self.replacements = replacements
-        self.backbone = build_model(backbone)
-        backbone_weight = torch.load(
-            backbone_path,
-            map_location=lambda storage, loc: storage.cuda(),
-        )
-        self.backbone_load(backbone_weight)
+# @MODELS.register_module()
+# class DefaultLORASegmentorV2(nn.Module):
+#     def __init__(
+#         self,
+#         num_classes,
+#         backbone_out_channels,
+#         backbone=None,
+#         criteria=None,
+#         freeze_backbone=False,
+#         use_lora=False,
+#         lora_r=8,
+#         lora_alpha=16,
+#         lora_dropout=0.1,
+#         backbone_path=None,
+#         keywords=None,
+#         replacements=None,
+#     ):
+#         super().__init__()
+#         self.seg_head = (
+#             nn.Linear(backbone_out_channels, num_classes)
+#             if num_classes > 0
+#             else nn.Identity()
+#         )
+#         self.keywords = keywords
+#         self.replacements = replacements
+#         self.backbone = build_model(backbone)
+#         backbone_weight = torch.load(
+#             backbone_path,
+#             map_location=lambda storage, loc: storage.cuda(),
+#         )
+#         self.backbone_load(backbone_weight)
 
-        self.criteria = build_criteria(criteria)
-        self.freeze_backbone = freeze_backbone
-        self.use_lora = use_lora
+#         self.criteria = build_criteria(criteria)
+#         self.freeze_backbone = freeze_backbone
+#         self.use_lora = use_lora
 
-        if self.use_lora:
-            lora_config = LoraConfig(
-                r=lora_r,
-                lora_alpha=lora_alpha,
-                target_modules=["qkv"],
-                # target_modules=["query", "value"],
-                lora_dropout=lora_dropout,
-                bias="none",
-            )
-            self.backbone.enc = get_peft_model(self.backbone.enc, lora_config)
+#         if self.use_lora:
+#             lora_config = LoraConfig(
+#                 r=lora_r,
+#                 lora_alpha=lora_alpha,
+#                 target_modules=["qkv"],
+#                 # target_modules=["query", "value"],
+#                 lora_dropout=lora_dropout,
+#                 bias="none",
+#             )
+#             self.backbone.enc = get_peft_model(self.backbone.enc, lora_config)
 
-        if self.freeze_backbone:
-            for p in self.backbone.parameters():
-                p.requires_grad = False
-        if self.use_lora:
-            for name, param in self.backbone.named_parameters():
-                if "lora_" in name:
-                    param.requires_grad = True
-        self.backbone.enc.print_trainable_parameters()
+#         if self.freeze_backbone:
+#             for p in self.backbone.parameters():
+#                 p.requires_grad = False
+#         if self.use_lora:
+#             for name, param in self.backbone.named_parameters():
+#                 if "lora_" in name:
+#                     param.requires_grad = True
+#         self.backbone.enc.print_trainable_parameters()
 
-    def backbone_load(self, checkpoint):
-        weight = OrderedDict()
-        for key, value in checkpoint["state_dict"].items():
-            if not key.startswith("module."):
-                key = "module." + key  # xxx.xxx -> module.xxx.xxx
-            # Now all keys contain "module." no matter DDP or not.
-            if self.keywords in key:
-                key = key.replace(self.keywords, self.replacements)
-            key = key[7:]  # module.xxx.xxx -> xxx.xxx
-            if key.startswith("backbone."):
-                key = key[9:]
-            weight[key] = value
-        load_state_info = self.backbone.load_state_dict(weight, strict=False)
-        print(f"Missing keys: {load_state_info[0]}")
-        print(f"Unexpected keys: {load_state_info[1]}")
+#     def backbone_load(self, checkpoint):
+#         weight = OrderedDict()
+#         for key, value in checkpoint["state_dict"].items():
+#             if not key.startswith("module."):
+#                 key = "module." + key  # xxx.xxx -> module.xxx.xxx
+#             # Now all keys contain "module." no matter DDP or not.
+#             if self.keywords in key:
+#                 key = key.replace(self.keywords, self.replacements)
+#             key = key[7:]  # module.xxx.xxx -> xxx.xxx
+#             if key.startswith("backbone."):
+#                 key = key[9:]
+#             weight[key] = value
+#         load_state_info = self.backbone.load_state_dict(weight, strict=False)
+#         print(f"Missing keys: {load_state_info[0]}")
+#         print(f"Unexpected keys: {load_state_info[1]}")
 
-    def forward(self, input_dict, return_point=False):
-        point = Point(input_dict)
-        if self.freeze_backbone and not self.use_lora:
-            with torch.no_grad():
-                point = self.backbone(point)
-        else:
-            point = self.backbone(point)
+#     def forward(self, input_dict, return_point=False):
+#         point = Point(input_dict)
+#         if self.freeze_backbone and not self.use_lora:
+#             with torch.no_grad():
+#                 point = self.backbone(point)
+#         else:
+#             point = self.backbone(point)
 
-        if isinstance(point, Point):
-            while "pooling_parent" in point.keys():
-                assert "pooling_inverse" in point.keys()
-                parent = point.pop("pooling_parent")
-                inverse = point.pop("pooling_inverse")
-                parent.feat = torch.cat([parent.feat, point.feat[inverse]], dim=-1)
-                point = parent
-            feat = point.feat
-        else:
-            feat = point
+#         if isinstance(point, Point):
+#             while "pooling_parent" in point.keys():
+#                 assert "pooling_inverse" in point.keys()
+#                 parent = point.pop("pooling_parent")
+#                 inverse = point.pop("pooling_inverse")
+#                 parent.feat = torch.cat([parent.feat, point.feat[inverse]], dim=-1)
+#                 point = parent
+#             feat = point.feat
+#         else:
+#             feat = point
 
-        seg_logits = self.seg_head(feat)
-        return_dict = dict()
-        if return_point:
-            return_dict["point"] = point
+#         seg_logits = self.seg_head(feat)
+#         return_dict = dict()
+#         if return_point:
+#             return_dict["point"] = point
 
-        if self.training:
-            loss = self.criteria(seg_logits, input_dict["segment"])
-            return_dict["loss"] = loss
-        elif "segment" in input_dict.keys():
-            loss = self.criteria(seg_logits, input_dict["segment"])
-            return_dict["loss"] = loss
-            return_dict["seg_logits"] = seg_logits
-        else:
-            return_dict["seg_logits"] = seg_logits
-        return return_dict
+#         if self.training:
+#             loss = self.criteria(seg_logits, input_dict["segment"])
+#             return_dict["loss"] = loss
+#         elif "segment" in input_dict.keys():
+#             loss = self.criteria(seg_logits, input_dict["segment"])
+#             return_dict["loss"] = loss
+#             return_dict["seg_logits"] = seg_logits
+#         else:
+#             return_dict["seg_logits"] = seg_logits
+#         return return_dict
 
 
 @MODELS.register_module()
@@ -550,6 +584,7 @@ class DeepLASegmentor(nn.Module):
     2. 使用 pointops.interpolation 将低分辨率中间特征插值到原始分辨率
     3. 动态辅助头 (Auxiliary Heads): 为每个 Encoder 阶段生成带 Dropout 的分类头
     4. 双轨损失机制: criteria (主损失) + aux_criteria (辅助损失)
+    5. 超点一致性损失: sp_criteria (Superpoint Consistency Loss，仅训练时生效)
 
     Args:
         num_classes (int): 分类类别数
@@ -561,6 +596,8 @@ class DeepLASegmentor(nn.Module):
         aux_dropout (float): 辅助头的 Dropout 概率
         aux_weights (tuple[float]): 各 stage 的辅助损失权重比例，如 (0.1, 0.2, 0.3, 0.4)
                                      如果为 None，默认所有 stage 权重相等 (1.0)
+        sp_criteria (list[dict]): 超点一致性损失配置 (如 SuperpointConsistencyLoss)
+                                  仅在训练时生效，验证和测试时自动跳过
         freeze_backbone (bool): 是否冻结 backbone 参数
     """
 
@@ -574,6 +611,7 @@ class DeepLASegmentor(nn.Module):
         aux_channels=None,
         aux_dropout=0.1,
         aux_weights=None,
+        sp_criteria=None,
         freeze_backbone=False,
     ):
         super().__init__()
@@ -593,6 +631,8 @@ class DeepLASegmentor(nn.Module):
         self.backbone = build_model(backbone)
         self.criteria = build_criteria(criteria)
         self.aux_criteria = build_criteria(aux_criteria) if aux_criteria else None
+        # Superpoint consistency loss (train only)
+        self.sp_criteria = build_criteria(sp_criteria) if sp_criteria else None
 
         # 冻结 backbone
         self.freeze_backbone = freeze_backbone
@@ -674,9 +714,12 @@ class DeepLASegmentor(nn.Module):
 
                 # 使用 pointops.interpolation 将低分辨率特征插值到原始分辨率
                 # interpolation(src_coord, dst_coord, src_feat, src_offset, dst_offset)
-                interpolated_feat = self.pointops.interpolation(
-                    aux_coord, origin_coord, aux_feat, aux_offset, origin_offset
-                )
+                # 必须在 FP32 下执行，否则 1/dist 的操作在 float16 (AMP) 下极易产生 inf/nan
+                import torch
+                with torch.amp.autocast('cuda', enabled=False):
+                    interpolated_feat = self.pointops.interpolation(
+                        aux_coord.float(), origin_coord.float(), aux_feat.float(), aux_offset, origin_offset
+                    )
 
                 # 通过辅助头生成 logits
                 aux_logits = self.aux_heads[i](interpolated_feat)
@@ -689,7 +732,7 @@ class DeepLASegmentor(nn.Module):
             # 主损失
             loss = self.criteria(seg_logits, input_dict["segment"])
 
-            # 辅助损失
+            # 辅助损失（只在配置时才计算和显示）
             if len(aux_logits_list) > 0 and self.aux_criteria is not None:
                 aux_loss = 0.0
                 for i, aux_logits in enumerate(aux_logits_list):
@@ -699,6 +742,22 @@ class DeepLASegmentor(nn.Module):
                     aux_loss = aux_loss + weighted_loss
                 # aux_criteria 的 loss_weight 已在 build_criteria 中处理
                 loss = loss + aux_loss
+                return_dict["l_aux"] = aux_loss  # 只在配置了 aux_criteria 时才添加到日志
+
+            # 超点一致性损失（只在配置时才计算和显示）
+            if self.sp_criteria is not None and "superpoint" in input_dict:
+                superpoint = input_dict["superpoint"]
+                # SuperpointConsistencyLoss 接受 logits 和 superpoint 索引
+                sp_loss = None
+                for sp_c in self.sp_criteria.criteria:
+                    sp_loss_item = sp_c(seg_logits, superpoint)
+                    if sp_loss is None:
+                        sp_loss = sp_loss_item
+                    else:
+                        sp_loss = sp_loss + sp_loss_item
+                if sp_loss is not None:
+                    loss = loss + sp_loss
+                    return_dict["l_sp"] = sp_loss  # 只在配置了 sp_criteria 且有数据时才添加到日志
 
             return_dict["loss"] = loss
 
@@ -713,6 +772,591 @@ class DeepLASegmentor(nn.Module):
             return_dict["seg_logits"] = seg_logits
 
         return return_dict
+    
+
+@MODELS.register_module()
+class DeepLNLSegmentor(nn.Module):
+    """
+    DeepLANet 噪声标签学习 (LNL) 终极 Segmentor: ICL-DeepLA (V4.0 Spatial-Uncertainty Aware Edition)
+    
+    核心创新与 V4.0 升级:
+    1. 打破跳跃连接悖论: 严格在 Encoder 内部计算跨层一致性。
+    2. 平滑退火 (Smooth Transition): alpha 随 epoch 线性预热，防止 Loss 休克。
+    3. 空间一致性 (Spatial Consistency): [V4新增] 利用 KNN 进行置信度空间平滑，完美保护大类边界难例。
+    4. 预测不确定性 (Predictive Uncertainty): [V4新增] 计算 HDS 多尺度预测的信息熵，严格防止“毒性原型”注入。
+    5. 类别自适应阈值与邻域投票: [V4新增] PSSM 打捞不仅依靠自适应阈值，还强制要求局部邻域达成共识，秒杀孤立噪点。
+    """
+
+    def __init__(
+        self,
+        num_classes,
+        backbone_out_channels,
+        backbone=None,
+        criteria=None,
+        aux_criteria=None,
+        aux_channels=None,
+        aux_dropout=0.1,
+        aux_weights=None,
+        freeze_backbone=False,
+        
+        # --- ICL-DeepLA V4.0 专属核心超参数 ---
+        shallow_stage=2,      # 物理 Stage 2 (提供纯净局部几何先验)
+        bottleneck_stage=4,   # 物理 Stage 4 (Encoder最深处，提供纯净全局语义)
+        max_alpha=2.0,        # CDCS 散度衰减的最大系数
+        warmup_epochs=10,     # 前 N 个 epoch 为纯热身期 (alpha=0)
+        rampup_epochs=15,     # 热身期结束后，alpha 爬升的过渡期轮数
+        base_tau_pseudo=0.90, # 基础伪标签阈值 (结合自适应机制)
+        pseudo_weight=0.1,    # PSSM 伪标签损失权重
+        ignore_index=-1,      # 数据集中的未分类/忽略标签 ID
+        
+        # --- V4.0 空间与不确定性参数 ---
+        k_neighbors=16,       # KNN 空间平滑的邻居数量
+        uncertainty_th=0.2,   # 预测不确定性(信息熵)的容忍阈值，越低越严格
+    ):
+        super().__init__()
+        import pointops
+        self.pointops = pointops
+        self.num_classes = num_classes
+
+        # LNL 专属参数赋值
+        self.shallow_stage = shallow_stage
+        self.bottleneck_stage = bottleneck_stage
+        self.max_alpha = max_alpha
+        self.warmup_epochs = warmup_epochs
+        self.rampup_epochs = rampup_epochs
+        self.base_tau_pseudo = base_tau_pseudo
+        self.pseudo_weight = pseudo_weight
+        self.ignore_index = ignore_index
+        self.k_neighbors = k_neighbors
+        self.uncertainty_th = uncertainty_th
+
+        # ==========================================================
+        # 1. 基础网络与损失模块构建
+        # ==========================================================
+        self.backbone = build_model(backbone)
+        self.criteria = build_criteria(criteria)
+        self.aux_criteria = build_criteria(aux_criteria) if aux_criteria else None
+        
+        if freeze_backbone:
+            for p in self.backbone.parameters():
+                p.requires_grad = False
+
+        self.seg_head = nn.Linear(backbone_out_channels, num_classes) if num_classes > 0 else nn.Identity()
+
+        self.aux_heads = None
+        self.aux_weights = None
+        if aux_channels is not None and len(aux_channels) > 0:
+            self.aux_heads = nn.ModuleList()
+            for ch in aux_channels:
+                self.aux_heads.append(nn.Sequential(
+                    nn.Dropout(p=aux_dropout),
+                    nn.Linear(ch, num_classes)
+                ))
+            
+            if aux_weights is not None:
+                assert len(aux_weights) == len(aux_channels)
+                self.aux_weights = aux_weights
+            else:
+                self.aux_weights = tuple([1.0] * len(aux_channels))
+
+        # ==========================================================
+        # 2. PSSM 缓冲注册 (不参与梯度回传)
+        # ==========================================================
+        self.register_buffer('prototypes', torch.zeros(num_classes, backbone_out_channels))
+        self.register_buffer('class_confidences', torch.ones(num_classes))
+
+    def get_dynamic_alpha(self, current_epoch):
+        """计算平滑过渡的 Alpha 值，防止机制启动瞬间网络崩溃"""
+        if current_epoch < self.warmup_epochs:
+            return 0.0
+        elif current_epoch >= self.warmup_epochs + self.rampup_epochs:
+            return self.max_alpha
+        else:
+            ratio = (current_epoch - self.warmup_epochs) / self.rampup_epochs
+            return self.max_alpha * ratio
+
+    def forward(self, input_dict, return_point=False):
+        point = Point(input_dict)
+        origin_coord = point.coord.clone()
+        origin_offset = point.offset.clone()
+
+        point = self.backbone(point)
+
+        # 剥离 Pooling 层级获取解码器最终特征
+        if isinstance(point, Point):
+            while "pooling_parent" in point.keys():
+                assert "pooling_inverse" in point.keys()
+                parent = point.pop("pooling_parent")
+                inverse = point.pop("pooling_inverse")
+                parent.feat = torch.cat([parent.feat, point.feat[inverse]], dim=-1)
+                point = parent
+            final_feat = point.feat
+        else:
+            final_feat = point
+
+        seg_logits = self.seg_head(final_feat)
+
+        return_dict = dict()
+        if return_point:
+            return_dict["point"] = point
+
+        # =====================================================================
+        # Eval / Test 模式: 跳过 LNL，执行常规推理
+        # =====================================================================
+        if not self.training:
+            return_dict["seg_logits"] = seg_logits
+            if "segment" in input_dict.keys():
+                return_dict["loss"] = self.criteria(seg_logits, input_dict["segment"])
+            return return_dict
+
+        # =====================================================================
+        # Train 模式: ICL-DeepLA V4.0 核心抗噪计算
+        # =====================================================================
+        target = input_dict["segment"]
+        valid_mask = (target != self.ignore_index)
+        
+        from pointspace.engines.hooks.misc import RuntimeInfoHook
+        current_epoch = RuntimeInfoHook.state.get("epoch", 0)
+
+        # -----------------------------------------------------------
+        # [步骤 A]: 提取 Encoder 所有辅助分支预测
+        # -----------------------------------------------------------
+        aux_logits_list = []
+        if self.aux_heads and hasattr(point, "aux_outputs"):
+            for i, aux_points in enumerate(point.aux_outputs[:len(self.aux_heads)]):
+                aux_coord, aux_feat, aux_offset = aux_points
+                # fp32 interpolation to avoid nan in amp
+                import torch
+                with torch.amp.autocast('cuda', enabled=False):
+                    interpolated_feat = self.pointops.interpolation(
+                        aux_coord.float(), origin_coord.float(), aux_feat.float(), aux_offset, origin_offset
+                    )
+                aux_logits_list.append(self.aux_heads[i](interpolated_feat))
+
+
+        robust_weight = torch.ones_like(target, dtype=torch.float32)
+        clean_target = target.clone()
+        pseudo_loss = (seg_logits.sum() * 0.0) # DDP 兼容预埋梯度
+        
+        current_alpha = self.get_dynamic_alpha(current_epoch)
+
+        if current_alpha > 0:
+            # =======================================================
+            # [步骤 B]: CDCS 与 空间一致性平滑 (Spatial Consistency)
+            # =======================================================
+            shallow_idx, bottleneck_idx = self.shallow_stage - 1, self.bottleneck_stage - 1
+            
+            if len(aux_logits_list) > bottleneck_idx:
+                shallow_logits = aux_logits_list[shallow_idx]
+                bottleneck_logits = aux_logits_list[bottleneck_idx]
+                
+                P_shallow = F.softmax(shallow_logits.detach(), dim=-1)
+                kl_div = F.kl_div(F.log_softmax(bottleneck_logits, dim=-1), P_shallow, reduction='none').sum(dim=-1)
+                kl_div = torch.clamp(kl_div, max=5.0)
+                
+                # 原始独立置信度
+                raw_weight = torch.exp(-current_alpha * kl_div)
+                
+                # 【V4.0 核心】: 引入 KNN 进行局部空间平滑，完美挽救物理边界难例
+                if self.k_neighbors > 0:
+                    knn_idx, _ = self.pointops.knn_query(16, origin_coord.float(), origin_offset.int(), origin_coord.float(), origin_offset.int())
+                    knn_idx = knn_idx.long()
+                    
+                    local_weights = raw_weight[knn_idx] # [N, K]
+                    smoothed_weight = local_weights.mean(dim=1)
+                    # 融合: 当前点权重与局部邻域权重 1:1 混合
+                    robust_weight = 0.5 * raw_weight + 0.5 * smoothed_weight
+                else:
+                    robust_weight = raw_weight
+
+            # 极端恶劣的错标(<0.3)将被物理截断，其余靠标准 Loss 继续学习
+            noise_mask = (robust_weight < 0.3) & valid_mask
+            clean_target[noise_mask] = self.ignore_index
+
+            # =======================================================
+            # [步骤 C]: 多尺度预测不确定性计算 (Predictive Uncertainty)
+            # =======================================================
+            uncertainty = torch.ones_like(target, dtype=torch.float32)
+            if len(aux_logits_list) > 0:
+                probs = [F.softmax(logits.detach(), dim=-1) for logits in aux_logits_list]
+                mean_prob = sum(probs) / len(probs) # [N, C]
+                # 计算信息熵 (加 1e-6 防溢出)并归一化
+                entropy = -torch.sum(mean_prob * torch.log(mean_prob + 1e-6), dim=-1)
+                uncertainty = entropy / math.log(self.num_classes)
+
+            # 更新类别平均置信度
+            with torch.no_grad():
+                if valid_mask.any():
+                    P_deep_max = F.softmax(seg_logits.detach(), dim=-1).max(dim=-1)[0]
+                    for c in range(self.num_classes):
+                        c_mask = (target == c) & valid_mask
+                        if c_mask.any():
+                            self.class_confidences[c] = 0.99 * self.class_confidences[c] + 0.01 * P_deep_max[c_mask].mean()
+
+            # =======================================================
+            # [步骤 D]: PSSM 原型挖掘与自适应邻域打捞
+            # =======================================================
+            pred_labels = seg_logits.argmax(dim=-1)
+            
+            # D.1 极致纯净的原型更新: 
+            # 必须满足深浅共识高(>0.8) + 预测正确 + 【多尺度不确定性极低】(拒绝毒性注入)
+            clean_proto_mask = valid_mask & (robust_weight > 0.8) & (pred_labels == target) & (uncertainty < self.uncertainty_th)
+            
+            if clean_proto_mask.any():
+                clean_feats = final_feat[clean_proto_mask].detach()
+                clean_targets = target[clean_proto_mask]
+                
+                for c in range(self.num_classes):
+                    c_mask = (clean_targets == c)
+                    if c_mask.any():
+                        c_feat_mean = clean_feats[c_mask].mean(dim=0)
+                        if self.prototypes[c].abs().sum() == 0:
+                            self.prototypes[c] = c_feat_mean
+                        else:
+                            self.prototypes[c] = 0.99 * self.prototypes[c] + 0.01 * c_feat_mean
+
+            # -----------------------------------------------------------
+            # [步骤 D/E.2]: 从 ignore_index 点池中打捞长尾地物
+            # -----------------------------------------------------------
+            unclass_mask = (target == self.ignore_index)
+            if unclass_mask.any() and self.prototypes.abs().sum() > 0:
+                unclass_feats = final_feat[unclass_mask]
+                norm_feats = F.normalize(unclass_feats, p=2, dim=-1)
+                norm_protos = F.normalize(self.prototypes, p=2, dim=-1)
+                
+                # 计算余弦相似度矩阵 [M, C]
+                sim_matrix = torch.mm(norm_feats, norm_protos.t())
+                max_sim, pseudo_labels = sim_matrix.max(dim=-1) # pseudo_labels 长度为 M (例如 8813)
+                
+                # [自适应阈值过滤]
+                adaptive_thresholds = self.base_tau_pseudo * self.class_confidences
+                point_thresholds = adaptive_thresholds[pseudo_labels] 
+                confident_mask = max_sim > point_thresholds
+                
+                # ==========================================================
+                # 🚀 V4.0 空间一致性校验 (Spatial Consistency Check)
+                # ==========================================================
+                if confident_mask.any():
+                    # 1. 获取全局的硬预测 (长度 N = 98103)
+                    full_preds = seg_logits.argmax(dim=-1)
+                    
+                    # 2. 专门提取这 M 个未分类点的 16 个邻居索引 [M, 16]
+                    unclass_knn_idx = knn_idx[unclass_mask]
+                    
+                    # 3. 获取这 16 个邻居在全局地图中的预测类别 [M, 16]
+                    neighbor_preds = full_preds[unclass_knn_idx]
+                    
+                    # 4. 统计 16 个邻居中，有几个和当前拟定的 pseudo_labels 一致？
+                    # pseudo_labels.unsqueeze(1) 变成 [M, 1] 以便触发广播机制
+                    match_count = (neighbor_preds == pseudo_labels.unsqueeze(1)).sum(dim=1) # [M]
+                    
+                    # 5. 终极防线：不仅要余弦相似度高，且邻居中至少有 3 个点支持它！(防止孤立噪点)
+                    confident_mask = confident_mask & (match_count >= 3)
+                # ==========================================================
+
+                # 如果校验后依然有幸存的真实长尾点，则计算 Loss
+                if confident_mask.any():
+                    p_logits = seg_logits[unclass_mask][confident_mask]
+                    p_targets = pseudo_labels[confident_mask]
+                    pseudo_loss = F.cross_entropy(p_logits, p_targets) * self.pseudo_weight
+
+                if confident_mask.any():
+                    p_logits = seg_logits[unclass_mask][confident_mask]
+                    p_targets = pseudo_labels[confident_mask]
+                    pseudo_loss = F.cross_entropy(p_logits, p_targets) * self.pseudo_weight
+
+        # =====================================================================
+        # 3. 极度优雅的 Loss 派发
+        # =====================================================================
+        main_loss = self.criteria(seg_logits, clean_target)
+        
+        aux_loss = (seg_logits.sum() * 0.0)
+        if len(aux_logits_list) > 0 and self.aux_criteria is not None:
+            for i, aux_logits in enumerate(aux_logits_list):
+                stage_loss = self.aux_criteria(aux_logits, clean_target)
+                aux_loss = aux_loss + stage_loss * self.aux_weights[i]
+
+        total_loss = main_loss + aux_loss + pseudo_loss
+        
+        return_dict["loss"] = total_loss
+        return_dict["l_aux"] = aux_loss
+        return_dict["l_pseudo"] = pseudo_loss
+        
+        current_epoch = RuntimeInfoHook.state.get("epoch", 0)
+        global_step = RuntimeInfoHook.state.get("global_step", 0)
+        
+        # 只在度过热身期，且达到指定间隔时触发，防止硬盘爆炸
+        if current_epoch >= self.warmup_epochs and global_step % 35 == 0:
+            import os
+            import numpy as np
+            
+            dump_dir = "debug_dumps"
+            os.makedirs(dump_dir, exist_ok=True)
+            
+            # 1. 基础信息导出
+            coord_np = origin_coord.detach().cpu().numpy()
+            target_np = target.detach().cpu().numpy()
+            pred_np = seg_logits.argmax(dim=-1).detach().cpu().numpy()
+            
+            # 2. CDCS 抗噪信息导出
+            weight_np = robust_weight.detach().cpu().numpy()
+            # 注意 kl_div 之前可能被 clamp 过，这里导出真实的
+            kl_np = kl_div.detach().cpu().numpy() if 'kl_div' in locals() else np.zeros_like(weight_np)
+            
+            # 3. PSSM 伪标签信息导出 (需要把局部子集映射回全局 N 长度)
+            full_pseudo = np.full_like(target_np, -1) # 默认全为 -1
+            if 'unclass_mask' in locals() and 'confident_mask' in locals() and confident_mask.any():
+                # 极其严谨的全局索引映射
+                unclass_indices = torch.nonzero(unclass_mask, as_tuple=True)[0]
+                confident_global_indices = unclass_indices[confident_mask]
+                full_pseudo[confident_global_indices.cpu().numpy()] = p_targets.cpu().numpy()
+                
+            # 保存为 npz 压缩包
+            dump_path = os.path.join(dump_dir, f"epoch_{current_epoch}_step_{global_step}.npz")
+            np.savez(dump_path, 
+                     coord=coord_np, 
+                     target=target_np, 
+                     pred=pred_np, 
+                     weight=weight_np, 
+                     kl=kl_np,
+                     pseudo=full_pseudo)
+            # print(f"\n[Diagnostic Probe] Saved intermediate tensors to {dump_path}")
+
+        return return_dict
+
+# @MODELS.register_module()
+# class DeepLNLSegmentor(nn.Module):
+#     """
+#     DeepLANet 噪声标签学习 (LNL) 终极 Segmentor: ICL-DeepLA
+    
+#     核心创新:
+#     1. 打破跳跃连接悖论: 严格在 Encoder 内部 (Bottleneck vs Shallow) 计算跨层一致性。
+#     2. 标签靶向净化: 动态生成抗噪掩码，为下游标准 Loss 提供 "clean_target"，彻底解耦。
+#     3. 混合深监督 (HDS) 免疫: 所有的辅助探头同样使用 clean_target，防止噪声污染深层特征。
+#     4. 原型自相似挖掘 (PSSM): 从未分类点中动态打捞长尾地物。
+#     """
+
+#     def __init__(
+#         self,
+#         num_classes,
+#         backbone_out_channels,
+#         backbone=None,
+#         criteria=None,
+#         aux_criteria=None,
+#         aux_channels=None,
+#         aux_dropout=0.1,
+#         aux_weights=None,
+#         freeze_backbone=False,
+        
+#         # --- ICL-DeepLA 专属核心超参数 ---
+#         shallow_stage=2,      # 物理 Stage 2 (提供纯净局部几何先验)
+#         bottleneck_stage=4,   # 物理 Stage 4 (Encoder最深处，提供纯净全局语义)
+#         alpha=2.0,            # CDCS 散度衰减系数 (2.0为经验甜点值)
+#         tau_pseudo=0.85,      # PSSM 伪标签打捞的余弦相似度阈值
+#         pseudo_weight=0.1,    # PSSM 伪标签损失权重 (软正则化)
+#         ignore_index=-1,     # 数据集中的未分类/忽略标签 ID (支持设置为 -1)
+#         warmup_epochs=10,     # 前 N 个 epoch 跳过 LNL 相关逻辑，直接使用原始标签训练
+#     ):
+#         super().__init__()
+#         import pointops
+#         self.pointops = pointops
+#         self.num_classes = num_classes
+
+#         # LNL 专属参数赋值
+#         self.shallow_stage = shallow_stage
+#         self.bottleneck_stage = bottleneck_stage
+#         self.alpha = alpha
+#         self.tau_pseudo = tau_pseudo
+#         self.pseudo_weight = pseudo_weight
+#         self.ignore_index = ignore_index
+#         self.warmup_epochs = warmup_epochs
+
+#         # ==========================================================
+#         # 1. 基础网络与损失模块构建
+#         # ==========================================================
+#         self.backbone = build_model(backbone)
+#         self.criteria = build_criteria(criteria)
+#         self.aux_criteria = build_criteria(aux_criteria) if aux_criteria else None
+        
+#         if freeze_backbone:
+#             for p in self.backbone.parameters():
+#                 p.requires_grad = False
+
+#         # 主分割头 (接在 Decoder 最终输出上)
+#         self.seg_head = nn.Linear(backbone_out_channels, num_classes) if num_classes > 0 else nn.Identity()
+
+#         # 动态创建 Encoder 的辅助探头 (混合深监督 HDS)
+#         self.aux_heads = None
+#         self.aux_weights = None
+#         if aux_channels is not None and len(aux_channels) > 0:
+#             self.aux_heads = nn.ModuleList()
+#             for ch in aux_channels:
+#                 self.aux_heads.append(nn.Sequential(
+#                     nn.Dropout(p=aux_dropout),
+#                     nn.Linear(ch, num_classes)
+#                 ))
+            
+#             if aux_weights is not None:
+#                 assert len(aux_weights) == len(aux_channels)
+#                 self.aux_weights = aux_weights
+#             else:
+#                 self.aux_weights = tuple([1.0] * len(aux_channels))
+
+#         # ==========================================================
+#         # 2. PSSM 注册特征原型缓冲 (不参与梯度回传)
+#         # ==========================================================
+#         self.register_buffer('prototypes', torch.zeros(num_classes, backbone_out_channels))
+
+
+#     def forward(self, input_dict, return_point=False):
+#         point = Point(input_dict)
+#         origin_coord = point.coord.clone()
+#         origin_offset = point.offset.clone()
+
+#         # [主干前向传播]
+#         point = self.backbone(point)
+
+#         # 剥离 Pooling 层级获取解码器最终特征
+#         if isinstance(point, Point):
+#             while "pooling_parent" in point.keys():
+#                 assert "pooling_inverse" in point.keys()
+#                 parent = point.pop("pooling_parent")
+#                 inverse = point.pop("pooling_inverse")
+#                 parent.feat = torch.cat([parent.feat, point.feat[inverse]], dim=-1)
+#                 point = parent
+#             final_feat = point.feat
+#         else:
+#             final_feat = point
+
+#         # 主预测输出 (Decoder Logits)
+#         seg_logits = self.seg_head(final_feat)
+
+#         return_dict = dict()
+#         if return_point:
+#             return_dict["point"] = point
+
+#         # =====================================================================
+#         # Eval / Test 模式: 跳过 LNL，执行常规推理
+#         # =====================================================================
+#         if not self.training:
+#             return_dict["seg_logits"] = seg_logits
+#             if "segment" in input_dict.keys():
+#                 return_dict["loss"] = self.criteria(seg_logits, input_dict["segment"])
+#             return return_dict
+
+#         # =====================================================================
+#         # Train 模式: ICL-DeepLA 内生抗噪计算
+#         # =====================================================================
+#         target = input_dict["segment"]
+#         valid_mask = (target != self.ignore_index)
+        
+#         # 获取最新的 RuntimeInfoHook.state，如果未注入则给个默认保护
+#         from pointspace.engines.hooks.misc import RuntimeInfoHook
+#         current_epoch = RuntimeInfoHook.state.get("epoch", 0)
+
+#         # -----------------------------------------------------------
+#         # [步骤 A]: 提取 Encoder 所有辅助分支预测 (并插值回原始分辨率)
+#         # -----------------------------------------------------------
+#         aux_logits_list = []
+#         if self.aux_heads and hasattr(point, "aux_outputs"):
+#             for i, aux_points in enumerate(point.aux_outputs[:len(self.aux_heads)]):
+#                 aux_coord, aux_feat, aux_offset = aux_points
+#                 interpolated_feat = self.pointops.interpolation(
+#                     aux_coord, origin_coord, aux_feat, aux_offset, origin_offset
+#                 )
+#                 aux_logits_list.append(self.aux_heads[i](interpolated_feat))
+
+
+#         robust_weight = torch.ones_like(target, dtype=torch.float32)
+#         clean_target = target.clone()
+#         pseudo_loss = torch.tensor(0.0, device=seg_logits.device)
+        
+#         # 只有过了 warmup_epochs 后，才执行噪声过滤与打捞 (步骤 BCD)
+#         if current_epoch >= self.warmup_epochs:
+#             # -----------------------------------------------------------
+#             # [步骤 B]: CDCS (跨深度一致性) —— 打破跳跃连接悖论
+#             # -----------------------------------------------------------
+#             shallow_idx = self.shallow_stage - 1       # 默认 1 (Stage 2)
+#             bottleneck_idx = self.bottleneck_stage - 1 # 默认 3 (Stage 4)
+            
+#             if len(aux_logits_list) > bottleneck_idx:
+#                 shallow_logits = aux_logits_list[shallow_idx]
+#                 bottleneck_logits = aux_logits_list[bottleneck_idx]
+                
+#                 # Encoder最深处语义(被测绘标签误导) vs Encoder浅层几何(纯净)
+#                 P_shallow = F.softmax(shallow_logits.detach(), dim=-1) # 必须阻断梯度!
+#                 kl_div = F.kl_div(
+#                     F.log_softmax(bottleneck_logits, dim=-1), 
+#                     P_shallow, 
+#                     reduction='none'
+#                 ).sum(dim=-1)
+#                 kl_div = torch.clamp(kl_div, max=5.0)
+#                 robust_weight = torch.exp(-self.alpha * kl_div)
+
+#             # -----------------------------------------------------------
+#             # [步骤 C]: 动态 Target 净化 (为 Loss 解耦)
+#             # -----------------------------------------------------------
+#             # KL 散度极大(权重<0.3)的明确错标点，将其强行丢入 ignore_index 排污槽
+#             noise_mask = (robust_weight < 0.3) & valid_mask
+#             clean_target[noise_mask] = self.ignore_index
+
+#             # -----------------------------------------------------------
+#             # [步骤 D]: PSSM (原型自相似挖掘) —— 解决长尾漏标
+#             # -----------------------------------------------------------
+#             # D.1 动态 EMA 更新类原型 (仅使用置信度 > 0.8 的绝对干净点)
+#             clean_proto_mask = valid_mask & (robust_weight > 0.8)
+#             if clean_proto_mask.any():
+#                 clean_feats = final_feat[clean_proto_mask].detach()
+#                 clean_targets = target[clean_proto_mask]
+                
+#                 for c in range(self.num_classes):
+#                     c_mask = (clean_targets == c)
+#                     if c_mask.any():
+#                         c_feat_mean = clean_feats[c_mask].mean(dim=0)
+#                         if self.prototypes[c].sum() == 0:
+#                             self.prototypes[c] = c_feat_mean
+#                         else:
+#                             self.prototypes[c] = 0.99 * self.prototypes[c] + 0.01 * c_feat_mean
+
+#             # D.2 从 ignore_index 点池中打捞高置信度长尾地物
+#             unclass_mask = (target == self.ignore_index)
+#             # 注意: 确保原型已被初始化 (非全零) 才开始打捞
+#             if unclass_mask.any() and self.prototypes.abs().sum() > 0:
+#                 unclass_feats = final_feat[unclass_mask]
+#                 norm_feats = F.normalize(unclass_feats, p=2, dim=-1)
+#                 norm_protos = F.normalize(self.prototypes, p=2, dim=-1)
+                
+#                 # 计算余弦相似度矩阵 [N_unclass, C]
+#                 sim_matrix = torch.mm(norm_feats, norm_protos.t())
+#                 max_sim, pseudo_labels = sim_matrix.max(dim=-1)
+                
+#                 confident_mask = max_sim > self.tau_pseudo
+#                 if confident_mask.any():
+#                     p_logits = seg_logits[unclass_mask][confident_mask]
+#                     p_targets = pseudo_labels[confident_mask]
+#                     # 单独计算打捞补偿损失
+#                     pseudo_loss = F.cross_entropy(p_logits, p_targets) * self.pseudo_weight
+
+#         # =====================================================================
+#         # 3. 极度优雅的 Loss 派发 (完全不污染 criteria 的内部代码)
+#         # =====================================================================
+#         # 主损失 (传入被净化过的 clean_target)
+#         main_loss = self.criteria(seg_logits, clean_target)
+        
+#         # 辅助损失 (HDS 分支全部受到抗噪掩码的保护)
+#         aux_loss = torch.tensor(0.0, device=seg_logits.device)
+#         if len(aux_logits_list) > 0 and self.aux_criteria is not None:
+#             for i, aux_logits in enumerate(aux_logits_list):
+#                 stage_loss = self.aux_criteria(aux_logits, clean_target)
+#                 aux_loss = aux_loss + stage_loss * self.aux_weights[i]
+
+#         total_loss = main_loss + aux_loss + pseudo_loss
+        
+#         return_dict["loss"] = total_loss
+#         return_dict["l_aux"] = aux_loss
+#         return_dict["l_pseudo"] = pseudo_loss
+        
+#         return return_dict
 
 
 @MODELS.register_module()

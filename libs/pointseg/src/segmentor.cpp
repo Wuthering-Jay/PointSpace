@@ -48,7 +48,7 @@ bool operator<(const edge &a, const edge &b) {
 }
 
 // Segment graph implementation
-universe *segment_graph(int num_vertices, int num_edges, edge *edges, float c) {
+universe *segment_graph(int num_vertices, int num_edges, edge *edges, float c, int segMaxVerts) {
   std::sort(edges, edges + num_edges);      // sort edges by weight
   universe *u = new universe(num_vertices); // make a disjoint-set forest
   float *threshold = new float[num_vertices];
@@ -62,7 +62,9 @@ universe *segment_graph(int num_vertices, int num_edges, edge *edges, float c) {
     int a = u->find(pedge->a);
     int b = u->find(pedge->b);
     if (a != b) {
-      if ((pedge->w <= threshold[a]) && (pedge->w <= threshold[b])) {
+      // Check max size constraint: if segMaxVerts > 0, ensure merged size doesn't exceed limit
+      bool sizeOk = (segMaxVerts <= 0) || (u->size(a) + u->size(b) <= segMaxVerts);
+      if (sizeOk && (pedge->w <= threshold[a]) && (pedge->w <= threshold[b])) {
         u->join(a, b);
         a = u->find(a);
         threshold[a] = pedge->w + (c / u->size(a));
@@ -235,7 +237,8 @@ vector<int> segment_point_kernel(const float *points_ptr,
                                 const int64_t *edges_ptr,
                                 const size_t edgeCount,
                                 const float kthr,
-                                const int segMinVerts) {
+                                const int segMinVerts,
+                                const int segMaxVerts) {
   // create points, normals, edges, counts vectors
   vector<vec3f> points(pointCount);
   vector<vec3f> normals(pointCount);
@@ -278,13 +281,18 @@ vector<int> segment_point_kernel(const float *points_ptr,
     edges[i].w = ww;
   }
 
-  universe *u = segment_graph(pointCount, edgeCount, edges, kthr);
+  universe *u = segment_graph(pointCount, edgeCount, edges, kthr, segMaxVerts);
 
+  // Joining small segments (respecting max size constraint)
   for (int j = 0; j < edgeCount; j++) {
     int a = u->find(edges[j].a);
     int b = u->find(edges[j].b);
     if ((a != b) && ((u->size(a) < segMinVerts) || (u->size(b) < segMinVerts))) {
-      u->join(a, b);
+      // Check max size constraint before merging
+      bool sizeOk = (segMaxVerts <= 0) || (u->size(a) + u->size(b) <= segMaxVerts);
+      if (sizeOk) {
+        u->join(a, b);
+      }
     }
   }
 
@@ -299,7 +307,7 @@ vector<int> segment_point_kernel(const float *points_ptr,
 }
 
 // Segment point implementation
-torch::Tensor segment_point(torch::Tensor vertices, torch::Tensor normals, torch::Tensor edges, float kthr, int segMinVerts) {
+torch::Tensor segment_point(torch::Tensor vertices, torch::Tensor normals, torch::Tensor edges, float kthr, int segMinVerts, int segMaxVerts) {
   float *vertices_ptr = vertices.data_ptr<float>();
   float *normals_ptr = normals.data_ptr<float>();
   int64_t *edges_ptr = edges.data_ptr<int64_t>();
@@ -312,7 +320,8 @@ torch::Tensor segment_point(torch::Tensor vertices, torch::Tensor normals, torch
                                           edges_ptr,
                                           edgeCount,
                                           kthr,
-                                          segMinVerts);
+                                          segMinVerts,
+                                          segMaxVerts);
 
   torch::Tensor result_index = torch::empty({int64_t(pointCount)}, torch::TensorOptions().dtype(torch::kInt64));
   int64_t *result_ptr = result_index.data_ptr<int64_t>();

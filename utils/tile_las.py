@@ -18,11 +18,12 @@ import multiprocessing
 from pathlib import Path
 from typing import Union, List, Tuple, Optional
 from tqdm import tqdm
-from sklearn.neighbors import KDTree
+from sklearn.neighbors import KDTree, NearestNeighbors
 from scipy.spatial import cKDTree
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 import logging
 import open3d as o3d
+import torch
 
 # Try to import pointspace logger, fallback to standard logging
 try:
@@ -37,11 +38,106 @@ except ImportError:
         )
         return logging.getLogger(__name__)
 
+# Try to import pointseg for superpoint segmentation
+try:
+    from pointseg.functions import segment_point
+    POINTSEG_AVAILABLE = True
+except ImportError:
+    POINTSEG_AVAILABLE = False
+
+
+def _compute_sp_for_single_tile(tile_path, sp_params):
+    """
+    为单个 tile 计算超点（模块级函数，支持多进程）
+
+    Args:
+        tile_path: tile 文件路径
+        sp_params: 超点计算参数字典
+
+    Returns:
+        结果字典
+    """
+    try:
+        # 读取 tile
+        with laspy.open(tile_path) as fh:
+            las = fh.read()
+
+        # 获取坐标
+        points = np.vstack((las.x, las.y, las.z)).transpose()
+        N = len(points)
+
+        # 应用 Z 轴敏感度调整
+        z_sensitivity = sp_params['z_sensitivity']
+        if z_sensitivity != 1.0:
+            xyz_scaled = points.copy()
+            xyz_scaled[:, 2] *= z_sensitivity
+        else:
+            xyz_scaled = points
+
+        # 计算法向量
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(xyz_scaled)
+        pcd.estimate_normals(
+            search_param=o3d.geometry.KDTreeSearchParamHybrid(
+                radius=sp_params['normal_radius'], max_nn=30
+            )
+        )
+        pcd.orient_normals_towards_camera_location([0., 0., 0.])
+        normals = np.asarray(pcd.normals).astype(np.float32)
+
+        # 构建 KNN 拓扑图
+        edge_k = sp_params['edge_k']
+        nbrs = NearestNeighbors(
+            n_neighbors=edge_k + 1,
+            algorithm='kd_tree',
+            n_jobs=1
+        ).fit(xyz_scaled)
+        _, indices = nbrs.kneighbors(xyz_scaled)
+
+        source_nodes = np.repeat(np.arange(N), edge_k)
+        target_nodes = indices[:, 1:].flatten()
+        edges = np.vstack((source_nodes, target_nodes)).T
+
+        # 执行 C++ 超点分割
+        vertices_tensor = torch.tensor(xyz_scaled, dtype=torch.float32)
+        normals_tensor = torch.tensor(normals, dtype=torch.float32)
+        edges_tensor = torch.tensor(edges, dtype=torch.int64)
+
+        sp_idx_tensor = segment_point(
+            vertices=vertices_tensor,
+            normals=normals_tensor,
+            edges=edges_tensor,
+            kThresh=sp_params['kThresh'],
+            segMinVerts=sp_params['segMinVerts'],
+            segMaxVerts=sp_params['segMaxVerts']
+        )
+
+        sp_idx = sp_idx_tensor.numpy().astype(np.int32)
+
+        # 更新文件
+        las.superpoint = sp_idx
+        las.write(tile_path)
+
+        return {
+            'status': 'success',
+            'filename': tile_path.name,
+            'num_points': N,
+            'num_superpoints': len(np.unique(sp_idx))
+        }
+    except Exception as e:
+        import traceback
+        return {
+            'status': 'error',
+            'filename': tile_path.name if hasattr(tile_path, 'name') else str(tile_path),
+            'error': str(e),
+            'traceback': traceback.format_exc()
+        }
+
 
 class LASTileProcessor:
     """
     LAS/LAZ 点云分块处理器
-    
+
     Args:
         input_path: 输入 LAS/LAZ 文件或目录
         output_dir: 输出目录
@@ -59,9 +155,21 @@ class LASTileProcessor:
                        False=在分割后的每个tile上计算（节省内存）
         hag_k_neighbors: IDW 插值使用的邻近地面点数量（默认 12）
         hag_power: IDW 插值的幂次（默认 2，即反距离平方）
-        
+
         calc_z_base: 是否利用 CSF 计算深度学习基准面 (Z_base)
         z_base_on_source: 是否在源点云上全局计算基准面（强烈建议 True，消除块间断层）
+
+        calc_superpoint: 是否计算超点分割 (Superpoint Segmentation)
+        superpoint_on_source: 是否在原始点云上计算超点
+                             - True: 在原始点云上计算好超点，然后 tile（避免边界效应）
+                             - False: 先完成所有 tile，然后批量并行计算所有 tile 的超点（更高效）
+        sp_kThresh: 分割阈值，越大块越大
+        sp_segMinVerts: 最小超点点数
+        sp_segMaxVerts: 最大超点点数（-1 表示不限制）
+        sp_edge_k: KNN 边数
+        sp_normal_radius: 法向量搜索半径
+        sp_z_sensitivity: Z 轴敏感度系数（>1 增强高度差异，<1 弱化）
+        sp_num_workers: 超点并行计算进程数（仅在 superpoint_on_source=False 时生效）
     """
     
     def __init__(
@@ -96,6 +204,16 @@ class LASTileProcessor:
         z_base_ptd_slope: float = 15.0,
         z_base_ptd_height: float = 0.25,
         z_base_ptd_slope_norm: bool = True,
+
+        calc_superpoint: bool = False,
+        superpoint_on_source: bool = False,
+        sp_kThresh: float = 0.01,
+        sp_segMinVerts: int = 5,
+        sp_segMaxVerts: int = 8192,
+        sp_edge_k: int = 10,
+        sp_normal_radius: float = 2.0,
+        sp_z_sensitivity: float = 2.5,
+        sp_num_workers: int = 4,
     ):
         self.input_path = Path(input_path)
         self.output_dir = Path(output_dir) if output_dir else self.input_path.parent / 'tiles'
@@ -134,6 +252,22 @@ class LASTileProcessor:
         self.z_base_ptd_height = z_base_ptd_height
         self.z_base_ptd_slope_norm = z_base_ptd_slope_norm
 
+        # Superpoint 参数
+        self.calc_superpoint = calc_superpoint
+        self.superpoint_on_source = superpoint_on_source
+        self.sp_kThresh = sp_kThresh
+        self.sp_segMinVerts = sp_segMinVerts
+        self.sp_segMaxVerts = sp_segMaxVerts
+        self.sp_edge_k = sp_edge_k
+        self.sp_normal_radius = sp_normal_radius
+        self.sp_z_sensitivity = sp_z_sensitivity
+        self.sp_num_workers = sp_num_workers
+
+        # 验证 pointseg 库可用性
+        if self.calc_superpoint and not POINTSEG_AVAILABLE:
+            raise ImportError("pointseg library is required for superpoint calculation. "
+                              "Please install it from libs/pointseg.")
+
         self.buffer_size = buffer_size
 
         self.logger = get_root_logger()
@@ -162,7 +296,7 @@ class LASTileProcessor:
             n_workers = max(1, multiprocessing.cpu_count() - 1)
 
         start_time = time.time()
-        
+
         self.logger.info(f"LAS Tile Processor started")
         self.logger.info(f"  Input: {self.input_path}")
         self.logger.info(f"  Output: {self.output_dir}")
@@ -176,7 +310,11 @@ class LASTileProcessor:
         if self.calc_z_base:
             mode = 'source' if self.z_base_on_source else 'tile'
             self.logger.info(f"  Z_base: enabled (denoise_radius={self.z_base_denoise_radius}m, ptd_radius={self.z_base_ptd_radius}m, mode={mode})")
-        
+        if self.calc_superpoint:
+            mode = 'source' if self.superpoint_on_source else 'tile-post'
+            self.logger.info(f"  Superpoint: enabled (kThresh={self.sp_kThresh}, maxVerts={self.sp_segMaxVerts}, z_sens={self.sp_z_sensitivity}, mode={mode})")
+
+        # 第一阶段：处理所有文件（tile + source 模式的特征计算）
         for idx, las_file in enumerate(self.las_files, 1):
             try:
                 self.process_file(las_file, n_workers=n_workers, file_idx=idx, total_files=len(self.las_files))
@@ -184,6 +322,14 @@ class LASTileProcessor:
                 self.logger.error(f"Failed to process {las_file.name}: {e}")
                 import traceback
                 traceback.print_exc()
+
+        # 第二阶段：如果启用 superpoint 且为 tile-post 模式，批量计算所有 tile 的 superpoint
+        if self.calc_superpoint and not self.superpoint_on_source:
+            self.logger.info("")
+            self.logger.info("="*60)
+            self.logger.info("Starting batch superpoint computation for all tiles...")
+            self.logger.info("="*60)
+            self._compute_superpoints_for_all_tiles()
 
         elapsed = time.time() - start_time
         self.logger.info(f"Processing completed in {elapsed:.2f}s")
@@ -229,6 +375,15 @@ class LASTileProcessor:
             source_normals = self._compute_normals(points, classification=src_cls)
             self.logger.info(f"  Normals computed in {time.time() - normals_start:.2f}s")
 
+        # 2.4 在原始点云上计算超点分割（如果启用且选择 source 模式）
+        source_superpoint = None
+        if self.calc_superpoint and self.superpoint_on_source:
+            self.logger.info(f"  Computing superpoint on source point cloud...")
+            sp_start = time.time()
+            source_superpoint = self._compute_superpoint(points)
+            n_sp = len(np.unique(source_superpoint))
+            self.logger.info(f"  Superpoint computed in {time.time() - sp_start:.2f}s, {n_sp} segments")
+
         
         # 3. 滑动窗口切块 (获取索引列表)
         segments_indices, stats_list = self._segment_point_cloud(points, n_workers=n_workers)
@@ -241,7 +396,7 @@ class LASTileProcessor:
             self.logger.info(f"  Generated {total_segs} tiles")
         
         # 4. 保存分块
-        self._save_tiles(las_file, las_data, segments_indices, points, source_hag, source_z_base, source_normals)
+        self._save_tiles(las_file, las_data, segments_indices, points, source_hag, source_z_base, source_normals, source_superpoint)
         
         elapsed = time.time() - file_start
         self.logger.info(f"  Completed in {elapsed:.2f}s")
@@ -687,10 +842,135 @@ class LASTileProcessor:
         self.logger.info(f"    Z_base computed in {time.time() - start_time:.2f}s")
         return z_base.astype(np.float32)
 
+    def _compute_superpoint(self, points: np.ndarray) -> np.ndarray:
+        """
+        计算超点分割 (Superpoint Segmentation)
+
+        使用基于图的分割算法，将点云划分为几何上连贯的超点块。
+
+        Args:
+            points: 点云坐标 (N, 3)
+
+        Returns:
+            超点索引数组 (N,)，每个点的超点 ID
+        """
+        N = len(points)
+
+        # 应用 Z 轴敏感度调整
+        if self.sp_z_sensitivity != 1.0:
+            xyz_scaled = points.copy()
+            xyz_scaled[:, 2] *= self.sp_z_sensitivity
+        else:
+            xyz_scaled = points
+
+        # 计算法向量
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(xyz_scaled)
+        pcd.estimate_normals(
+            search_param=o3d.geometry.KDTreeSearchParamHybrid(
+                radius=self.sp_normal_radius, max_nn=30
+            )
+        )
+        pcd.orient_normals_towards_camera_location([0., 0., 0.])
+        normals = np.asarray(pcd.normals).astype(np.float32)
+
+        # 构建 KNN 拓扑图
+        nbrs = NearestNeighbors(
+            n_neighbors=self.sp_edge_k + 1,
+            algorithm='kd_tree',
+            n_jobs=1
+        ).fit(xyz_scaled)
+        _, indices = nbrs.kneighbors(xyz_scaled)
+
+        source_nodes = np.repeat(np.arange(N), self.sp_edge_k)
+        target_nodes = indices[:, 1:].flatten()
+        edges = np.vstack((source_nodes, target_nodes)).T
+
+        # 执行 C++ 超点分割
+        vertices_tensor = torch.tensor(xyz_scaled, dtype=torch.float32)
+        normals_tensor = torch.tensor(normals, dtype=torch.float32)
+        edges_tensor = torch.tensor(edges, dtype=torch.int64)
+
+        sp_idx_tensor = segment_point(
+            vertices=vertices_tensor,
+            normals=normals_tensor,
+            edges=edges_tensor,
+            kThresh=self.sp_kThresh,
+            segMinVerts=self.sp_segMinVerts,
+            segMaxVerts=self.sp_segMaxVerts
+        )
+
+        return sp_idx_tensor.numpy().astype(np.int32)
+
+    def _compute_superpoints_for_all_tiles(self):
+        """
+        批量并行计算所有 tile 的超点分割（tile-post 模式）
+        """
+        # 收集所有已生成的 tile 文件
+        tile_files = list(self.output_dir.glob(f'*.{self.output_format}'))
+
+        if not tile_files:
+            self.logger.warning("  No tile files found, skipping superpoint computation.")
+            return
+
+        self.logger.info(f"  Found {len(tile_files)} tile files to process")
+        self.logger.info(f"  Using {self.sp_num_workers} parallel workers")
+
+        start_time = time.time()
+
+        # 超点参数字典
+        sp_params = {
+            'kThresh': self.sp_kThresh,
+            'segMinVerts': self.sp_segMinVerts,
+            'segMaxVerts': self.sp_segMaxVerts,
+            'edge_k': self.sp_edge_k,
+            'normal_radius': self.sp_normal_radius,
+            'z_sensitivity': self.sp_z_sensitivity
+        }
+
+        # 并行处理
+        completed = 0
+        errors = []
+        success_count = 0
+
+        if self.sp_num_workers <= 1:
+            # 串行模式
+            self.logger.info("  Processing in serial mode...")
+            for tile_path in tqdm(tile_files, desc="  Computing superpoints"):
+                result = _compute_sp_for_single_tile(tile_path, sp_params)
+                if result['status'] == 'success':
+                    success_count += 1
+                else:
+                    errors.append(result)
+        else:
+            # 并行模式
+            with ProcessPoolExecutor(max_workers=self.sp_num_workers) as executor:
+                futures = {executor.submit(_compute_sp_for_single_tile, tile_path, sp_params): tile_path
+                          for tile_path in tile_files}
+
+                for future in tqdm(as_completed(futures), total=len(tile_files), desc="  Computing superpoints"):
+                    result = future.result()
+                    completed += 1
+                    if result['status'] == 'success':
+                        success_count += 1
+                    else:
+                        errors.append(result)
+                        self.logger.error(f"    Failed: {result['filename']} - {result['error']}")
+
+        elapsed = time.time() - start_time
+        self.logger.info(f"  Superpoint computation completed in {elapsed:.2f}s")
+        self.logger.info(f"  Success: {success_count}/{len(tile_files)}, Failed: {len(errors)}")
+
+        if errors:
+            self.logger.warning(f"  {len(errors)} tiles failed superpoint computation")
+            for err in errors[:5]:  # 只显示前 5 个错误
+                self.logger.warning(f"    - {err['filename']}: {err['error']}")
+
     def _save_tiles(self, las_file: Path, las_data: laspy.LasData,
                     segments: List[Tuple[np.ndarray, np.ndarray]],
                     points: np.ndarray = None, source_hag: np.ndarray = None,
-                    source_z_base: np.ndarray = None, source_normals: np.ndarray = None):
+                    source_z_base: np.ndarray = None, source_normals: np.ndarray = None,
+                    source_superpoint: np.ndarray = None):
         """
         保存分块为 LAS/LAZ 文件
 
@@ -702,6 +982,7 @@ class LASTileProcessor:
             source_hag: 在源点云上预计算的 HAG 值（source 模式）
             source_z_base: 在源点云上预计算的 Z_base 值（source 模式）
             source_normals: 在源点云上预计算的法向量（source 模式）
+            source_superpoint: 在源点云上预计算的超点索引（source 模式）
         """
         base_name = las_file.stem
         ext = f".{self.output_format}"
@@ -719,6 +1000,7 @@ class LASTileProcessor:
         need_hag = self.calc_hag
         need_z_base = self.calc_z_base
         need_normal = self.calc_normals
+        need_superpoint = self.calc_superpoint
         
         for i, (indices, core_bbox) in enumerate(tqdm(segments, desc="  Saving tiles", leave=False)):
             if len(indices) == 0:
@@ -790,6 +1072,14 @@ class LASTileProcessor:
                     header.add_extra_dim(laspy.ExtraBytesParams(name="normal_y", type=np.float32, description="Normal Vector Y"))
                 if 'normal_z' not in existing_names:
                     header.add_extra_dim(laspy.ExtraBytesParams(name="normal_z", type=np.float32, description="Normal Vector Z"))
+
+            # 添加 superpoint 字段
+            if need_superpoint and 'superpoint' not in existing_names:
+                header.add_extra_dim(laspy.ExtraBytesParams(
+                    name="superpoint",
+                    type=np.int32,
+                    description="Superpoint Segment ID"
+                ))
             
             # 创建新的 LAS 数据
             new_las = laspy.LasData(header)
@@ -799,7 +1089,7 @@ class LASTileProcessor:
             
             # 复制所有维度（除了我们要单独处理的）
             for dim_name in source_points.array.dtype.names:
-                if dim_name in ['orig_idx', 'hag', 'z_base']:
+                if dim_name in ['orig_idx', 'hag', 'z_base', 'superpoint']:
                     continue  # 跳过，后面单独写入
                 if dim_name in new_las.points.array.dtype.names:
                     new_las.points[dim_name] = source_points[dim_name]
@@ -835,10 +1125,20 @@ class LASTileProcessor:
                     # 如果在局部块计算，注意边缘可能出现畸变
                     tile_cls = np.array(source_points['classification']) if self.normal_class is not None else None
                     tile_normals = self._compute_normals(points[indices], classification=tile_cls)
-                
+
                 new_las.normal_x = tile_normals[:, 0]
                 new_las.normal_y = tile_normals[:, 1]
                 new_las.normal_z = tile_normals[:, 2]
+
+            # 写入 Superpoint
+            if need_superpoint:
+                if self.superpoint_on_source and source_superpoint is not None:
+                    # source 模式：使用预计算的超点索引
+                    tile_superpoint = source_superpoint[indices].astype(np.int32)
+                    new_las.superpoint = tile_superpoint
+                else:
+                    # tile-post 模式：暂时填充 -1，后续批量并行计算
+                    new_las.superpoint = np.full(len(indices), -1, dtype=np.int32)
             
             # 更新头文件统计信息
             new_las.update_header()
@@ -853,18 +1153,30 @@ class LASTileProcessor:
 if __name__ == "__main__":
     processor = LASTileProcessor(
         # 路径与格式配置
-        input_path=r"E:\data\LASDU\train_sparse",  # 原始数据路径
-        output_dir=r"E:\data\LASDU\tile\train_sparse", # 输出路径
+        input_path=r"E:\data\云南遥感中心\第二批\disk03\train\processed_其他073.las",  # 原始数据路径
+        output_dir=r"E:\data\云南遥感中心\第二批\disk03\processed_其他073", # 输出路径
         output_format='las',          # 输出格式
 
         # 分块参数
-        window_size=(100.0, 100.0),   # 分块大小
+        window_size=(200.0, 200.0),   # 分块大小
         overlap=True,                 # 启用重叠
         overlap_factor=1,             # 重叠因子
         min_points=5000,              # 最小点数
         max_points=None,              # 最大点数限制（None=不限制）
         save_orig_idx=True,           # 保存原始点索引
         buffer_size=0,
+
+        # Superpoint 超点分割参数
+        calc_superpoint=True,         # 启用超点分割
+        superpoint_on_source=False,   # False: 先 tile 再批量并行计算（推荐，更高效）
+                                      # True: 先在原始点云计算再 tile（避免边界效应）
+        sp_kThresh=0.005,              # 分割阈值，越大块越大
+        sp_segMinVerts=5,             # 最小超点点数
+        sp_segMaxVerts=4096,          # 最大超点点数（-1 表示不限制）
+        sp_edge_k=10,                 # KNN 边数
+        sp_normal_radius=2.0,         # 法向量搜索半径
+        sp_z_sensitivity=2.0,         # Z 轴敏感度（>1 增强高度差异）
+        sp_num_workers=8,             # 超点并行计算进程数（tile-post 模式）
 
         # 法向量参数
         calc_normals=False,           # 启用法向量计算
@@ -888,6 +1200,5 @@ if __name__ == "__main__":
         z_base_ptd_slope=15.0,        # 坡度阈值 (山区可设大，如20-30；城市设小，如10)
         z_base_ptd_height=0.25,       # 贴地精度阈值 (越小越贴地，但也容易漏掉微起伏)
         z_base_ptd_slope_norm=True,   # 是否对坡度进行归一化（推荐，适应不同地形）
-
     )
     processor.process_all_files()
