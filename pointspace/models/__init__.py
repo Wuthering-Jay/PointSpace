@@ -33,4 +33,5 @@ from .sonata import *
 from .concerto import *
 
 # EZ-SP (GPU-accelerated superpoint segmentation)
-from .ezsp import *
+from .backbone.ezsp import *
+from .segmentor import *
