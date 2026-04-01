@@ -15,37 +15,49 @@ from .builder import MODELS, build_model
 
 @MODELS.register_module()
 class DefaultSegmentor(nn.Module):
-    def __init__(self, backbone=None, criteria=None, sp_criteria=None):
+    def __init__(self, backbone=None, criteria=None, aux_criteria=None, aux_weights=None):
         super().__init__()
         self.backbone = build_model(backbone)
         self.criteria = build_criteria(criteria)
-        self.sp_criteria = build_criteria(sp_criteria) if sp_criteria else None
+        self.aux_criteria = build_criteria(aux_criteria) if aux_criteria else None
+        self.aux_weights = aux_weights
 
     def forward(self, input_dict):
         if "condition" in input_dict.keys():
             # PPT (https://arxiv.org/abs/2308.09718)
             # currently, only support one batch one condition
             input_dict["condition"] = input_dict["condition"][0]
-        seg_logits = self.backbone(input_dict)
+        
+        out = self.backbone(input_dict)
+        aux_logits_list = []
+        if isinstance(out, dict) and "seg_logits" in out:
+            seg_logits = out["seg_logits"]
+            aux_logits_list = out.get("aux_logits", [])
+        elif isinstance(out, tuple) and len(out) >= 2:
+            seg_logits, aux_logits_list = out[0], out[1]
+        else:
+            seg_logits = out
+
         # train
         if self.training:
             loss = self.criteria(seg_logits, input_dict["segment"])
+            return_dict = dict()
 
-            # 超点一致性损失（只在配置时才计算和显示）
-            if self.sp_criteria is not None and "superpoint" in input_dict:
-                superpoint = input_dict["superpoint"]
-                sp_loss = None
-                for sp_c in self.sp_criteria.criteria:
-                    sp_loss_item = sp_c(seg_logits, superpoint)
-                    if sp_loss is None:
-                        sp_loss = sp_loss_item
-                    else:
-                        sp_loss = sp_loss + sp_loss_item
-                if sp_loss is not None:
-                    loss = loss + sp_loss
-                    return dict(loss=loss, l_sp=sp_loss)
+            # 辅助损失
+            if len(aux_logits_list) > 0 and self.aux_criteria is not None:
+                aux_weights = self.aux_weights if self.aux_weights is not None else [1.0] * len(aux_logits_list)
+                aux_loss = 0.0
+                for i, aux_logits in enumerate(aux_logits_list):
+                    if i >= len(aux_weights):
+                        break
+                    stage_loss = self.aux_criteria(aux_logits, input_dict["segment"])
+                    weighted_loss = stage_loss * aux_weights[i]
+                    aux_loss = aux_loss + weighted_loss
+                loss = loss + aux_loss
+                return_dict["l_aux"] = aux_loss
 
-            return dict(loss=loss)
+            return_dict["loss"] = loss
+            return return_dict
         # eval
         elif "segment" in input_dict.keys():
             loss = self.criteria(seg_logits, input_dict["segment"])
@@ -63,10 +75,16 @@ class DefaultSegmentorV2(nn.Module):
         backbone_out_channels,
         backbone=None,
         criteria=None,
-        sp_criteria=None,
+        aux_criteria=None,
+        aux_channels=None,
+        aux_dropout=0.1,
+        aux_weights=None,
         freeze_backbone=False,
     ):
         super().__init__()
+        import pointops
+        self.pointops = pointops
+        self.num_classes = num_classes
         self.seg_head = (
             nn.Linear(backbone_out_channels, num_classes)
             if num_classes > 0
@@ -74,14 +92,40 @@ class DefaultSegmentorV2(nn.Module):
         )
         self.backbone = build_model(backbone)
         self.criteria = build_criteria(criteria)
-        self.sp_criteria = build_criteria(sp_criteria) if sp_criteria else None
+        self.aux_criteria = build_criteria(aux_criteria) if aux_criteria else None
         self.freeze_backbone = freeze_backbone
         if self.freeze_backbone:
             for p in self.backbone.parameters():
                 p.requires_grad = False
 
+        self.aux_heads = None
+        self.aux_weights = None
+        if aux_channels is not None and len(aux_channels) > 0:
+            self.aux_heads = nn.ModuleList()
+            for ch in aux_channels:
+                head = nn.Sequential(
+                    nn.Dropout(p=aux_dropout),
+                    nn.Linear(ch, num_classes),
+                )
+                self.aux_heads.append(head)
+
+            # 设置各 stage 的权重比例
+            if aux_weights is not None:
+                assert len(aux_weights) == len(aux_channels), (
+                    f"aux_weights 长度 ({len(aux_weights)}) 必须与 "
+                    f"aux_channels 长度 ({len(aux_channels)}) 一致"
+                )
+                self.aux_weights = aux_weights
+            else:
+                # 默认权重均为 1.0
+                self.aux_weights = tuple([1.0] * len(aux_channels))
+
     def forward(self, input_dict, return_point=False):
         point = Point(input_dict)
+        
+        origin_coord = point.coord.clone()
+        origin_offset = point.offset.clone()
+
         point = self.backbone(point)
         # Backbone added after v1.5.0 return Point instead of feat and use DefaultSegmentorV2
         # TODO: remove this part after make all backbone return Point only.
@@ -100,23 +144,50 @@ class DefaultSegmentorV2(nn.Module):
         if return_point:
             # PCA evaluator parse feat and coord in point
             return_dict["point"] = point
+
+        # =====================================================================
+        # 混合深监督: 处理辅助输出
+        # =====================================================================
+        aux_logits_list = []
+        if (
+            self.training
+            and self.aux_heads is not None
+            and self.aux_criteria is not None
+            and hasattr(point, "aux_outputs")
+            and point.aux_outputs is not None
+        ):
+            aux_outputs = point.aux_outputs
+
+            for i, aux_points in enumerate(aux_outputs):
+                if i >= len(self.aux_heads):
+                    break
+
+                aux_coord, aux_feat, aux_offset = aux_points
+
+                # 使用 pointops.interpolation 将低分辨率特征插值到原始分辨率
+                with torch.amp.autocast('cuda', enabled=False):
+                    interpolated_feat = self.pointops.interpolation(
+                        aux_coord.float(), origin_coord.float(), aux_feat.float(), aux_offset, origin_offset
+                    )
+
+                # 通过辅助头生成 logits
+                aux_logits = self.aux_heads[i](interpolated_feat)
+                aux_logits_list.append(aux_logits)
+
         # train
         if self.training:
             loss = self.criteria(seg_logits, input_dict["segment"])
-
-            # 超点一致性损失（只在配置时才计算和显示）
-            if self.sp_criteria is not None and "superpoint" in input_dict:
-                superpoint = input_dict["superpoint"]
-                sp_loss = None
-                for sp_c in self.sp_criteria.criteria:
-                    sp_loss_item = sp_c(seg_logits, superpoint)
-                    if sp_loss is None:
-                        sp_loss = sp_loss_item
-                    else:
-                        sp_loss = sp_loss + sp_loss_item
-                if sp_loss is not None:
-                    loss = loss + sp_loss
-                    return_dict["l_sp"] = sp_loss
+            
+            # 辅助损失
+            if len(aux_logits_list) > 0 and self.aux_criteria is not None:
+                aux_loss = 0.0
+                for i, aux_logits in enumerate(aux_logits_list):
+                    stage_loss = self.aux_criteria(aux_logits, input_dict["segment"])
+                    # 应用各 stage 的权重比例
+                    weighted_loss = stage_loss * self.aux_weights[i]
+                    aux_loss = aux_loss + weighted_loss
+                loss = loss + aux_loss
+                return_dict["l_aux"] = aux_loss
 
             return_dict["loss"] = loss
         # eval
@@ -611,7 +682,6 @@ class DeepLASegmentor(nn.Module):
         aux_channels=None,
         aux_dropout=0.1,
         aux_weights=None,
-        sp_criteria=None,
         freeze_backbone=False,
     ):
         super().__init__()
@@ -632,7 +702,6 @@ class DeepLASegmentor(nn.Module):
         self.criteria = build_criteria(criteria)
         self.aux_criteria = build_criteria(aux_criteria) if aux_criteria else None
         # Superpoint consistency loss (train only)
-        self.sp_criteria = build_criteria(sp_criteria) if sp_criteria else None
 
         # 冻结 backbone
         self.freeze_backbone = freeze_backbone
@@ -743,21 +812,6 @@ class DeepLASegmentor(nn.Module):
                 # aux_criteria 的 loss_weight 已在 build_criteria 中处理
                 loss = loss + aux_loss
                 return_dict["l_aux"] = aux_loss  # 只在配置了 aux_criteria 时才添加到日志
-
-            # 超点一致性损失（只在配置时才计算和显示）
-            if self.sp_criteria is not None and "superpoint" in input_dict:
-                superpoint = input_dict["superpoint"]
-                # SuperpointConsistencyLoss 接受 logits 和 superpoint 索引
-                sp_loss = None
-                for sp_c in self.sp_criteria.criteria:
-                    sp_loss_item = sp_c(seg_logits, superpoint)
-                    if sp_loss is None:
-                        sp_loss = sp_loss_item
-                    else:
-                        sp_loss = sp_loss + sp_loss_item
-                if sp_loss is not None:
-                    loss = loss + sp_loss
-                    return_dict["l_sp"] = sp_loss  # 只在配置了 sp_criteria 且有数据时才添加到日志
 
             return_dict["loss"] = loss
 

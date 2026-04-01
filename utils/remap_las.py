@@ -90,8 +90,8 @@ def remap_las_classification(input_path: str, output_path: str, mapping_rule: di
 # ==========================================
 if __name__ == "__main__":
     
-    INPUT_SRC = r"E:\data\云南遥感中心\第二批\disk03\train"      # 替换为实际的输入文件或文件夹
-    OUTPUT_DST = r"E:\data\云南遥感中心\第二批\ground\disk03\train"    # 替换为实际的输出文件或文件夹
+    INPUT_SRC = r"E:\data\铁二院\第二批\nl"      # 替换为实际的输入文件或文件夹
+    OUTPUT_DST = r"E:\data\铁二院\第二批\new\nl"    # 替换为实际的输出文件或文件夹
     
     # 规则字典：将 2 映射为 2（可省略，写上更明确），4 和 5 映射为 3
     my_mapping = {

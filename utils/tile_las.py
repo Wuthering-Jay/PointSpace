@@ -1153,12 +1153,12 @@ class LASTileProcessor:
 if __name__ == "__main__":
     processor = LASTileProcessor(
         # 路径与格式配置
-        input_path=r"E:\data\云南遥感中心\第二批\disk03\train\processed_其他073.las",  # 原始数据路径
-        output_dir=r"E:\data\云南遥感中心\第二批\disk03\processed_其他073", # 输出路径
+        input_path=r"E:\data\铁二院\第二批\new\nl\train",  # 原始数据路径
+        output_dir=r"E:\data\铁二院\第二批\new\nl\tile\train", # 输出路径
         output_format='las',          # 输出格式
 
         # 分块参数
-        window_size=(200.0, 200.0),   # 分块大小
+        window_size=(50.0,50.0),   # 分块大小
         overlap=True,                 # 启用重叠
         overlap_factor=1,             # 重叠因子
         min_points=5000,              # 最小点数
@@ -1167,7 +1167,7 @@ if __name__ == "__main__":
         buffer_size=0,
 
         # Superpoint 超点分割参数
-        calc_superpoint=True,         # 启用超点分割
+        calc_superpoint=False,         # 启用超点分割
         superpoint_on_source=False,   # False: 先 tile 再批量并行计算（推荐，更高效）
                                       # True: 先在原始点云计算再 tile（避免边界效应）
         sp_kThresh=0.005,              # 分割阈值，越大块越大

@@ -382,6 +382,13 @@ class PreciseEvaluator(HookBase):
         cfg = self.trainer.cfg
         test_cfg = dict(cfg=cfg, model=self.trainer.model, **cfg.test)
         tester = TESTERS.build(test_cfg)
+        
+        # 传递训练集阶段的反映射字典给 tester，使得 train.py 内部执行测
+        # 试时也能成功按正确类型将连续 id 转换回真实标注 Las/Semantic 类别。
+        id2class = getattr(self.trainer.train_loader.dataset, "id2class", None)
+        if id2class is not None:
+            tester.id2class = id2class
+
         if self.test_last:
             self.trainer.logger.info("=> Testing on model_last ...")
         else:

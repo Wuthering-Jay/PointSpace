@@ -677,8 +677,10 @@ class PointTransformerV2(PointModule):
         drop_path_rate=0,
         enable_checkpoint=False,
         unpool_backend="map",
+        enable_deep_supervision=False,
     ):
         super(PointTransformerV2, self).__init__()
+        self.enable_deep_supervision = enable_deep_supervision
         self.in_channels = in_channels
         self.num_stages = len(enc_depths)
         assert self.num_stages == len(dec_depths)
@@ -771,10 +773,13 @@ class PointTransformerV2(PointModule):
         points = [coord, feat, offset]
         points = self.patch_embed(points)
         skips = [[points]]  # 便于添加cluster
+        aux_outputs = []
         for i in range(self.num_stages):
             points, cluster = self.enc_stages[i](points)
+            if self.enable_deep_supervision:
+                aux_outputs.append(points)
             skips[-1].append(cluster)  # record grid cluster of pooling
-            skips.append([points])  # record points info of current stage
+            skips.append([points])  # record points info of current stage       
         # 取出最后一层的点云信息
         points = skips.pop(-1)[0]  # unpooling points info in the last enc stage
         for i in reversed(range(self.num_stages)):
@@ -784,4 +789,6 @@ class PointTransformerV2(PointModule):
 
         # 将输出包装为 Point 对象返回
         point.feat = feat
+        if self.enable_deep_supervision:
+            point.aux_outputs = aux_outputs
         return point
