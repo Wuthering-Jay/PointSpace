@@ -153,9 +153,16 @@ class EZSPPartitionSegmentor(nn.Module):
             if criteria is not None:
                 self.criteria = build_criteria(criteria)
             else:
+                # CRITICAL: SPT/EZ-SP uses ignore_index = num_classes (NOT -1!)
+                # This follows the histogram convention where void/ignored labels
+                # are placed in the (num_classes)-th column
                 self.criteria = build_criteria(
                     [
-                        dict(type="CrossEntropyLoss", loss_weight=1.0, ignore_index=-1),
+                        dict(
+                            type="CrossEntropyLoss", 
+                            loss_weight=1.0, 
+                            ignore_index=num_classes  # Use num_classes, not -1
+                        ),
                     ]
                 )
 
