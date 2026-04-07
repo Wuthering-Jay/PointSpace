@@ -184,13 +184,57 @@ class SemSegEvaluator(HookBase):
             with torch.no_grad(), auto_cast():
                 output_dict = self.trainer.model(input_dict)
             output = output_dict["seg_logits"]
-            loss = output_dict["loss"]
+            # Some models may skip explicit val loss; keep evaluator robust
+            loss = output_dict.get("loss", torch.zeros((), device=output.device))
             pred = output.max(1)[1]
             segment = input_dict["segment"]
-            if "inverse" in input_dict.keys():
-                assert "origin_segment" in input_dict.keys()
-                pred = pred[input_dict["inverse"]]
-                segment = input_dict["origin_segment"]
+            
+            # Debug logging for first iteration
+            if i == 0:
+                self.trainer.logger.info(f"[Evaluator Debug] output shape: {output.shape}")
+                self.trainer.logger.info(f"[Evaluator Debug] pred shape: {pred.shape}")
+                self.trainer.logger.info(f"[Evaluator Debug] segment shape: {segment.shape}")
+                self.trainer.logger.info(f"[Evaluator Debug] segment dtype: {segment.dtype}")
+                if segment.dim() > 1:
+                    self.trainer.logger.info(f"[Evaluator Debug] segment is histogram format")
+                self.trainer.logger.info(f"[Evaluator Debug] Has inverse: {'inverse' in input_dict.keys()}")
+                self.trainer.logger.info(f"[Evaluator Debug] Has origin_segment: {'origin_segment' in input_dict.keys()}")
+            
+            # Handle different scenarios for superpoint vs regular models:
+            # 1. Regular models with inverse: use inverse to propagate pred, use segment_raw
+            # 2. Superpoint models without inverse: pred already at point-level, use segment_raw directly
+            # 3. Models without segment_raw: convert histogram segment to hard labels if needed
+            
+            if "segment_raw" in input_dict.keys():
+                # For superpoint models: pred is already at point level (chain-propagated in model)
+                # Just use segment_raw for ground truth (original point-level labels)
+                segment = input_dict["segment_raw"]
+                if i == 0:
+                    self.trainer.logger.info(f"[Evaluator Debug] Using segment_raw: {segment.shape}")
+                
+                # Apply inverse to pred if available (regular models that need voxel->point mapping)
+                if "inverse" in input_dict.keys():
+                    pred = pred[input_dict["inverse"]]
+                    if i == 0:
+                        self.trainer.logger.info(f"[Evaluator Debug] Applied inverse to pred: {pred.shape}")
+                
+                # Handle histogram format for segment_raw (shouldn't happen, but be defensive)
+                if segment.dim() > 1:
+                    segment = segment[:, :self.trainer.cfg.data.num_classes].argmax(dim=1)
+                    if i == 0:
+                        self.trainer.logger.info(f"[Evaluator Debug] segment_raw after argmax: {segment.shape}")
+            else:
+                # Fallback: no origin_segment, use voxel-level segment
+                if segment.dim() > 1:
+                    # Histogram label format [N, C+1] -> hard label [N]
+                    segment = segment[:, :self.trainer.cfg.data.num_classes].argmax(dim=1)
+                    if i == 0:
+                        self.trainer.logger.info(f"[Evaluator Debug] segment after argmax: {segment.shape}")
+            
+            if i == 0:
+                self.trainer.logger.info(f"[Evaluator Debug] Final pred shape: {pred.shape}")
+                self.trainer.logger.info(f"[Evaluator Debug] Final segment shape: {segment.shape}")
+            
             intersection, union, target = intersection_and_union_gpu(
                 pred,
                 segment,
@@ -1200,4 +1244,204 @@ class CnfEvaluator(HookBase):
     def after_train(self):
         self.trainer.logger.info(
             "Best {}: {:.6f}".format("neg_RMSE", self.trainer.best_metric_value)
+        )
+
+
+@HOOKS.register_module()
+class EZSPPartitionEvaluator(HookBase):
+    """Validation evaluator for EZ-SP partition learning (Stage 1).
+    
+    This evaluator computes partition quality metrics without requiring
+    semantic segmentation outputs. It evaluates:
+    
+    1. **Oracle mIoU**: The best possible mIoU if each superpoint takes
+       its majority class label. Higher = better boundary alignment.
+    2. **Oracle OA**: Overall accuracy with oracle labels.
+    3. **Superpoint statistics**: Number of superpoints, average size, etc.
+    
+    Unlike SemSegEvaluator, this does not require 'seg_logits' in the output.
+    The model output should contain 'y_pred' and 'y_true' tensors.
+    
+    Args:
+        log_interval: Log every N iterations during validation.
+        write_cls_iou: Whether to write per-class IoU to tensorboard.
+    """
+    
+    def __init__(self, log_interval: int = 1, write_cls_iou: bool = False):
+        self.log_interval = max(1, log_interval)
+        self.write_cls_iou = write_cls_iou
+    
+    def before_train(self):
+        if self.trainer.writer is not None and self.trainer.cfg.enable_wandb:
+            wandb.define_metric("val/*", step_metric="Epoch")
+    
+    def after_epoch(self):
+        if self.trainer.cfg.evaluate:
+            self.eval()
+    
+    def eval(self):
+        self.trainer.logger.info(">>>>>>>>>>>>>>>> Start Partition Evaluation >>>>>>>>>>>>>>>>")
+        self.trainer.model.eval()
+        auto_cast = _build_autocast(self.trainer.cfg)
+        
+        from pointspace.engines.hooks.misc import CacheCleaner
+        _cache_cleaner = next(
+            (h for h in self.trainer.hooks if isinstance(h, CacheCleaner)), None
+        )
+        
+        # Accumulators for Oracle mIoU computation
+        num_classes = self.trainer.cfg.data.num_classes
+        ignore_index = getattr(self.trainer.cfg.data, "ignore_index", -1)
+        
+        # Per-class counters for IoU
+        intersection_total = np.zeros(num_classes, dtype=np.float64)
+        union_total = np.zeros(num_classes, dtype=np.float64)
+        target_total = np.zeros(num_classes, dtype=np.float64)
+        
+        # Statistics
+        total_samples = 0
+        total_superpoints = 0
+        
+        for i, input_dict in enumerate(self.trainer.val_loader):
+            _iter_start = time.perf_counter()
+            
+            for key in input_dict.keys():
+                if isinstance(input_dict[key], torch.Tensor):
+                    input_dict[key] = input_dict[key].cuda(non_blocking=True)
+            
+            with torch.no_grad(), auto_cast():
+                output_dict = self.trainer.model(input_dict)
+            
+            # Extract predictions and ground truth
+            # Model returns y_pred (oracle predictions) and y_true (ground truth)
+            if "y_pred" not in output_dict or "y_true" not in output_dict:
+                # Skip this batch if no valid output
+                continue
+            
+            y_pred = output_dict["y_pred"]
+            y_true = output_dict["y_true"]
+            
+            # Handle inverse mapping if present
+            if "inverse" in input_dict.keys():
+                if "origin_segment" in input_dict.keys():
+                    y_true = input_dict["origin_segment"]
+                    if y_pred.shape[0] != y_true.shape[0]:
+                        y_pred = y_pred[input_dict["inverse"]]
+            
+            # Compute intersection and union per class
+            intersection, union, target = intersection_and_union_gpu(
+                y_pred,
+                y_true,
+                num_classes,
+                ignore_index,
+            )
+            
+            # DDP sync
+            if comm.get_world_size() > 1:
+                dist.all_reduce(intersection)
+                dist.all_reduce(union)
+                dist.all_reduce(target)
+            
+            intersection = intersection.cpu().numpy()
+            union = union.cpu().numpy()
+            target = target.cpu().numpy()
+            
+            intersection_total += intersection
+            union_total += union
+            target_total += target
+            
+            total_samples += 1
+            
+            # Get superpoint statistics if available
+            if "oracle_acc" in output_dict:
+                oracle_acc = output_dict["oracle_acc"].item()
+            else:
+                valid_mask = y_true >= 0
+                if valid_mask.any():
+                    oracle_acc = (y_pred[valid_mask] == y_true[valid_mask]).float().mean().item()
+                else:
+                    oracle_acc = 0.0
+            
+            # Log progress
+            if (i + 1) % self.log_interval == 0 or (i + 1) == len(self.trainer.val_loader):
+                self.trainer.logger.info(
+                    "Val: [{iter}/{max_iter}] Oracle Acc: {acc:.4f}".format(
+                        iter=i + 1,
+                        max_iter=len(self.trainer.val_loader),
+                        acc=oracle_acc,
+                    )
+                )
+            
+            # Cache cleaning
+            if _cache_cleaner is not None:
+                _cache_cleaner.check_and_clean(
+                    time.perf_counter() - _iter_start,
+                    f"val iter {i + 1}/{len(self.trainer.val_loader)}",
+                )
+        
+        # Compute final metrics
+        iou_class = intersection_total / (union_total + 1e-10)
+        acc_class = intersection_total / (target_total + 1e-10)
+        m_iou = np.mean(iou_class)
+        m_acc = np.mean(acc_class)
+        all_acc = sum(intersection_total) / (sum(target_total) + 1e-10)
+        
+        # Log results
+        self.trainer.logger.info(
+            "Val result:  Oracle mIoU {:.4f}  Oracle mAcc {:.4f}  Oracle OA {:.4f}".format(
+                m_iou, m_acc, all_acc
+            )
+        )
+        
+        # Per-class breakdown
+        names = self.trainer.cfg.data.names
+        if names is not None and len(names) == num_classes:
+            precision_class = intersection_total / (
+                intersection_total + np.maximum(union_total - target_total, 0) + 1e-10
+            )
+            f1_class = 2 * precision_class * acc_class / (precision_class + acc_class + 1e-10)
+            max_name_len = max(len(n) for n in names)
+            
+            for j in range(num_classes):
+                self.trainer.logger.info(
+                    "  Class {:2d} - {:<{w}} | Oracle IoU {:.4f}".format(
+                        j, names[j], iou_class[j], w=max_name_len
+                    )
+                )
+        
+        # TensorBoard / WandB logging
+        current_epoch = self.trainer.epoch + 1
+        if self.trainer.writer is not None:
+            self.trainer.writer.add_scalar("val/oracle_mIoU", m_iou, current_epoch)
+            self.trainer.writer.add_scalar("val/oracle_mAcc", m_acc, current_epoch)
+            self.trainer.writer.add_scalar("val/oracle_OA", all_acc, current_epoch)
+            
+            if self.trainer.cfg.enable_wandb:
+                wandb.log(
+                    {
+                        "Epoch": current_epoch,
+                        "val/oracle_mIoU": m_iou,
+                        "val/oracle_mAcc": m_acc,
+                        "val/oracle_OA": all_acc,
+                    },
+                    step=wandb.run.step,
+                )
+            
+            if self.write_cls_iou and names is not None:
+                for j in range(num_classes):
+                    self.trainer.writer.add_scalar(
+                        f"val/oracle_cls_{j}-{names[j]} IoU",
+                        iou_class[j],
+                        current_epoch,
+                    )
+        
+        self.trainer.logger.info("<<<<<<<<<<<<<<<<< End Partition Evaluation <<<<<<<<<<<<<<<<<")
+        
+        # Save metric for checkpoint saver (higher is better)
+        self.trainer.comm_info["current_metric_value"] = m_iou
+        self.trainer.comm_info["current_metric_name"] = "oracle_mIoU"
+    
+    def after_train(self):
+        self.trainer.logger.info(
+            "Best {}: {:.4f}".format("oracle_mIoU", self.trainer.best_metric_value)
         )

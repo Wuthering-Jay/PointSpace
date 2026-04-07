@@ -111,7 +111,17 @@ class EZSPTransformer(nn.Module):
             if nano:
                 # Nano mode: first stage gets features directly
                 down_in_mlp = [[in_channels, down_dim[0]]]
-                down_in_mlp += [[d, d] for d in down_dim[1:]]
+                # Subsequent stages receive concatenated features (parent + pooled child)
+                # For stage i (i >= 1):
+                #   - parent features: down_dim[i-1] (from previous stage output)
+                #   - pooled child features: down_dim[i-1] (pooled from same level)
+                #   - concatenated: 2 * down_dim[i-1]
+                if fusion == "cat":
+                    for i in range(1, len(down_dim)):
+                        down_in_mlp.append([2 * down_dim[i-1], down_dim[i]])
+                else:
+                    # For additive fusion, dimension stays same
+                    down_in_mlp += [[d, d] for d in down_dim[1:]]
             else:
                 # Normal mode: PointStage handles initial projection
                 down_in_mlp = [[d, d] for d in down_dim]
@@ -154,16 +164,11 @@ class EZSPTransformer(nn.Module):
             pool=pool,
             fusion=fusion,
             output_stage_wise=output_stage_wise,
+            # Add segmentation head directly in SPT
+            num_classes=num_classes,
+            add_seg_head=True,
             **spt_kwargs,
         )
-
-        # Segmentation head (maps SPT output to class logits)
-        spt_out_dim = self.spt.out_dim
-        if isinstance(spt_out_dim, list):
-            # Stage-wise output: use first level output
-            spt_out_dim = spt_out_dim[0]
-        
-        self.seg_head = nn.Linear(spt_out_dim, num_classes)
 
     def forward(self, nag: SuperpointHierarchy) -> torch.Tensor:
         """
@@ -176,21 +181,20 @@ class EZSPTransformer(nn.Module):
                 - Level 1+ (superpoints): pos, x, edge_index, edge_attr, super_index
 
         Returns:
-            seg_logits: Semantic logits of shape [N_points, num_classes].
+            seg_logits_superpoint: Semantic logits at SUPERPOINT level.
+                Shape: [N_superpoints_L1, num_classes]
+                
+        Note:
+            This returns superpoint-level logits, NOT point-level!
+            The segmentor is responsible for propagating to points for evaluation.
+            Loss should be computed at superpoint level.
         """
-        # Forward through SPT
-        x = self.spt(nag)
-
-        # x is now superpoint-level features (Level 1)
-        # Shape: [N_superpoints, out_dim]
+        # Forward through SPT (includes seg_head)
+        seg_logits_superpoint = self.spt(nag)
         
-        # Apply segmentation head
-        seg_logits_super = self.seg_head(x)  # [N_superpoints, num_classes]
-
-        # Propagate back to points
-        seg_logits_points = nag.propagate_labels_to_points(seg_logits_super)
-
-        return seg_logits_points
+        # Return superpoint-level logits
+        # Shape: [num_superpoints_L1, num_classes]
+        return seg_logits_superpoint
 
 
 @MODELS.register_module()

@@ -995,6 +995,8 @@ class GridSample(object):
                 mask[data_dict["sampled_index"]] = True
                 data_dict["sampled_index"] = np.where(mask[idx_unique])[0]
             data_dict = index_operator(data_dict, idx_unique)
+            # Store grid_size for later use (e.g., Point.sparsify())
+            data_dict["grid_size"] = self.grid_size
             if self.return_inverse:
                 data_dict["inverse"] = np.zeros_like(inverse)
                 data_dict["inverse"][idx_sort] = inverse
@@ -1024,6 +1026,8 @@ class GridSample(object):
                 idx_part = idx_sort[idx_select]
                 data_part = index_operator(data_dict, idx_part, duplicate=True)
                 data_part["index"] = idx_part
+                # Store grid_size for later use (e.g., Point.sparsify())
+                data_part["grid_size"] = self.grid_size
                 if self.return_inverse:
                     data_part["inverse"] = np.zeros_like(inverse)
                     data_part["inverse"][idx_sort] = inverse
@@ -1192,6 +1196,8 @@ class GridSample_Maxloop(GridSample):
                 mask[data_dict["sampled_index"]] = True
                 data_dict["sampled_index"] = np.where(mask[idx_unique])[0]
             data_dict = index_operator(data_dict, idx_unique)
+            # Store grid_size for later use (e.g., Point.sparsify())
+            data_dict["grid_size"] = self.grid_size
             # 若需返回逆索引 return_inverse，记录每个点在原始数据中的归属
             if self.return_inverse:
                 data_dict["inverse"] = np.zeros_like(inverse)
@@ -1227,6 +1233,8 @@ class GridSample_Maxloop(GridSample):
                 
                 data_part = index_operator(data_dict, batch_indices, duplicate=True)
                 data_part["index"] = batch_indices
+                # Store grid_size for later use (e.g., Point.sparsify())
+                data_part["grid_size"] = self.grid_size
                 if self.return_inverse:
                     data_part["inverse"] = np.zeros_like(inverse)
                     data_part["inverse"][idx_sort] = inverse
@@ -1251,6 +1259,520 @@ class GridSample_Maxloop(GridSample):
         
         else:
             raise NotImplementedError
+
+
+@TRANSFORMS.register_module()
+class GridVoxelize(object):
+    """Voxelization without sampling - for EZ-SP superpoint methods.
+    
+    Unlike GridSample which samples one point per voxel, this transform:
+    1. Voxelizes the point cloud into a grid
+    2. Keeps ALL original points (no sampling)
+    3. Creates voxel representations and point-to-voxel mapping
+    4. Enables voxel-based feature extraction + point-level partition
+    
+    This is critical for superpoint methods like EZ-SP where we need:
+    - Fast sparse convolution on voxels
+    - Complete point cloud for accurate partition boundaries
+    
+    Args:
+        grid_size: Voxel size for quantization
+        hash_type: Hash function ('fnv' or 'ravel')
+        mode: 'train' or 'test' 
+        aggregation: How to aggregate point features in each voxel
+                     'mean', 'max', or 'first' (default: 'mean')
+        return_voxel_coord: Whether to return voxel center coordinates
+        return_inverse: Whether to return point→voxel mapping (required for decoder)
+        return_grid_coord: Whether to return grid coordinates
+        
+    Returns (in data_dict):
+        coord: [N, 3] - Original point coordinates (unchanged)
+        feat: [N, C] - Original point features (unchanged)
+        voxel_coord: [M, 3] - Voxel center coordinates
+        voxel_feat: [M, C] - Aggregated voxel features
+        inverse: [N] - Point-to-voxel mapping (point_i → voxel_id)
+        grid_coord: [N, 3] - Grid coordinates for each point
+    """
+    
+    def __init__(
+        self,
+        grid_size=0.05,
+        hash_type="fnv",
+        mode="train",
+        aggregation="mean",
+        return_voxel_coord=True,
+        return_inverse=True,
+        return_grid_coord=True,
+        return_min_coord=False,
+        feat_keys=None,  # NEW: Specify which keys to aggregate into voxel_feat
+    ):
+        self.grid_size = grid_size
+        self.hash = self.fnv_hash_vec if hash_type == "fnv" else self.ravel_hash_vec
+        assert mode in ["train", "test"]
+        self.mode = mode
+        assert aggregation in ["mean", "max", "first"]
+        self.aggregation = aggregation
+        self.return_voxel_coord = return_voxel_coord
+        self.return_inverse = return_inverse
+        self.return_grid_coord = return_grid_coord
+        self.return_min_coord = return_min_coord
+        self.feat_keys = feat_keys  # List of keys to concat as features
+
+    def __call__(self, data_dict):
+        assert "coord" in data_dict.keys()
+        
+        # Build features from feat_keys if specified (like Collect does)
+        if self.feat_keys is not None:
+            feat = np.concatenate([data_dict[key].astype(np.float32) for key in self.feat_keys], axis=1)
+        elif "feat" in data_dict.keys():
+            feat = data_dict["feat"]
+        else:
+            feat = None  # No features to aggregate
+        
+        # 1. Compute grid coordinates
+        scaled_coord = data_dict["coord"] / np.array(self.grid_size)
+        grid_coord = np.floor(scaled_coord).astype(int)
+        min_coord = grid_coord.min(0)
+        grid_coord -= min_coord
+        scaled_coord -= min_coord
+        min_coord = min_coord * np.array(self.grid_size)
+        
+        # 2. Hash grid coordinates to find unique voxels
+        key = self.hash(grid_coord)
+        idx_sort = np.argsort(key)
+        key_sort = key[idx_sort]
+        unique_keys, inverse_sorted, count = np.unique(
+            key_sort, return_inverse=True, return_counts=True
+        )
+        
+        # 3. Create point→voxel mapping (inverse)
+        # inverse[i] tells which voxel point i belongs to
+        inverse = np.zeros_like(inverse_sorted)
+        inverse[idx_sort] = inverse_sorted
+        
+        # 4. Find one representative point per voxel (for coord/features)
+        idx_voxel_representatives = np.cumsum(np.insert(count, 0, 0)[:-1])
+        idx_voxel_points = idx_sort[idx_voxel_representatives]
+        
+        # 5. Compute voxel center coordinates
+        voxel_grid_coord = grid_coord[idx_voxel_points]
+        voxel_coord = (voxel_grid_coord + 0.5) * self.grid_size + min_coord
+        
+        # 6. Aggregate point features into voxel features (if features available)
+        if feat is not None:
+            voxel_feat = self._aggregate_features(feat, inverse, len(unique_keys))
+            data_dict["voxel_feat"] = voxel_feat
+            if "voxel_feat" not in data_dict.get("index_valid_keys", []):
+                if "index_valid_keys" not in data_dict:
+                    data_dict["index_valid_keys"] = []
+                data_dict["index_valid_keys"].append("voxel_feat")
+        # else: No features available, voxel_feat won't be created
+        
+        # 7. Store voxelization results
+        data_dict["grid_size"] = self.grid_size
+        
+        if self.return_voxel_coord:
+            data_dict["voxel_coord"] = voxel_coord
+            if "voxel_coord" not in data_dict.get("index_valid_keys", []):
+                if "index_valid_keys" not in data_dict:
+                    data_dict["index_valid_keys"] = []
+                data_dict["index_valid_keys"].append("voxel_coord")
+        
+        if self.return_inverse:
+            data_dict["inverse"] = inverse
+            if "inverse" not in data_dict.get("index_valid_keys", []):
+                if "index_valid_keys" not in data_dict:
+                    data_dict["index_valid_keys"] = []
+                data_dict["index_valid_keys"].append("inverse")
+        
+        if self.return_grid_coord:
+            data_dict["grid_coord"] = grid_coord
+            if "grid_coord" not in data_dict.get("index_valid_keys", []):
+                if "index_valid_keys" not in data_dict:
+                    data_dict["index_valid_keys"] = []
+                data_dict["index_valid_keys"].append("grid_coord")
+        
+        if self.return_min_coord:
+            data_dict["min_coord"] = min_coord.reshape([1, 3])
+        
+        # Store original point count for verification
+        data_dict["num_raw_points"] = len(data_dict["coord"])
+        data_dict["num_voxels"] = len(unique_keys)
+        
+        return data_dict
+    
+    def _aggregate_features(self, feat, inverse, num_voxels):
+        """Aggregate point features into voxel features (VECTORIZED - no for loops).
+        
+        Args:
+            feat: [N, C] point features
+            inverse: [N] point-to-voxel mapping
+            num_voxels: M number of unique voxels
+            
+        Returns:
+            voxel_feat: [M, C] aggregated voxel features
+        """
+        N, C = feat.shape
+        voxel_feat = np.zeros((num_voxels, C), dtype=feat.dtype)
+        
+        if self.aggregation == "mean":
+            # Mean pooling (already vectorized)
+            np.add.at(voxel_feat, inverse, feat)
+            count = np.bincount(inverse, minlength=num_voxels).reshape(-1, 1)
+            voxel_feat = voxel_feat / np.maximum(count, 1)
+        
+        elif self.aggregation == "max":
+            # Max pooling (VECTORIZED using np.maximum.at)
+            # Initialize with -inf so empty voxels stay at -inf (then we can fill with 0)
+            voxel_feat.fill(-np.inf)
+            np.maximum.at(voxel_feat, inverse, feat)
+            # Replace -inf with 0 for empty voxels (if any)
+            voxel_feat[np.isinf(voxel_feat)] = 0
+        
+        elif self.aggregation == "first":
+            # First point in each voxel (VECTORIZED)
+            # Sort by point index, then use unique to find first occurrence
+            sort_idx = np.argsort(inverse, kind='stable')  # stable preserves order for same voxel
+            sorted_inverse = inverse[sort_idx]
+            sorted_feat = feat[sort_idx]
+            
+            # Find first occurrence of each voxel
+            _, first_idx = np.unique(sorted_inverse, return_index=True)
+            voxel_feat[sorted_inverse[first_idx]] = sorted_feat[first_idx]
+        
+        return voxel_feat
+
+    @staticmethod
+    def ravel_hash_vec(arr):
+        """Ravel the coordinates after subtracting the min coordinates."""
+        assert arr.ndim == 2
+        arr = arr.copy()
+        arr -= arr.min(0)
+        arr = arr.astype(np.uint64, copy=False)
+        arr_max = arr.max(0).astype(np.uint64) + 1
+
+        keys = np.zeros(arr.shape[0], dtype=np.uint64)
+        # Fortran style indexing
+        for j in range(arr.shape[1] - 1):
+            keys += arr[:, j]
+            keys *= arr_max[j + 1]
+        keys += arr[:, -1]
+        return keys
+
+    @staticmethod
+    def fnv_hash_vec(arr):
+        """FNV64-1A"""
+        assert arr.ndim == 2
+        arr = arr.copy()
+        arr = arr.astype(np.uint64, copy=False)
+        hashed_arr = np.uint64(14695981039346656037) * np.ones(
+            arr.shape[0], dtype=np.uint64
+        )
+        for j in range(arr.shape[1]):
+            hashed_arr *= np.uint64(1099511628211)
+            hashed_arr = np.bitwise_xor(hashed_arr, arr[:, j])
+        return hashed_arr
+
+
+@TRANSFORMS.register_module()
+class SaveNodeIndex(object):
+    """Save node indices for tracking points through voxelization.
+    
+    This is the CRITICAL first step of the official EZ-SP pipeline:
+    1. SaveNodeIndex('sub') → saves [0, 1, 2, ..., N-1] into data['sub']
+    2. GridSampling3D → voxelizes points, converts 'sub' to Cluster object
+    3. GreedyPartition → creates NAG[L0=sub, L1=voxels, L2+=superpoints]
+    
+    By storing indices BEFORE voxelization, we can later backtrack:
+    - Which raw points belong to which voxel (via Cluster)
+    - Propagate predictions from superpoints back to raw points
+    
+    Following: src/transforms/sampling.py:SaveNodeIndex
+    
+    Args:
+        key: str - Attribute name to store indices (default: 'sub')
+        
+    Example:
+        >>> transform = SaveNodeIndex(key='sub')
+        >>> data_dict = {'coord': np.random.randn(1000, 3)}
+        >>> data_dict = transform(data_dict)
+        >>> data_dict['sub']
+        array([0, 1, 2, ..., 999])
+    """
+    DEFAULT_KEY = 'sub'
+    
+    def __init__(self, key: str = 'sub'):
+        self.key = key
+    
+    def __call__(self, data_dict):
+        """Save point indices."""
+        assert "coord" in data_dict, "coord must exist before SaveNodeIndex"
+        num_points = len(data_dict["coord"])
+        data_dict[self.key] = np.arange(num_points, dtype=np.int64)
+        
+        # Mark as index-valid for proper handling
+        if "index_valid_keys" not in data_dict:
+            data_dict["index_valid_keys"] = []
+        if self.key not in data_dict["index_valid_keys"]:
+            data_dict["index_valid_keys"].append(self.key)
+        
+        return data_dict
+
+
+@TRANSFORMS.register_module()
+class GridSampling3D(object):
+    """Voxel grid sampling following official EZ-SP implementation.
+    
+    This is the CORE voxelization transform that:
+    1. Clusters points into voxels based on grid coordinates
+    2. Aggregates point features (mean/last)
+    3. CRITICALLY: Converts 'sub' (saved indices) to Cluster format
+    
+    The Cluster object preserves the mapping from voxels → raw points,
+    enabling final prediction propagation: superpoints → voxels → raw points
+    
+    Data flow:
+        Input:  N raw points with sub=[0,1,...,N-1]
+        Output: M voxels with sub=Cluster(pointer, value)
+                - pointer[i:i+1] gives range in value array for voxel i
+                - value contains original point indices
+    
+    Following: src/transforms/sampling.py:GridSampling3D
+    
+    Performance Optimizations:
+        - FNV64-style hashing for voxel grouping
+        - Stable mergesort grouping
+        - Early exit for empty histograms
+        - Vectorized aggregation (bincount / add.at)
+    
+    Args:
+        size: float - Voxel size (meters)
+        mode: str - 'mean' for average, 'last' for random point
+        hist_key: str|List - Keys to convert to histogram (e.g., 'y' for labels)
+        hist_size: int|List - Histogram bins (e.g., num_classes+1)
+        quantize_coords: bool - Store integer grid coordinates
+        feat_keys: List[str] - Keys to aggregate into features
+        
+    Returns:
+        data_dict with voxelized data:
+            - coord: [M, 3] voxel center coordinates
+            - feat: [M, C] aggregated features
+            - sub: Cluster object mapping voxels→raw points
+            - y: [M, num_classes+1] label histogram (if hist_key='y')
+            - grid_size: float (CRITICAL: required by Point.sparsify())
+    """
+    
+    # Keys that get converted to Cluster objects (point→voxel backtracking)
+    _CLUSTER_KEYS = ['sub']
+    
+    # Keys that use majority voting
+    _VOTING_KEYS = ['super_index', 'is_val']
+    
+    # Keys that use 'last' mode regardless of global mode
+    _LAST_KEYS = ['batch']
+    
+    def __init__(
+        self,
+        size: float = 0.1,
+        mode: str = "mean",
+        hist_key=None,
+        hist_size=None,
+        quantize_coords: bool = True,
+        feat_keys=None,
+    ):
+        self.size = size
+        self.mode = mode
+        assert mode in ["mean", "last"], f"mode must be 'mean' or 'last', got {mode}"
+        
+        # Histogram configuration (for label aggregation)
+        hist_key = [] if hist_key is None else hist_key
+        hist_size = [] if hist_size is None else hist_size
+        hist_key = [hist_key] if isinstance(hist_key, str) else list(hist_key)
+        hist_size = [hist_size] if isinstance(hist_size, int) else list(hist_size)
+        assert len(hist_key) == len(hist_size), "hist_key and hist_size must match"
+        self.bins = {k: v for k, v in zip(hist_key, hist_size)}
+        
+        self.quantize_coords = quantize_coords
+        self.feat_keys = feat_keys
+    
+    @staticmethod
+    def _fnv_hash(arr):
+        """FNV64-1A hash for grid coordinates."""
+        assert arr.ndim == 2
+        arr = arr.astype(np.uint64)
+        hashed = np.uint64(14695981039346656037) * np.ones(len(arr), dtype=np.uint64)
+        for j in range(arr.shape[1]):
+            hashed *= np.uint64(1099511628211)
+            hashed = np.bitwise_xor(hashed, arr[:, j])
+        return hashed
+
+    def __call__(self, data_dict):
+        assert "coord" in data_dict, "coord is required"
+        coord = data_dict["coord"]
+        num_points = len(coord)
+        
+        # 1. Compute grid coordinates - optimized
+        grid_coord = np.floor(coord / self.size).astype(np.int64)
+        min_grid = grid_coord.min(axis=0, keepdims=True)  # Keep dims for broadcasting
+        grid_coord_offset = grid_coord - min_grid  # Broadcasting subtraction
+        
+        # 2. Hash to find unique voxels (faster path for this project)
+        key = self._fnv_hash(grid_coord_offset)
+        sort_idx = np.argsort(key, kind="mergesort")
+        key_sorted = key[sort_idx]
+        _, inverse_sorted, counts = np.unique(
+            key_sorted, return_inverse=True, return_counts=True
+        )
+        num_voxels = len(counts)
+
+        # Inverse mapping: point_i → voxel_id
+        inverse = np.empty(num_points, dtype=np.int64)
+        inverse[sort_idx] = inverse_sorted
+
+        # Representative point per voxel (first in sorted order)
+        first_idx = np.concatenate(([0], np.cumsum(counts[:-1])))
+        unique_pos_indices = sort_idx[first_idx]
+        
+        # 3. Build output data_dict
+        out_dict = {}
+        
+        # Store metadata (CRITICAL: grid_size required by Point.sparsify())
+        out_dict["num_raw_points"] = num_points
+        out_dict["num_voxels"] = num_voxels
+        out_dict["grid_size"] = self.size  # Will be re-ensured at end
+        
+        # Voxel center coordinates - optimized indexing
+        voxel_grid_coord = grid_coord[unique_pos_indices]
+        voxel_coord = (voxel_grid_coord.astype(np.float32) + 0.5) * self.size  # Combined ops
+        out_dict["coord"] = voxel_coord
+        
+        if self.quantize_coords:
+            out_dict["grid_coord"] = (voxel_grid_coord - min_grid[0]).astype(np.int32)  # Remove keepdim
+        
+        # 4. Process each attribute
+        index_valid_keys = ["coord"]
+        if self.quantize_coords:
+            index_valid_keys.append("grid_coord")
+        
+        # Keys ending with '_raw' should be preserved (not aggregated)
+        # They store original point-level data for evaluation
+        raw_keys_to_preserve = {}
+        
+        for key_name, item in data_dict.items():
+            if key_name in ["coord", "index_valid_keys", "num_raw_points", "num_voxels", "grid_size"]:
+                continue
+            
+            # Preserve keys ending with '_raw' - they store original point-level data
+            if key_name.endswith("_raw"):
+                raw_keys_to_preserve[key_name] = item
+                continue
+            
+            # CRITICAL: Cluster keys (sub) → create Cluster mapping
+            if key_name in self._CLUSTER_KEYS:
+                if isinstance(item, np.ndarray) and item.ndim == 1:
+                    # Create Cluster object (CSR format)
+                    # pointer: [M+1], cumsum of counts
+                    # value: original point indices sorted by voxel
+                    pointer = np.concatenate([[0], np.cumsum(counts)])
+                    value = item[sort_idx]  # Point indices in voxel order
+                    out_dict[key_name] = {"pointer": pointer, "value": value}
+                    # Note: Will be converted to Cluster object in ToTensor or collate
+                continue
+            
+            # Histogram keys (y) → aggregate to histogram
+            if key_name in self.bins:
+                hist_size = self.bins[key_name]
+                if isinstance(item, np.ndarray) and item.ndim == 1:
+                    # OPTIMIZED histogram aggregation
+                    # Filter valid labels once
+                    valid_mask = (item >= 0) & (item < hist_size)
+                    
+                    if valid_mask.any():
+                        valid_voxels = inverse[valid_mask]
+                        valid_labels = item[valid_mask].astype(np.int64)
+                        
+                        # Use flat index: voxel_id * hist_size + label
+                        flat_idx = valid_voxels * hist_size + valid_labels
+                        
+                        # Count occurrences using bincount (fastest method)
+                        y_hist_flat = np.bincount(flat_idx, minlength=num_voxels * hist_size)
+                        y_hist = y_hist_flat.reshape(num_voxels, hist_size).astype(np.float32)
+                    else:
+                        # No valid labels, create zero histogram
+                        y_hist = np.zeros((num_voxels, hist_size), dtype=np.float32)
+                    
+                    out_dict[key_name] = y_hist
+                    index_valid_keys.append(key_name)
+                continue
+            
+            # Standard tensor aggregation
+            if not isinstance(item, np.ndarray):
+                out_dict[key_name] = item
+                continue
+            
+            if item.shape[0] != num_points:
+                out_dict[key_name] = item  # Not point-indexed
+                continue
+            
+            # Voting keys (majority voting) - OPTIMIZED
+            if key_name in self._VOTING_KEYS:
+                # Use bincount for mode calculation (most frequent value)
+                max_val = int(item.max()) + 1
+                # Create flat index: voxel_id * max_val + value
+                flat_idx = inverse * max_val + item.astype(np.int64)
+                counts_flat = np.bincount(flat_idx, minlength=num_voxels * max_val)
+                counts_2d = counts_flat.reshape(num_voxels, max_val)
+                agg = counts_2d.argmax(axis=1).astype(item.dtype)
+                out_dict[key_name] = agg
+                index_valid_keys.append(key_name)
+                continue
+            
+            # Last keys or 'last' mode
+            if key_name in self._LAST_KEYS or self.mode == 'last':
+                out_dict[key_name] = item[unique_pos_indices]
+                index_valid_keys.append(key_name)
+                continue
+            
+            # Mean aggregation (default for 'mean' mode)
+            if self.mode == 'mean':
+                if item.ndim == 1:
+                    agg = np.zeros(num_voxels, dtype=np.float32)
+                    np.add.at(agg, inverse, item.astype(np.float32))
+                    agg /= np.maximum(counts, 1)
+                else:
+                    agg = np.zeros((num_voxels, item.shape[1]), dtype=np.float32)
+                    np.add.at(agg, inverse, item.astype(np.float32))
+                    agg /= np.maximum(counts, 1).reshape(-1, 1)
+                out_dict[key_name] = agg
+                index_valid_keys.append(key_name)
+        
+        # Build features if feat_keys specified
+        if self.feat_keys:
+            feat_list = []
+            for fk in self.feat_keys:
+                if fk in out_dict:
+                    f = out_dict[fk]
+                    if f.ndim == 1:
+                        f = f.reshape(-1, 1)
+                    feat_list.append(f.astype(np.float32))
+            if feat_list:
+                out_dict["feat"] = np.concatenate(feat_list, axis=1)
+                index_valid_keys.append("feat")
+        
+        out_dict["index_valid_keys"] = index_valid_keys
+        
+        # Store inverse mapping for potential use (but main mechanism is 'sub' Cluster)
+        out_dict["voxel_inverse"] = inverse
+        
+        # Restore preserved raw keys (original point-level data for evaluation)
+        # CRITICAL: Do this BEFORE ensuring grid_size to avoid overwriting metadata
+        out_dict.update(raw_keys_to_preserve)
+        
+        # CRITICAL FIX: Ensure grid_size is always present (required by Point.sparsify())
+        # Even if it was in data_dict originally, ensure output has it
+        out_dict["grid_size"] = self.size
+        
+        return out_dict
 
 
 @TRANSFORMS.register_module()
@@ -2311,3 +2833,4 @@ class ClassLabelClamp(object):
             input_dict["segment"] = segment
             
         return input_dict
+

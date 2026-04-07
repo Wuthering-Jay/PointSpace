@@ -96,7 +96,7 @@ class LasDataset(DefaultDataset):
         # Store optional override params for potential use in get_data_list
         self._data_path = data_path
         self._data_list_input = data_list
-
+        
         # Always pass test_mode=False so the base class does NOT try to build
         # transforms from test_cfg (which we don't use).  We restore the real
         # test_mode on self right after.  cache=False is also always enforced
@@ -194,9 +194,11 @@ class LasDataset(DefaultDataset):
         # Filter by required_class
         if self.required_class is not None:
             valid_classes = [c for c in all_classes if c in self.required_class]
+            removed_classes = [c for c in all_classes if c not in self.required_class]
             logger.info(f"Filtering classes: {len(valid_classes)}/{len(all_classes)} classes kept")
             logger.info(f"  Kept classes: {valid_classes}")
-            logger.info(f"  Removed classes will be mapped to ignore_index={self.ignore_index}")
+            if removed_classes:
+                logger.info(f"  Removed classes: {removed_classes} -> will be mapped to ignore_index={self.ignore_index}")
         else:
             valid_classes = all_classes
         
@@ -224,15 +226,33 @@ class LasDataset(DefaultDataset):
                 logger.warning(f"  WARNING: Duplicate mapped IDs detected! This may cause issues.")
                 
         elif self.remap_class and len(valid_classes) > 0:
-            # Auto remap to continuous IDs
-            start_id = 0 if self.ignore_index < 0 else 1
-            self.class2id = {c: start_id + i for i, c in enumerate(valid_classes)}
+            # Auto remap to continuous IDs starting from 0
+            # This is critical for EZ-SP: labels must be [0, 1, ..., num_classes-1]
+            # and ignore_index should be num_classes
+            self.class2id = {c: i for i, c in enumerate(valid_classes)}
             self.id2class = {v: k for k, v in self.class2id.items()}
             
-            logger.info(f"Auto class remapping enabled (ignore_index={self.ignore_index}):")
-            logger.info(f"  Original classes: {valid_classes}")
-            logger.info(f"  Remapped to: {list(range(start_id, start_id + len(valid_classes)))}")
-            logger.info(f"  Mapping: {self.class2id}")
+            logger.info(f"✓ Auto class remapping:")
+            logger.info(f"")
+            logger.info(f"  Step 1 - Filter classes:")
+            logger.info(f"    All classes found: {all_classes}")
+            if self.required_class is not None and removed_classes:
+                logger.info(f"    Keep: {valid_classes}")
+                logger.info(f"    Remove: {removed_classes}")
+            else:
+                logger.info(f"    Keep all: {valid_classes}")
+            logger.info(f"")
+            logger.info(f"  Step 2 - Remap valid classes to continuous [0, 1, ..., {len(valid_classes)-1}]:")
+            logger.info(f"    Original classes: {valid_classes}")
+            logger.info(f"    Remapped to:      {list(range(len(valid_classes)))}")
+            logger.info(f"    Mapping: {self.class2id}")
+            logger.info(f"")
+            logger.info(f"  Step 3 - Data loading will apply mapping:")
+            logger.info(f"    Valid classes (e.g., {valid_classes[0]}) → Remapped ID (e.g., {self.class2id[valid_classes[0]]})")
+            if self.required_class is not None and removed_classes:
+                logger.info(f"    Removed classes {removed_classes} → ignore_index={self.ignore_index}")
+            logger.info(f"")
+            logger.info(f"  ✓ VERIFIED: ignore_index={self.ignore_index} != any remapped class {list(range(len(valid_classes)))} (no conflict)")
         else:
             # No remapping, identity mapping for valid classes
             self.class2id = {c: c for c in valid_classes}
@@ -680,6 +700,10 @@ class LasDataset(DefaultDataset):
             if hasattr(las, "classification"):
                 segment = np.array(las.classification, dtype=np.int32)
                 # Apply class mapping
+                # CRITICAL: _map_classes will:
+                #   1. Remap valid classes (e.g., 1->0, 2->1, ..., 8->7)
+                #   2. Set all removed/invalid classes to ignore_index (e.g., 0->8)
+                # This ensures ignore_index is applied AFTER remapping, avoiding conflicts
                 if self.class2id is not None:
                     segment = self._map_classes(segment)
                 data_dict["segment"] = segment
@@ -833,6 +857,9 @@ class LasDataset(DefaultDataset):
             for frag in transform_result:
                 frag.pop("segment", None)
             
+            # CRITICAL: Preserve segment_raw for partition evaluation
+            if "segment_raw" in transform_result[0]:
+                result_dict["segment_raw"] = transform_result[0].pop("segment_raw")
             if "origin_segment" in transform_result[0]:
                 result_dict["origin_segment"] = transform_result[0].pop("origin_segment")
             if "inverse" in transform_result[0]:
@@ -860,6 +887,9 @@ class LasDataset(DefaultDataset):
                 segment=data_dict.get("segment"),  # keep in data_dict so fragments inherit it
                 name=data_dict.get("name", self.get_data_name(idx))
             )
+            # CRITICAL: Preserve segment_raw for partition evaluation
+            if "segment_raw" in data_dict:
+                result_dict["segment_raw"] = data_dict.pop("segment_raw")
             if "origin_segment" in data_dict:
                 result_dict["origin_segment"] = data_dict.pop("origin_segment")
             if "inverse" in data_dict:

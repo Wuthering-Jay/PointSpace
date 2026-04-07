@@ -9,9 +9,11 @@ Author: PointSpace Team
 """
 
 import torch
-from torch import nn
+import torch.nn.functional as F
+from torch import nn, Tensor
+from torch.nn.parameter import Parameter
 from torch_scatter import scatter
-from torch_geometric.nn.norm import LayerNorm, InstanceNorm, GraphNorm
+from torch_geometric.nn.norm import InstanceNorm, GraphNorm
 from torch_geometric.nn.inits import ones, zeros
 from torch_geometric.utils import degree
 from typing import Optional
@@ -21,7 +23,7 @@ __all__ = [
     "BatchNorm",
     "UnitSphereNorm",
     "GroupNorm",
-    "LayerNorm",
+    "LayerNorm",  # Custom FP16-friendly version
     "InstanceNorm",
     "GraphNorm",
     "INDEX_BASED_NORMS",
@@ -348,6 +350,135 @@ class GroupNorm(torch.nn.Module):
             f"{self.__class__.__name__}(in_channels={self.in_channels}, "
             f"num_groups={self.num_groups}, mode={self.mode})"
         )
+
+
+class LayerNorm(nn.Module):
+    r"""FP16-friendly Layer Normalization for graph/point cloud data.
+    
+    Applies layer normalization with improved numerical stability for mixed precision training.
+    Based on torch_geometric.nn.norm.LayerNorm but with FP16 optimizations:
+    
+    1. Larger default eps (1e-3 instead of 1e-5) to prevent FP16 underflow
+    2. FP32 accumulation for mean/variance computation to avoid precision loss
+    3. Gradient-safe sqrt operation
+    
+    .. math::
+        \mathbf{x}^{\prime}_i = \frac{\mathbf{x} -
+        \textrm{E}[\mathbf{x}]}{\sqrt{\textrm{Var}[\mathbf{x}] + \epsilon}}
+        \odot \gamma + \beta
+
+    Args:
+        in_channels (int): Size of each input sample.
+        eps (float, optional): A value added to the denominator for numerical
+            stability. Default: 1e-3 (larger than torch_geometric's 1e-5 for FP16 safety)
+        affine (bool, optional): If set to True, this module has
+            learnable affine parameters gamma and beta. (default: True)
+        mode (str, optional): The normalization mode ("graph" or "node").
+            If "graph", each graph is normalized independently.
+            If "node", each node is normalized independently. (default: "graph")
+    """
+    def __init__(
+        self,
+        in_channels: int,
+        eps: float = 1e-3,  # Larger eps for FP16 stability
+        affine: bool = True,
+        mode: str = 'graph',
+    ):
+        super().__init__()
+
+        self.in_channels = in_channels
+        self.eps = eps
+        self.affine = affine
+        self.mode = mode
+
+        if affine:
+            self.weight = Parameter(torch.empty(in_channels))
+            self.bias = Parameter(torch.empty(in_channels))
+        else:
+            self.register_parameter('weight', None)
+            self.register_parameter('bias', None)
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        """Initialize learnable parameters: weight=1.0, bias=0.0"""
+        ones(self.weight)
+        zeros(self.bias)
+
+    def forward(self, x: Tensor, batch: Optional[Tensor] = None,
+                batch_size: Optional[int] = None) -> Tensor:
+        r"""Forward pass with FP16 stability improvements.
+
+        Args:
+            x (torch.Tensor): Input tensor [N, D] or [B, N, D]
+            batch (torch.Tensor, optional): Batch assignment vector [N]
+                assigning each element to a specific example.
+            batch_size (int, optional): Number of examples B.
+                Automatically calculated if not given.
+        
+        Returns:
+            Normalized tensor of same shape as input.
+        """
+        if self.mode == 'graph':
+            # Store original dtype for output
+            orig_dtype = x.dtype
+            
+            # Convert to FP32 for stable mean/var computation
+            x_fp32 = x.float()
+            
+            if batch is None:
+                # Single graph normalization
+                mean = x_fp32.mean()
+                # Use unbiased=False for consistency with batch behavior
+                std = x_fp32.std(unbiased=False)
+                
+                # Normalize in FP32
+                out = (x_fp32 - mean) / (std + self.eps)
+                
+            else:
+                # Multi-graph normalization
+                if batch_size is None:
+                    batch_size = int(batch.max()) + 1
+
+                # Compute normalization factor (total elements per graph)
+                norm = degree(batch, batch_size, dtype=torch.float32).clamp_(min=1)
+                norm = norm.mul_(x_fp32.size(-1)).view(-1, 1)
+
+                # Compute per-graph mean in FP32
+                mean = scatter(x_fp32, batch, dim=0, dim_size=batch_size,
+                               reduce='sum').sum(dim=-1, keepdim=True) / norm
+
+                # Center the data
+                x_centered = x_fp32 - mean.index_select(0, batch)
+
+                # Compute per-graph variance in FP32
+                var = scatter(x_centered * x_centered, batch, dim=0, dim_size=batch_size,
+                              reduce='sum').sum(dim=-1, keepdim=True)
+                var = var / norm
+
+                # Normalize with safe sqrt (add eps before sqrt for numerical stability)
+                std = (var + self.eps).sqrt()
+                out = x_centered / std.index_select(0, batch)
+
+            # Apply affine transformation (weight and bias should be in FP32 for stability)
+            if self.weight is not None and self.bias is not None:
+                out = out * self.weight.float() + self.bias.float()
+
+            # Convert back to original dtype
+            return out.to(orig_dtype)
+
+        elif self.mode == 'node':
+            # Use PyTorch's optimized LayerNorm for node-level normalization
+            # PyTorch's implementation handles FP16 well internally
+            return F.layer_norm(x, (self.in_channels,), self.weight,
+                                self.bias, self.eps)
+        
+        else:
+            raise ValueError(f"Unknown normalization mode: {self.mode}")
+
+    def __repr__(self):
+        return (f'{self.__class__.__name__}({self.in_channels}, '
+                f'eps={self.eps}, affine={self.affine}, mode={self.mode})')
 
 
 # Tuple of normalization layers that require batch index

@@ -401,6 +401,22 @@ class LASWriter(BaseWriter):
             self._add_extra_dim(las, "curvature", curvature, np.float64)
             logger.debug("  -> curvature 字段已写入")
 
+        # ========== 超点分割 (Superpoint Partition) ==========
+        # 支持多级超点标签，字段名格式：superpoint_level_1, superpoint_level_2, ...
+        # 用于 EZ-SP 等可学习超点分割方法的输出
+        for key, value in kwargs.items():
+            if key.startswith("superpoint_level_"):
+                sp_data = np.asarray(value, dtype=np.int32)
+                if sp_data.shape[0] != n_points:
+                    raise ValueError(
+                        f"{key} 长度 ({sp_data.shape[0]}) 与点数 ({n_points}) 不匹配"
+                    )
+                self._add_extra_dim(las, key, sp_data, np.int32)
+                logger.debug(
+                    f"  -> {key} 字段已写入 "
+                    f"(unique superpoints: {len(np.unique(sp_data))})"
+                )
+
         # ========== 通用自定义维度 (Extra Dimensions) ==========
         # 允许用户直接指定 {字段名: (数据数组, dtype)} 的字典来写入任意维度
         extra_dims = kwargs.get("extra_dims", None)

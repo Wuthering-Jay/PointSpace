@@ -31,8 +31,8 @@ in_channels = 5
 # -------------------------------------------------------
 # 2. Checkpoint / run control
 # -------------------------------------------------------
-# weight = "exp/dales/semseg-pt-v2m4-2-base/model/model_last.pth"   # path to pretrained / fine-tune weight
-weight = None
+weight = "exp/dales/semseg-pt-v2m4-2-base/model/model_last.pth"   # path to pretrained / fine-tune weight
+# weight = None
 resume = True      # resume from the latest checkpoint
 evaluate = True     # run evaluation after each training epoch
 test_only = False   # skip training, run test only
@@ -45,7 +45,7 @@ batch_size_train = 8       # effective batch = micro_batch × gradient_accumulat
                            #   micro_batch = batch_size_train // gradient_accumulation_steps
 batch_size_val = 4         # None → auto 1 per GPU (no gradient → less memory than train)
 batch_size_test = 2        # None → auto 1 per GPU; >1 = fragments per forward in SemSegTester
-num_worker = 4            # total dataloader workers across all GPUs
+num_worker = 0            # total dataloader workers across all GPUs
 gradient_accumulation_steps = 2  # effective batch = 2, micro_batch per step = 3
 
 # -------------------------------------------------------
@@ -109,15 +109,6 @@ model = dict(
     criteria=[
         dict(type="CrossEntropyLoss", loss_weight=1.0, ignore_index=-1, auto_class_weight=True),
         dict(type="LovaszLoss", mode="multiclass", loss_weight=1.0, ignore_index=-1),
-    ],
-    sp_criteria=[
-        dict(
-            type="SuperpointConsistencyLoss",
-            conflict_margin=0.2,
-            loss_weight=5,
-            train_only=True,
-            warmup_epochs=1,  # 前 3 个 epoch 不启用
-        ),
     ],
 )
 

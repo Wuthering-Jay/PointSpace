@@ -78,33 +78,45 @@ class GraphNorm(nn.Module):
 
     def forward(self, x: Tensor, batch: Tensor) -> Tensor:
         """
-        Forward pass
+        Forward pass with numerical stability
+        
+        Strategy: Always compute in FP32 for stability, then convert back
+        to original dtype. This preserves AMP benefits while ensuring
+        normalization doesn't cause numerical issues.
 
         Args:
             x: (N, C) Point features
             batch: (N,) Batch index for each point (0, 0, ..., 1, 1, ..., B-1)
 
         Returns:
-            x_norm: (N, C) Normalized features
+            x_norm: (N, C) Normalized features (same dtype as input)
         """
+        # Store original dtype
+        orig_dtype = x.dtype
+        
+        # Compute in FP32 for numerical stability
+        x_fp32 = x.float()
+        
         # Compute per-graph mean: [B, C]
-        mean = scatter_mean(x, batch, dim=0)
+        mean = scatter_mean(x_fp32, batch, dim=0)
+        mean_expanded = mean[batch]  # [N, C]
 
         # Center features
-        x_centered = x - mean[batch]
+        x_centered = x_fp32 - mean_expanded
 
         # Compute per-graph variance: [B, C]
         var = scatter_mean(x_centered**2, batch, dim=0)
-
-        # Normalize
         std = (var + self.eps).sqrt()
+
         x_norm = x_centered / std[batch]
 
-        # Apply affine transformation
+        # Apply affine transformation (in FP32)
         if self.affine:
-            x_norm = x_norm * self.weight + self.bias
+            x_norm = x_norm * self.weight.float() + self.bias.float()
 
-        return x_norm
+        # Convert back to original dtype
+        return x_norm.to(orig_dtype)
+
 
     def extra_repr(self) -> str:
         return f"{self.num_features}, eps={self.eps}, affine={self.affine}"

@@ -93,6 +93,71 @@ class Cluster:
         value = sorted_idx
 
         return cls(pointer, value)
+    
+    @classmethod
+    def from_dict(cls, d: dict, device=None) -> "Cluster":
+        """
+        Create Cluster from dict (typically from GridSampling3D transform).
+        
+        Args:
+            d: dict with 'pointer' and 'value' keys (numpy arrays or tensors)
+            device: Optional device to place tensors
+            
+        Returns:
+            Cluster object
+        """
+        pointer = d["pointer"]
+        value = d["value"]
+        
+        if isinstance(pointer, (list, tuple)):
+            import numpy as np
+            pointer = np.array(pointer)
+        if isinstance(value, (list, tuple)):
+            import numpy as np
+            value = np.array(value)
+        
+        if not isinstance(pointer, Tensor):
+            pointer = torch.from_numpy(pointer).long()
+        if not isinstance(value, Tensor):
+            value = torch.from_numpy(value).long()
+        
+        if device is not None:
+            pointer = pointer.to(device)
+            value = value.to(device)
+        
+        return cls(pointer, value)
+    
+    def to_super_index(self) -> Tensor:
+        """
+        Convert Cluster to super_index format.
+        
+        Returns:
+            super_index: [num_points] mapping each point to its cluster
+        """
+        device = self.pointer.device
+        num_points = self.value.shape[0]
+        num_clusters = self.num_clusters
+        
+        # Create cluster indices repeated by their sizes
+        sizes = self.pointer[1:] - self.pointer[:-1]
+        
+        # Safety check: sizes should be non-negative
+        if (sizes < 0).any():
+            raise RuntimeError(
+                f"Cluster has invalid pointer (negative sizes). "
+                f"pointer shape: {self.pointer.shape}, "
+                f"min size: {sizes.min().item()}, max size: {sizes.max().item()}"
+            )
+        
+        cluster_idx = torch.arange(num_clusters, device=device)
+        repeated = cluster_idx.repeat_interleave(sizes.long())
+        
+        # Map back to original point order using value as indices
+        # value[i] tells us which original point index is at position i
+        super_index = torch.empty(num_points, dtype=torch.long, device=device)
+        super_index[self.value.long()] = repeated
+        
+        return super_index
 
     def __getitem__(self, idx: Union[int, Tensor]) -> Tensor:
         """

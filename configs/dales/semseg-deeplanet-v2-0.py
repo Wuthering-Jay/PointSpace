@@ -31,8 +31,8 @@ in_channels = 5
 # -------------------------------------------------------
 # 2. Checkpoint / run control
 # -------------------------------------------------------
-# weight = "exp/dales/semseg-deeplanet-v2-1/model/model_last.pth"   # path to pretrained / fine-tune weight
-weight = None
+weight = "exp/dales/semseg-deeplanet-v2-0/model/model_last.pth"   # path to pretrained / fine-tune weight
+# weight = None
 resume = True      # resume from the latest checkpoint
 evaluate = True     # run evaluation after each training epoch
 test_only = False   # skip training, run test only
@@ -117,20 +117,6 @@ model = dict(
     aux_dropout=0.1,
     # 各 stage 的辅助损失权重比例 (越深的层权重越大)
     aux_weights=(0.1, 0.2, 0.3, 0.4),
-    # 超点一致性损失配置 (仅训练时生效，需要数据中包含 superpoint 字段)
-    # conflict_margin: 冲突容忍阈值，越小越保守 (0.05~0.2)
-    # loss_weight: 损失权重
-    # train_only: 仅在训练时生效
-    # warmup_epochs: 预热轮数，前 N 个 epoch 不启用此损失，让网络先稳定
-    sp_criteria=[
-        dict(
-            type="SuperpointConsistencyLoss",
-            conflict_margin=0.2,
-            loss_weight=1.0,
-            train_only=True,
-            warmup_epochs=0,  # 前 3 个 epoch 不启用
-        ),
-    ],
 )
 
 # -------------------------------------------------------

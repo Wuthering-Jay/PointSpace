@@ -127,8 +127,12 @@ class Point(Dict):
             # dict(type="Copy", keys_dict={"grid_size": 0.01}),
             # (adjust `grid_size` to what your want)
             assert {"grid_size", "coord"}.issubset(self.keys())
+            # Handle grid_size which may be a tensor with shape (1,) or ()
+            grid_size = self.grid_size
+            if isinstance(grid_size, torch.Tensor):
+                grid_size = grid_size.item() if grid_size.numel() == 1 else grid_size
             self["grid_coord"] = torch.div(
-                self.coord - self.coord.min(0)[0], self.grid_size, rounding_mode="trunc"
+                self.coord - self.coord.min(0)[0], grid_size, rounding_mode="trunc"
             ).int()
         if "sparse_shape" in self.keys():
             sparse_shape = self.sparse_shape

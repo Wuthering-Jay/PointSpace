@@ -259,6 +259,9 @@ class SPT(nn.Module):
         # Output
         norm_mode: str = "graph",
         output_stage_wise: bool = False,
+        # Segmentation head
+        num_classes: Optional[int] = None,
+        add_seg_head: bool = False,
     ):
         super().__init__()
 
@@ -530,6 +533,20 @@ class SPT(nn.Module):
                 )
         else:
             self.up_stages = None
+        
+        # Segmentation head (optional)
+        if add_seg_head and num_classes is not None:
+            out_channels = self.out_dim
+            if isinstance(out_channels, list):
+                # Multi-stage output: create head for each level
+                self.seg_head = nn.ModuleList([
+                    nn.Linear(dim, num_classes) for dim in out_channels
+                ])
+            else:
+                # Single-stage output
+                self.seg_head = nn.Linear(out_channels, num_classes)
+        else:
+            self.seg_head = None
 
     @property
     def num_down_stages(self) -> int:
@@ -658,8 +675,18 @@ class SPT(nn.Module):
         # Output
         if self.output_stage_wise:
             out = [x] + up_outputs[::-1][1:] + [down_outputs[-1]]
+            # Apply seg_head if present
+            if self.seg_head is not None:
+                if isinstance(self.seg_head, nn.ModuleList):
+                    out = [head(feat) for head, feat in zip(self.seg_head, out)]
+                else:
+                    out = [self.seg_head(feat) for feat in out]
             return out
 
+        # Apply seg_head if present (single-stage output)
+        if self.seg_head is not None and not isinstance(self.seg_head, nn.ModuleList):
+            x = self.seg_head(x)
+        
         return x
 
     def _get_norm_index(self, level_data: Dict[str, Any]) -> torch.Tensor:

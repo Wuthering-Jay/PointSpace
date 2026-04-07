@@ -2129,3 +2129,551 @@ class CnfTester(TesterBase):
     @staticmethod
     def collate_fn(batch):
         return batch
+
+
+@TESTERS.register_module()
+class EZSPPartitionTester(TesterBase):
+    """Test-time evaluator for EZ-SP partition learning (Stage 1).
+    
+    Unlike SemSegTester, this does not require 'seg_logits' output.
+    Instead, it evaluates the quality of learned superpoint partitions:
+    
+    1. **Oracle mIoU**: Each superpoint takes its majority class label.
+       Higher values indicate better boundary alignment with objects.
+    2. **Superpoint statistics**: Number of superpoints, average size.
+    
+    Output files:
+        * LAS with superpoint labels in custom fields (superpoint_level_1, etc.)
+        * Optionally: superpoint boundaries visualization
+    
+    Args:
+        max_levels: Maximum number of superpoint levels to save (default: 3)
+    """
+    
+    def __init__(self, max_levels: int = 3, **kwargs):
+        super().__init__(**kwargs)
+        self.max_levels = max_levels
+    
+    def test(self):
+        auto_cast = _build_autocast(self.cfg)
+        logger = get_root_logger()
+        logger.info(">>>>>>>>>>>>>>>> Start Partition Evaluation >>>>>>>>>>>>>>>>")
+        
+        batch_time = AverageMeter()
+        intersection_meter = AverageMeter()
+        union_meter = AverageMeter()
+        target_meter = AverageMeter()
+        
+        self.model.eval()
+        
+        # General writer for superpoint output
+        general_writer = None
+        writer_cfg = getattr(self.cfg, "writer", None)
+        if writer_cfg is not None:
+            general_writer = build_writer(writer_cfg)
+        
+        comm.synchronize()
+        record = {}
+        
+        num_classes = self.cfg.data.num_classes
+        ignore_index = getattr(self.cfg.data, "ignore_index", -1)
+        
+        for idx, data_dict in enumerate(self.test_loader):
+            start = time.time()
+            data_dict = data_dict[0]  # batch size = 1
+            
+            # Get scene info
+            data_name = data_dict.pop("name", f"scene_{idx}")
+            
+            # Debug: Check what keys are available
+            if idx == 0:
+                logger.info(f"[DEBUG] data_dict keys: {list(data_dict.keys())}")
+                if 'segment' in data_dict:
+                    logger.info(f"[DEBUG] segment shape: {data_dict['segment'].shape}")
+                if 'segment_raw' in data_dict:
+                    logger.info(f"[DEBUG] segment_raw shape: {data_dict['segment_raw'].shape}")
+            
+            # For partition evaluation, use raw point-level labels
+            segment = data_dict.pop("segment_raw", None)
+            if segment is None:
+                segment = data_dict.pop("segment", None)
+                if idx == 0:
+                    logger.info(f"[DEBUG] Using 'segment' (voxel-level), shape: {segment.shape if segment is not None else None}")
+            else:
+                if idx == 0:
+                    logger.info(f"[DEBUG] Using 'segment_raw' (point-level), shape: {segment.shape if segment is not None else None}")
+            
+            # Handle fragment-based processing if present
+            if "fragment_list" in data_dict:
+                # Process all fragments and aggregate
+                fragment_list = data_dict.pop("fragment_list")
+                
+                # For partition model, we process one fragment at a time
+                # Accumulate superpoint predictions across fragments
+                all_sp_labels = []
+                all_oracle_preds = []
+                
+                for frag_dict in fragment_list:
+                    # CRITICAL: Inject segment_raw into fragment for Oracle computation
+                    # segment_raw is stored in outer dict, but model needs it in fragment
+                    if segment is not None and "segment_raw" not in frag_dict:
+                        # segment here is actually segment_raw (we popped it earlier)
+                        if isinstance(segment, torch.Tensor):
+                            frag_dict["segment_raw"] = segment.clone()
+                        else:
+                            frag_dict["segment_raw"] = torch.from_numpy(segment).long()
+                    
+                    for key in frag_dict.keys():
+                        if isinstance(frag_dict[key], torch.Tensor):
+                            frag_dict[key] = frag_dict[key].cuda(non_blocking=True)
+                    
+                    with torch.no_grad(), auto_cast():
+                        output_dict = self.model(frag_dict)
+                    
+                    if "superpoint_labels" in output_dict:
+                        all_sp_labels.append(output_dict["superpoint_labels"])
+                    if "y_pred" in output_dict:
+                        all_oracle_preds.append(output_dict["y_pred"])
+                    elif (
+                        "y_pred_voxel" in output_dict
+                        and "superpoint_labels_multi" in output_dict
+                        and len(output_dict["superpoint_labels_multi"]) > 0
+                    ):
+                        # Fallback: recover point-level oracle from voxel-level oracle
+                        # using L1 (voxel) id at point level.
+                        l1_ids = output_dict["superpoint_labels_multi"][0]
+                        y_pred_point = output_dict["y_pred_voxel"][l1_ids]
+                        all_oracle_preds.append(y_pred_point)
+                
+                # Combine results
+                if all_oracle_preds:
+                    y_pred = torch.cat(all_oracle_preds, dim=0)
+                else:
+                    y_pred = None
+                    
+                if all_sp_labels:
+                    superpoint_labels = torch.cat(all_sp_labels, dim=0)
+                else:
+                    superpoint_labels = None
+            else:
+                # Single batch processing
+                for key in data_dict.keys():
+                    if isinstance(data_dict[key], torch.Tensor):
+                        data_dict[key] = data_dict[key].cuda(non_blocking=True)
+                
+                with torch.no_grad(), auto_cast():
+                    output_dict = self.model(data_dict)
+                
+                y_pred = output_dict.get("y_pred", None)
+                superpoint_labels = output_dict.get("superpoint_labels", None)
+            
+            # Handle origin mapping
+            if segment is not None and "origin_segment" in data_dict:
+                segment = data_dict["origin_segment"]
+                if "inverse" in data_dict and y_pred is not None:
+                    y_pred = y_pred[data_dict["inverse"]]
+                if "inverse" in data_dict and superpoint_labels is not None:
+                    superpoint_labels = superpoint_labels[data_dict["inverse"]]
+            
+            # Compute Oracle metrics if we have ground truth
+            if segment is not None:
+                if idx == 0:
+                    logger.info(f"[DEBUG Metrics] segment shape: {segment.shape if hasattr(segment, 'shape') else type(segment)}")
+                    logger.info(f"[DEBUG Metrics] y_pred: {y_pred.shape if y_pred is not None else None}")
+                    logger.info(f"[DEBUG Metrics] output_dict keys: {list(output_dict.keys())}")
+                
+                if y_pred is not None:
+                    # Move to numpy for metric computation
+                    y_pred_np = y_pred.cpu().numpy() if isinstance(y_pred, torch.Tensor) else y_pred
+                    segment_np = segment.cpu().numpy() if isinstance(segment, torch.Tensor) else segment
+                    
+                    # Debug shape mismatch
+                    if y_pred_np.shape != segment_np.shape:
+                        logger.error(
+                            f"Shape mismatch: y_pred={y_pred_np.shape}, segment={segment_np.shape}\n"
+                            f"  data_name={data_name}\n"
+                            f"  Has inverse: {'inverse' in data_dict}\n"
+                            f"  Has origin_segment: {'origin_segment' in data_dict}\n"
+                            f"  segment source: {'origin_segment' if 'origin_segment' in data_dict else 'segment'}"
+                        )
+                        # Try to fix by checking if we need to use inverse
+                        if "inverse" in data_dict:
+                            logger.info(f"  Applying inverse mapping: inverse shape={data_dict['inverse'].shape}")
+                            y_pred_np = y_pred_np[data_dict["inverse"].cpu().numpy()]
+                            logger.info(f"  After inverse: y_pred shape={y_pred_np.shape}")
+                    
+                    intersection, union, target = intersection_and_union(
+                        y_pred_np, segment_np, num_classes, ignore_index
+                    )
+                    
+                    intersection_meter.update(intersection)
+                    union_meter.update(union)
+                    target_meter.update(target)
+                    
+                    record[data_name] = dict(
+                        intersection=intersection, union=union, target=target
+                    )
+                    
+                    # Per-scene metrics
+                    mask = union != 0
+                    iou_class = intersection / (union + 1e-10)
+                    iou = np.mean(iou_class[mask])
+                    acc = sum(intersection) / (sum(target) + 1e-10)
+                else:
+                    if idx == 0:
+                        logger.warning("[DEBUG Metrics] y_pred is None, skipping metrics computation")
+                    iou = 0.0
+                    acc = 0.0
+            else:
+                iou = 0.0
+                acc = 0.0
+            
+            # Write predictions to output file
+            if general_writer is not None:
+                write_kwargs = {}
+                
+                # Multi-level superpoint IDs (for partition evaluation visualization)
+                if "superpoint_labels_multi" in output_dict:
+                    sp_multi = output_dict["superpoint_labels_multi"]
+                    for level, sp_level in enumerate(sp_multi):
+                        sp_level_np = sp_level.cpu().numpy() if isinstance(sp_level, torch.Tensor) else sp_level
+                        write_kwargs[f"superpoint_level_{level + 1}"] = sp_level_np.astype(np.int32)
+                    
+                    if idx == 0:
+                        logger.info(f"[DEBUG Writer] Writing {len(sp_multi)} levels of superpoint IDs to points")
+                        for level, sp_level in enumerate(sp_multi):
+                            logger.info(f"  Level {level + 1}: {sp_level.shape[0]} points")
+                
+                # Final superpoint labels (highest level)
+                elif superpoint_labels is not None:
+                    sp_labels_np = superpoint_labels.cpu().numpy() if isinstance(superpoint_labels, torch.Tensor) else superpoint_labels
+                    write_kwargs["superpoint_level_1"] = sp_labels_np.astype(np.int32)
+                
+                # Oracle predictions (for partition quality evaluation)
+                if y_pred is not None:
+                    y_pred_np = y_pred.cpu().numpy() if isinstance(y_pred, torch.Tensor) else y_pred
+                    write_kwargs["oracle_pred"] = y_pred_np.astype(np.int32)
+                    
+                    if idx == 0:
+                        logger.info(f"[DEBUG Writer] Writing Oracle predictions: {y_pred_np.shape[0]} points")
+                
+                if write_kwargs:
+                    general_writer.write(data_name, **write_kwargs)
+            
+            # Logging
+            m_iou = np.mean(intersection_meter.sum / (union_meter.sum + 1e-10))
+            m_acc = np.mean(intersection_meter.sum / (target_meter.sum + 1e-10))
+            
+            batch_time.update(time.time() - start)
+            logger.info(
+                "Test: {} [{}/{}] "
+                "Batch {batch_time.val:.3f} ({batch_time.avg:.3f}) "
+                "Oracle Acc {acc:.4f} ({m_acc:.4f}) "
+                "Oracle mIoU {iou:.4f} ({m_iou:.4f})".format(
+                    data_name,
+                    idx + 1,
+                    len(self.test_loader),
+                    batch_time=batch_time,
+                    acc=acc,
+                    m_acc=m_acc,
+                    iou=iou,
+                    m_iou=m_iou,
+                )
+            )
+            
+            self.cache_cleaner.check_and_clean(
+                batch_time.val, f"test iter {idx + 1}/{len(self.test_loader)}"
+            )
+        
+        # Sync across processes
+        logger.info("Syncing ...")
+        comm.synchronize()
+        record_sync = comm.gather(record, dst=0)
+        
+        if comm.is_main_process():
+            record = {}
+            for _ in range(len(record_sync)):
+                r = record_sync.pop()
+                record.update(r)
+                del r
+            
+            if record:
+                intersection = np.sum(
+                    [meters["intersection"] for _, meters in record.items()], axis=0
+                )
+                union = np.sum([meters["union"] for _, meters in record.items()], axis=0)
+                target = np.sum([meters["target"] for _, meters in record.items()], axis=0)
+                
+                iou_class = intersection / (union + 1e-10)
+                acc_class = intersection / (target + 1e-10)
+                m_iou = np.mean(iou_class)
+                m_acc = np.mean(acc_class)
+                all_acc = sum(intersection) / (sum(target) + 1e-10)
+                
+                logger.info(
+                    "Partition Test Result: Oracle mIoU/mAcc/allAcc {:.4f}/{:.4f}/{:.4f}".format(
+                        m_iou, m_acc, all_acc
+                    )
+                )
+                
+                # Per-class breakdown
+                names = self.cfg.data.names
+                if names is not None:
+                    for i in range(min(len(names), num_classes)):
+                        logger.info(
+                            "Class_{idx}-{name} Result: Oracle IoU {iou:.4f}".format(
+                                idx=i, name=names[i], iou=iou_class[i]
+                            )
+                        )
+            else:
+                logger.info("No ground truth available for evaluation.")
+        
+        logger.info("<<<<<<<<<<<<<<<<< End Partition Evaluation <<<<<<<<<<<<<<<<<")
+    
+    @staticmethod
+    def collate_fn(batch):
+        return batch
+
+
+"""
+Simple tester for superpoint semantic segmentation models.
+
+Unlike SemSegTester which uses fragment-based inference with TTA,
+this tester performs single-pass inference similar to validation.
+
+Suitable for models that:
+- Use sub_cluster for chain propagation (voxel->point)
+- Don't require fragment-based multi-scale testing
+- Already output point-level predictions via internal propagation
+"""
+
+from pointspace.engines.test import TesterBase, TESTERS
+from pointspace.utils.logger import get_root_logger
+from pointspace.utils.misc import AverageMeter, intersection_and_union_gpu
+from pointspace.utils import comm
+import torch
+import torch.nn.functional as F
+import time
+import numpy as np
+from functools import partial
+
+
+@TESTERS.register_module()
+class SuperpointSemSegTester(TesterBase):
+    """Tester for superpoint models (single-pass inference, no fragment-based TTA).
+    
+    For models that handle chain propagation internally (superpoint->voxel->point).
+    Assumes test_mode=False in dataset config for simple val-like data loading.
+    """
+    def build_test_loader(self):
+        test_dataset = build_dataset(self.cfg.data.test)
+        if comm.get_world_size() > 1:
+            test_sampler = torch.utils.data.distributed.DistributedSampler(test_dataset)
+        else:
+            test_sampler = None
+        batch_size_test = getattr(
+            self.cfg,
+            "batch_size_test_per_gpu",
+            getattr(self.cfg, "batch_size_test", 1),
+        )
+        test_loader = torch.utils.data.DataLoader(
+            test_dataset,
+            batch_size=batch_size_test,
+            shuffle=False,
+            num_workers=self.cfg.num_worker_per_gpu,
+            pin_memory=True,
+            sampler=test_sampler,
+            collate_fn=self.__class__.collate_fn,
+        )
+        return test_loader
+
+    def test(self):
+        logger = get_root_logger()
+        logger.info(">>>>>>>>>>>>>>>> Start Superpoint Evaluation >>>>>>>>>>>>>>>>")
+        
+        batch_size_test = getattr(
+            self.cfg,
+            "batch_size_test_per_gpu",
+            getattr(self.cfg, "batch_size_test", 1),
+        )
+        logger.info(f"Batch size: {batch_size_test}")
+        
+        auto_cast = _build_autocast(self.cfg)
+        batch_time = AverageMeter()
+        intersection_meter = AverageMeter()
+        union_meter = AverageMeter()
+        target_meter = AverageMeter()
+        
+        self.model.eval()
+        
+        # Build writer if configured
+        writer_cfg = getattr(self.cfg, 'writer', None)
+        benchmark_writer = None
+        if writer_cfg is not None:
+            from pointspace.writers import WRITERS
+            benchmark_writer = WRITERS.build(writer_cfg)
+            logger.info(f"Writer enabled: {writer_cfg['type']}")
+        
+        comm.synchronize()
+        
+        num_samples = len(self.test_loader.dataset)
+        processed = 0
+        dataset = self.test_loader.dataset
+
+        for _, data_dict in enumerate(self.test_loader):
+            start = time.time()
+            if not isinstance(data_dict, dict):
+                raise TypeError(
+                    "SuperpointSemSegTester expects collated dict input. "
+                    f"Got {type(data_dict)}"
+                )
+
+            # Extract names (list[str] when batch>1, str when batch=1)
+            names = data_dict.pop("name", None)
+            if names is None:
+                bs_fallback = int(data_dict["offset"].shape[0]) if "offset" in data_dict else 1
+                names = [
+                    dataset.get_data_name(processed + i) if hasattr(dataset, "get_data_name")
+                    else f"sample_{processed + i}"
+                    for i in range(bs_fallback)
+                ]
+            elif isinstance(names, str):
+                names = [names]
+            else:
+                names = list(names)
+
+            # Extract GT labels (concatenated across batch after collate_fn)
+            segment = None
+            if "segment_raw" in data_dict:
+                segment = data_dict.pop("segment_raw")
+            elif "segment" in data_dict:
+                segment = data_dict.pop("segment")
+                if isinstance(segment, torch.Tensor) and segment.dim() > 1:
+                    segment = segment[:, :self.cfg.data.num_classes].argmax(dim=1)
+            if isinstance(segment, torch.Tensor):
+                segment = segment.cpu().numpy()
+
+            # For superpoint model output, seg_logits is at raw-point level (N).
+            # So per-sample slicing must use num_raw_points, not voxel offset.
+            if "num_raw_points" not in data_dict:
+                raise KeyError("SuperpointSemSegTester requires 'num_raw_points' in batch data.")
+            nraw = data_dict["num_raw_points"]
+            if isinstance(nraw, torch.Tensor):
+                nraw_np = nraw.cpu().numpy().astype(np.int64).reshape(-1)
+            elif isinstance(nraw, (list, tuple)):
+                nraw_np = np.asarray(nraw, dtype=np.int64).reshape(-1)
+            else:
+                nraw_np = np.asarray([nraw], dtype=np.int64)
+            ends = np.cumsum(nraw_np)
+            starts = np.concatenate(([0], ends[:-1]))
+
+            # Move tensors to GPU
+            for key in data_dict.keys():
+                if isinstance(data_dict[key], torch.Tensor):
+                    data_dict[key] = data_dict[key].cuda(non_blocking=True)
+
+            # Forward once per batch
+            with torch.no_grad(), auto_cast():
+                output_dict = self.model(data_dict)
+            pred_logits = output_dict["seg_logits"]
+
+            if pred_logits.shape[1] != self.cfg.data.num_classes:
+                raise RuntimeError(
+                    f"SuperpointSemSegTester: seg_logits channels={pred_logits.shape[1]} "
+                    f"!= num_classes={self.cfg.data.num_classes}. "
+                    f"Model must output exactly num_classes classes."
+                )
+            pred_all = pred_logits.max(1)[1].data.cpu().numpy()
+
+            # Per-sample write + metrics
+            for i, (s, e) in enumerate(zip(starts, ends)):
+                data_name = names[i] if i < len(names) else (
+                    dataset.get_data_name(processed + i) if hasattr(dataset, "get_data_name")
+                    else f"sample_{processed + i}"
+                )
+                pred = pred_all[s:e]
+                if benchmark_writer is not None:
+                    benchmark_writer.write(data_name, pred_sem=self._remap_to_original(pred))
+
+                if segment is not None:
+                    seg_i = segment[s:e]
+                    intersection, union, target = intersection_and_union(
+                        pred, seg_i, self.cfg.data.num_classes, self.cfg.data.ignore_index
+                    )
+                    intersection_meter.update(intersection)
+                    union_meter.update(union)
+                    target_meter.update(target)
+
+                    mask = union != 0
+                    iou_class = intersection / (union + 1e-10)
+                    iou = np.mean(iou_class[mask])
+                    acc = sum(intersection) / (sum(target) + 1e-10)
+                    m_iou = np.mean(intersection_meter.sum / (union_meter.sum + 1e-10))
+                    m_acc = np.mean(intersection_meter.sum / (target_meter.sum + 1e-10))
+                    logger.info(
+                        "Test: {} [{}/{}] "
+                        "BSz {} "
+                        "Batch {:.3f} ({:.3f}) "
+                        "Accuracy {:.4f} ({:.4f}) "
+                        "mIoU {:.4f} ({:.4f})".format(
+                            data_name,
+                            processed + i + 1,
+                            num_samples,
+                            len(ends),
+                            time.time() - start,
+                            batch_time.avg if batch_time.count > 0 else (time.time() - start),
+                            acc,
+                            m_acc,
+                            iou,
+                            m_iou,
+                        )
+                    )
+
+            batch_time.update(time.time() - start)
+            processed += len(ends)
+            if hasattr(self, "cache_cleaner") and self.cache_cleaner is not None:
+                self.cache_cleaner.check_and_clean(
+                    batch_time.val, f"test iter {processed}/{num_samples}"
+                )
+        
+        # Sync and final metrics
+        logger.info("Syncing ...")
+        comm.synchronize()
+        
+        if target_meter.count > 0:
+            iou_class = intersection_meter.sum / (union_meter.sum + 1e-10)
+            recall_class = intersection_meter.sum / (target_meter.sum + 1e-10)
+            fp_class = union_meter.sum - target_meter.sum
+            precision_class = intersection_meter.sum / (intersection_meter.sum + fp_class + 1e-10)
+            f1_class = (
+                2 * precision_class * recall_class
+                / (precision_class + recall_class + 1e-10)
+            )
+            mIoU = np.mean(iou_class)
+            mAcc = np.mean(recall_class)
+            allAcc = sum(intersection_meter.sum) / (sum(target_meter.sum) + 1e-10)
+            
+            logger.info("Val result: mIoU/mAcc/allAcc {:.4f}/{:.4f}/{:.4f}".format(
+                mIoU, mAcc, allAcc))
+
+            names = getattr(self.cfg.data, "names", None)
+            if names is None:
+                names = [f"Class_{i}" for i in range(self.cfg.data.num_classes)]
+            name_width = max(len(str(n)) for n in names)
+            for i in range(self.cfg.data.num_classes):
+                class_name = str(names[i]) if i < len(names) else f"Class_{i}"
+                logger.info(
+                    f"Class {i:2d} - {class_name:<{name_width}} | "
+                    f"IoU {iou_class[i]:.4f}  "
+                    f"Prec {precision_class[i]:.4f}  "
+                    f"Recall {recall_class[i]:.4f}  "
+                    f"F1 {f1_class[i]:.4f}"
+                )
+        
+        logger.info("<<<<<<<<<<<<<<<<< End Evaluation <<<<<<<<<<<<<<<<<")
+    
+    @staticmethod
+    def collate_fn(batch):
+        """Use standard point cloud collate to build true batched tensors."""
+        return collate_fn(batch)
+

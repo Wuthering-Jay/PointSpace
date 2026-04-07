@@ -236,6 +236,8 @@ class GreedyContourPriorPartition(nn.Module):
         w_adjacency: float = 0.0,
         max_iterations: int = -1,
         edge_reduce: str = "add",
+        build_edge_features: bool = True,
+        build_vertical_features: bool = True,
     ):
         super().__init__()
 
@@ -262,6 +264,8 @@ class GreedyContourPriorPartition(nn.Module):
         self.w_adjacency = w_adjacency
         self.max_iterations = max_iterations
         self.edge_reduce = edge_reduce
+        self.build_edge_features = build_edge_features
+        self.build_vertical_features = build_vertical_features
 
         assert edge_weight_mode in self._EDGE_WEIGHT_MODES, (
             f"Invalid edge_weight_mode: {edge_weight_mode}, "
@@ -273,10 +277,18 @@ class GreedyContourPriorPartition(nn.Module):
         pos: Tensor,
         x: Tensor,
         offset: Tensor,
+        batch: Optional[Tensor] = None,
         y: Optional[Tensor] = None,
     ) -> SuperpointHierarchy:
         """
         Execute hierarchical partition
+
+        Args:
+            pos: [N, 3] Point positions
+            x: [N, D] Point features
+            offset: [B] Cumulative point counts per batch
+            batch: [N] Optional pre-computed batch indices (for performance)
+            y: [N] or [N, C] Optional ground truth labels
 
         Data flow:
             1. GPU KNN graph construction (using pointops, auto batch isolation)
@@ -297,8 +309,13 @@ class GreedyContourPriorPartition(nn.Module):
         neighbor_idx, neighbor_dist = knn_query(self.k_adjacency, pos, offset)
         edge_index = self._neighbor_idx_to_edge_index(neighbor_idx)
 
-        # Compute batch indices from offset
-        batch = self._offset_to_batch(offset, num_points, device)
+        # Compute batch indices (use pre-computed if available for performance)
+        if batch is not None:
+            # ✅ Performance optimization: use pre-computed batch
+            batch = batch.to(device)
+        else:
+            # Fallback: compute on-the-fly
+            batch = self._offset_to_batch(offset, num_points, device)
 
         # Process labels to histogram format
         y_hist = None
@@ -314,7 +331,9 @@ class GreedyContourPriorPartition(nn.Module):
             "batch": batch,
             "offset": offset,
             "node_size": torch.ones(num_points, device=device, dtype=torch.long),
-            "normal": compute_point_normal_from_knn(pos, neighbor_idx),
+            "normal": compute_point_normal_from_knn(pos, neighbor_idx)
+            if (self.build_edge_features or self.build_vertical_features)
+            else None,
             "log_size": log_size_0,
             "log_length": log_size_0 / 3.0,
             "log_surface": log_size_0 * 2.0 / 3.0,
@@ -333,14 +352,18 @@ class GreedyContourPriorPartition(nn.Module):
             # 1. Compute edge weights
             edge_weight = self._compute_edge_weights(d["x"], d["edge_index"])
             d["edge_weight"] = edge_weight
-            d["edge_attr"] = self._compute_horizontal_edge_attr(
-                pos=d["pos"],
-                edge_index=d["edge_index"],
-                normal=d["normal"],
-                log_length=d["log_length"],
-                log_surface=d["log_surface"],
-                log_volume=d["log_volume"],
-                log_size=d["log_size"],
+            d["edge_attr"] = (
+                self._compute_horizontal_edge_attr(
+                    pos=d["pos"],
+                    edge_index=d["edge_index"],
+                    normal=d["normal"],
+                    log_length=d["log_length"],
+                    log_surface=d["log_surface"],
+                    log_volume=d["log_volume"],
+                    log_size=d["log_size"],
+                )
+                if self.build_edge_features
+                else None
             )
 
             # 2. Optional: Concatenate spatial coordinates
@@ -361,11 +384,11 @@ class GreedyContourPriorPartition(nn.Module):
                 min_size=min_size,
                 y=d.get("y"),
                 batch=d.get("batch"),
-                normal_child=d["normal"],
-                log_length_child=d["log_length"],
-                log_surface_child=d["log_surface"],
-                log_volume_child=d["log_volume"],
-                log_size_child=d["log_size"],
+                normal_child=d.get("normal"),
+                log_length_child=d.get("log_length"),
+                log_surface_child=d.get("log_surface"),
+                log_volume_child=d.get("log_volume"),
+                log_size_child=d.get("log_size"),
             )
 
             # 4. Update current level with super_index and v_edge_attr
@@ -578,7 +601,11 @@ class GreedyContourPriorPartition(nn.Module):
         num_super = X_merged.shape[0]
 
         # Compute geometric attributes for merged superpoints
-        normal_merged = compute_segment_normal(pos, super_index, node_size, num_super)
+        normal_merged = (
+            compute_segment_normal(pos, super_index, node_size, num_super)
+            if (self.build_edge_features or self.build_vertical_features)
+            else None
+        )
         log_size_merged = torch.log(S_merged.clamp(min=1.0))
         log_length_merged = log_size_merged / 3.0
         log_surface_merged = log_size_merged * 2.0 / 3.0
@@ -611,33 +638,41 @@ class GreedyContourPriorPartition(nn.Module):
         # Compute vertical edge attributes (v_edge_attr)
         # These are features for each child->parent edge used in attentive pooling
         # v_edge_attr[i] describes the relationship between child node i and its parent
-        v_edge_attr = self._compute_vertical_edge_attr(
-            pos_child=pos,
-            pos_parent=P_merged,
-            super_index=super_index,
-            node_size_child=node_size,
-            node_size_parent=S_merged,
-            normal_child=normal_child,
-            normal_parent=normal_merged,
-            log_length_child=log_length_child,
-            log_length_parent=log_length_merged,
-            log_surface_child=log_surface_child,
-            log_surface_parent=log_surface_merged,
-            log_volume_child=log_volume_child,
-            log_volume_parent=log_volume_merged,
-            log_size_child=log_size_child,
-            log_size_parent=log_size_merged,
+        v_edge_attr = (
+            self._compute_vertical_edge_attr(
+                pos_child=pos,
+                pos_parent=P_merged,
+                super_index=super_index,
+                node_size_child=node_size,
+                node_size_parent=S_merged,
+                normal_child=normal_child,
+                normal_parent=normal_merged,
+                log_length_child=log_length_child,
+                log_length_parent=log_length_merged,
+                log_surface_child=log_surface_child,
+                log_surface_parent=log_surface_merged,
+                log_volume_child=log_volume_child,
+                log_volume_parent=log_volume_merged,
+                log_size_child=log_size_child,
+                log_size_parent=log_size_merged,
+            )
+            if self.build_vertical_features
+            else None
         )
 
         # Compute horizontal edge features for merged graph (18D)
-        h_edge_attr = self._compute_horizontal_edge_attr(
-            pos=P_merged,
-            edge_index=E_merged,
-            normal=normal_merged,
-            log_length=log_length_merged,
-            log_surface=log_surface_merged,
-            log_volume=log_volume_merged,
-            log_size=log_size_merged,
+        h_edge_attr = (
+            self._compute_horizontal_edge_attr(
+                pos=P_merged,
+                edge_index=E_merged,
+                normal=normal_merged,
+                log_length=log_length_merged,
+                log_surface=log_surface_merged,
+                log_volume=log_volume_merged,
+                log_size=log_size_merged,
+            )
+            if self.build_edge_features
+            else None
         )
 
         merged_data = {
@@ -864,6 +899,7 @@ class GreedyContourPriorPartitionSimple(nn.Module):
         pos: Tensor,
         x: Tensor,
         offset: Tensor,
+        batch: Optional[Tensor] = None,
         y: Optional[Tensor] = None,
     ) -> SuperpointHierarchy:
         """Simple grid-based partition"""

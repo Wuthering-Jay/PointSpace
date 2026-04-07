@@ -11,9 +11,11 @@ import os
 import shutil
 import time
 import gc
+import math
 import wandb
 import torch
 import torch.utils.data
+import numpy as np
 from collections import OrderedDict
 
 if sys.version_info >= (3, 10):
@@ -144,14 +146,38 @@ class InformationWriter(HookBase):
         Returns a string like: ``loss: 2.3702 (ce: 1.2345 lovasz: 1.1357)``
         For non-loss keys, appended normally.
         """
+        def format_value(key, val):
+            """Smart formatting: integers as integers, floats with precision."""
+            if isinstance(val, torch.Tensor):
+                val = val.mean().item() if val.numel() > 1 else val.item()
+            elif isinstance(val, np.ndarray):
+                val = float(val.mean()) if val.size > 1 else float(val.item())
+            else:
+                val = float(val)
+            if math.isnan(val) or math.isinf(val):
+                return f"{key}: {val:.4f}"
+            # Check if value is an integer or very close to one
+            if abs(val - round(val)) < 1e-6 and abs(val) > 1:
+                # Likely an integer count (e.g., n_inter_edge, n_intra_edge)
+                return f"{key}: {int(round(val))}"
+            else:
+                # Float value (loss, affinity, etc.)
+                return f"{key}: {val:.4f}"
+        
         main_parts = []   # non-subloss entries
         sub_parts = []    # loss/{name} entries
         for key, val in key_vals:
+            if isinstance(val, torch.Tensor):
+                val = val.mean().item() if val.numel() > 1 else val.item()
+            elif isinstance(val, np.ndarray):
+                val = float(val.mean()) if val.size > 1 else float(val.item())
+            else:
+                val = float(val)
             if key.startswith("loss/"):
                 short = key[len("loss/"):]
                 sub_parts.append(f"{short}: {val:.4f}")
             else:
-                entry = f"{key}: {val:.4f}"
+                entry = format_value(key, val)
                 if key == "loss" and sub_parts == [] and any(
                     k.startswith("loss/") for k, _ in key_vals
                 ):
@@ -172,9 +198,22 @@ class InformationWriter(HookBase):
     def after_step(self):
         if "model_output_dict" in self.trainer.comm_info.keys():
             model_output_dict = self.trainer.comm_info["model_output_dict"]
-            self.model_output_keys = model_output_dict.keys()
-            for key in self.model_output_keys:
-                self.trainer.storage.put_scalar(key, model_output_dict[key].item())
+            self.model_output_keys = []
+            for key, value in model_output_dict.items():
+                # Handle both tensor and scalar values.
+                # Only scalar-like values can be logged with put_scalar.
+                if isinstance(value, torch.Tensor):
+                    if value.numel() == 1:
+                        self.trainer.storage.put_scalar(key, value.item())
+                        self.model_output_keys.append(key)
+                    elif key.startswith("loss"):
+                        # Loss tensors are expected to be scalar; fallback to mean for safety.
+                        self.trainer.storage.put_scalar(key, value.mean().item())
+                        self.model_output_keys.append(key)
+                else:
+                    # Already a Python scalar (int/float/bool)
+                    self.trainer.storage.put_scalar(key, float(value))
+                    self.model_output_keys.append(key)
 
         # Only log every `interval` steps; always accumulate storage for correct avg
         if self.curr_iter % self.interval != 0:

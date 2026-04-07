@@ -9,6 +9,7 @@ Components:
     - GraphNorm: Graph-aware normalization layer
     - GreedyContourPriorPartition: GPU-based hierarchical partition
     - SuperpointHierarchy: Multi-level superpoint data structure
+    - EZSPTransformer: SPT-based semantic segmentation transformer
 
 Author: PointSpace Team
 """
@@ -24,6 +25,11 @@ from pointspace.models.backbone.ezsp.graph_partition import (
     GreedyContourPriorPartition,
     GreedyContourPriorPartitionSimple,
 )
+from pointspace.models.backbone.ezsp.voxel_to_point_decoder import (
+    VoxelToPointDecoder,
+    LightweightVoxelToPointDecoder,
+)
+from pointspace.models.backbone.ezsp.ezsp_transformer import EZSPTransformer
 
 __all__ = [
     # Normalization
@@ -39,4 +45,9 @@ __all__ = [
     # Partition
     "GreedyContourPriorPartition",
     "GreedyContourPriorPartitionSimple",
+    # Voxel-to-point decoders
+    "VoxelToPointDecoder",
+    "LightweightVoxelToPointDecoder",
+    # Transformer for semantic segmentation
+    "EZSPTransformer",
 ]

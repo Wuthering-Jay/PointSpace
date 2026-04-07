@@ -35,34 +35,70 @@ def collate_fn(batch):
     elif isinstance(batch[0], Mapping):
         if "img_num" in batch[0].keys():
             max_img_num = max([d["img_num"] for d in batch])
-        batch = {
-            key: (
-                (
-                    collate_fn([d[key] for d in batch])
-                    if "offset" not in key
-                    # offset -> bincount -> concat bincount-> concat offset
-                    else torch.cumsum(
-                        collate_fn(
-                            [d[key].diff(prepend=torch.tensor([0])) for d in batch]
-                        ),
-                        dim=0,
-                    )
+        
+        result = {}
+        for key in batch[0]:
+            items = [d[key] for d in batch]
+            
+            # Special handling for 'sub' Cluster dict - needs CSR-style merging
+            if key == "sub" and isinstance(items[0], dict) and "pointer" in items[0]:
+                # Merge multiple Cluster dicts into one
+                # Each sub has pointer (cumsum) and value (point indices)
+                # Need to offset value indices and recompute pointer
+                merged_pointer = [torch.tensor([0], dtype=torch.long)]
+                merged_value = []
+                value_offset = 0
+                
+                for sub_dict in items:
+                    ptr = sub_dict["pointer"]
+                    val = sub_dict["value"]
+                    if isinstance(ptr, np.ndarray):
+                        ptr = torch.from_numpy(ptr).long()
+                    if isinstance(val, np.ndarray):
+                        val = torch.from_numpy(val).long()
+                    
+                    # Append sizes (diff of pointers) to build new pointer
+                    sizes = ptr[1:] - ptr[:-1]
+                    merged_pointer.append(sizes)
+                    
+                    # Offset value indices by cumulative point count
+                    merged_value.append(val + value_offset)
+                    value_offset += len(val)
+                
+                merged_pointer = torch.cumsum(torch.cat(merged_pointer), dim=0)
+                merged_value = torch.cat(merged_value)
+                result[key] = {"pointer": merged_pointer, "value": merged_value}
+                continue
+            
+            # Handle offset keys
+            if "offset" in key:
+                result[key] = torch.cumsum(
+                    collate_fn([d[key].diff(prepend=torch.tensor([0])) for d in batch]),
+                    dim=0,
                 )
-                if "correspondence" not in key
-                else collate_fn(
-                    [
-                        F.pad(
-                            d[key].permute(0, 2, 1),
-                            (0, max_img_num - d[key].shape[1]),
-                            value=-1,
-                        ).permute(0, 2, 1)
-                        for d in batch
-                    ]
-                )
-            )
-            for key in batch[0]
-        }
-        return batch
+                continue
+            
+            # Handle grid_size (scalar, use first sample)
+            if key == "grid_size":
+                result[key] = batch[0][key]
+                continue
+            
+            # Handle correspondence
+            if "correspondence" in key:
+                result[key] = collate_fn([
+                    F.pad(
+                        d[key].permute(0, 2, 1),
+                        (0, max_img_num - d[key].shape[1]),
+                        value=-1,
+                    ).permute(0, 2, 1)
+                    for d in batch
+                ])
+                continue
+            
+            # Default: recursive collate
+            result[key] = collate_fn(items)
+        
+        return result
     else:
         return default_collate(batch)
 
