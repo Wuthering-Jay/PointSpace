@@ -169,6 +169,84 @@ def compute_point_normal_from_knn(pos: Tensor, neighbor_idx: Tensor) -> Tensor:
     return normal
 
 
+def base_vectors_3d(x: Tensor) -> Tensor:
+    """Build an orthonormal basis from input 3D vectors."""
+    assert x.dim() == 2 and x.shape[1] == 3
+    a = x.clone()
+    zero_mask = a.norm(dim=1) == 0
+    if zero_mask.any():
+        a[zero_mask] = torch.tensor([[1, 0, 0]], dtype=x.dtype, device=x.device)
+    a = a / a.norm(dim=1, keepdim=True)
+    b = torch.vstack((a[:, 1] - a[:, 2], a[:, 2] - a[:, 0], a[:, 0] - a[:, 1])).T
+    zero_mask = b.norm(dim=1) == 0
+    if zero_mask.any():
+        b[zero_mask] = torch.tensor([[2, 1, -1]], dtype=x.dtype, device=x.device)
+    b = b / b.norm(dim=1, keepdim=True)
+    c = torch.linalg.cross(a, b)
+    return torch.cat((a.unsqueeze(1), b.unsqueeze(1), c.unsqueeze(1)), dim=1)
+
+
+def reverse_horizontal_edge_attr(edge_attr: Tensor) -> Tensor:
+    """Reverse direction-sensitive horizontal edge features."""
+    if edge_attr.numel() == 0:
+        return edge_attr
+    flipped = edge_attr.clone()
+    flipped[:, 0:3] *= -1  # mean_off
+    flipped[:, 9:12] *= -1  # centroid_dir
+    flipped[:, 14:18] *= -1  # log ratios
+    return flipped
+
+
+def make_horizontal_graph_bidirectional(
+    edge_index: Tensor,
+    edge_attr: Optional[Tensor],
+) -> Tuple[Tensor, Optional[Tensor]]:
+    """Tensorized expansion of a trimmed horizontal graph to both directions."""
+    if edge_index.numel() == 0:
+        return edge_index, edge_attr
+
+    src, dst = edge_index[0], edge_index[1]
+    max_node = int(torch.max(edge_index).item()) + 1
+    pair_id = src * max_node + dst
+    reverse_id = dst * max_node + src
+
+    # If reverse edges are already all present, keep the graph as-is.
+    if torch.isin(reverse_id, pair_id).all():
+        return edge_index, edge_attr
+
+    canonical_src = torch.minimum(src, dst)
+    canonical_dst = torch.maximum(src, dst)
+    canonical_id = canonical_src * max_node + canonical_dst
+    order = torch.argsort(canonical_id, stable=True)
+    sorted_cid = canonical_id[order]
+    first_mask = torch.ones_like(sorted_cid, dtype=torch.bool)
+    first_mask[1:] = sorted_cid[1:] != sorted_cid[:-1]
+    first_idx = order[first_mask]
+
+    canonical_src = canonical_src[first_idx]
+    canonical_dst = canonical_dst[first_idx]
+    bi_edge_index = torch.stack(
+        [
+            torch.stack([canonical_src, canonical_dst], dim=1).reshape(-1),
+            torch.stack([canonical_dst, canonical_src], dim=1).reshape(-1),
+        ],
+        dim=0,
+    )
+
+    if edge_attr is None:
+        return bi_edge_index, None
+
+    attr_canonical = edge_attr[first_idx].clone()
+    need_flip = src[first_idx] > dst[first_idx]
+    if need_flip.any():
+        attr_canonical[need_flip] = reverse_horizontal_edge_attr(attr_canonical[need_flip])
+    bi_edge_attr = torch.stack(
+        [attr_canonical, reverse_horizontal_edge_attr(attr_canonical)],
+        dim=1,
+    ).reshape(-1, attr_canonical.shape[1])
+    return bi_edge_index, bi_edge_attr
+
+
 @MODELS.register_module()
 class GreedyContourPriorPartition(nn.Module):
     """
@@ -660,28 +738,32 @@ class GreedyContourPriorPartition(nn.Module):
             else None
         )
 
-        # Compute horizontal edge features for merged graph (18D)
+        # Compute horizontal edge features for merged graph (18D).
+        # When possible, derive mean_off/std_off/mean_dist from child-level edges
+        # to stay close to the official on-the-fly edge feature construction.
         h_edge_attr = (
-            self._compute_horizontal_edge_attr(
-                pos=P_merged,
-                edge_index=E_merged,
-                normal=normal_merged,
-                log_length=log_length_merged,
-                log_surface=log_surface_merged,
-                log_volume=log_volume_merged,
-                log_size=log_size_merged,
+            self._compute_horizontal_edge_attr_from_child_graph(
+                pos_child=pos,
+                child_edge_index=edge_index,
+                super_index=super_index,
+                merged_edge_index=E_merged,
+                pos_parent=P_merged,
+                normal_parent=normal_merged,
+                log_length_parent=log_length_merged,
+                log_surface_parent=log_surface_merged,
+                log_volume_parent=log_volume_merged,
+                log_size_parent=log_size_merged,
             )
             if self.build_edge_features
             else None
         )
-
         merged_data = {
             "pos": P_merged,
             "x": X_merged,
             "node_size": S_merged.long(),
             "edge_index": E_merged,
             "edge_weight": W_merged / reg if reg > 0 else W_merged,  # scalar weights for partition only
-            "edge_attr": h_edge_attr,  # 18D handcrafted edge features for SPT RPE
+            "edge_attr": h_edge_attr,  # trimmed 18D handcrafted edge features for SPT RPE
             "normal": normal_merged,
             "log_size": log_size_merged,
             "log_length": log_length_merged,
@@ -696,6 +778,13 @@ class GreedyContourPriorPartition(nn.Module):
         }
 
         return super_index, merged_data
+
+    def _make_horizontal_graph_bidirectional(
+        self,
+        edge_index: Tensor,
+        edge_attr: Optional[Tensor],
+    ) -> Tuple[Tensor, Optional[Tensor]]:
+        return make_horizontal_graph_bidirectional(edge_index, edge_attr)
 
     def _compute_vertical_edge_attr(
         self,
@@ -873,129 +962,118 @@ class GreedyContourPriorPartition(nn.Module):
             dim=1,
         )
 
-
-@MODELS.register_module()
-class GreedyContourPriorPartitionSimple(nn.Module):
-    """
-    Simplified partition module for testing without torch-graph-components
-
-    Uses a simple connected components approach instead of energy-based merging.
-    Useful for debugging and when torch-graph-components is not available.
-    """
-
-    def __init__(
+    def _compute_horizontal_edge_attr_from_child_graph(
         self,
-        k_adjacency: int = 10,
-        grid_size: float = 0.1,
-        num_levels: int = 3,
-    ):
-        super().__init__()
-        self.k_adjacency = k_adjacency
-        self.grid_size = grid_size
-        self.num_levels = num_levels
+        pos_child: Tensor,
+        child_edge_index: Tensor,
+        super_index: Tensor,
+        merged_edge_index: Tensor,
+        pos_parent: Tensor,
+        normal_parent: Optional[Tensor],
+        log_length_parent: Optional[Tensor],
+        log_surface_parent: Optional[Tensor],
+        log_volume_parent: Optional[Tensor],
+        log_size_parent: Optional[Tensor],
+    ) -> Tensor:
+        if merged_edge_index.numel() == 0:
+            return pos_parent.new_zeros((0, 18))
 
-    def forward(
-        self,
-        pos: Tensor,
-        x: Tensor,
-        offset: Tensor,
-        batch: Optional[Tensor] = None,
-        y: Optional[Tensor] = None,
-    ) -> SuperpointHierarchy:
-        """Simple grid-based partition"""
-        device = pos.device
-        num_points = pos.shape[0]
+        child_src = child_edge_index[0]
+        child_dst = child_edge_index[1]
+        parent_src = super_index[child_src]
+        parent_dst = super_index[child_dst]
+        inter_mask = parent_src != parent_dst
 
-        # Build KNN graph for edge_index (needed for PartitionCriterion)
-        try:
-            from libs.pointops.functions import knn_query
-            neighbor_idx, _ = knn_query(self.k_adjacency, pos, offset)
-            edge_index = self._neighbor_idx_to_edge_index(neighbor_idx)
-        except Exception:
-            # Fallback: no edge_index
-            edge_index = torch.zeros(2, 0, dtype=torch.long, device=device)
-
-        # Prepare y histogram
-        y_hist = None
-        if y is not None:
-            if y.dim() == 1:
-                valid_mask = y >= 0
-                num_classes = max(y[valid_mask].max().item() + 1, 1) if valid_mask.any() else 1
-                y_hist = torch.zeros(num_points, num_classes, device=device)
-                if valid_mask.any():
-                    import torch.nn.functional as F
-                    y_hist[valid_mask] = F.one_hot(y[valid_mask].long(), num_classes).float()
-            else:
-                y_hist = y.float()
-
-        # Level 0: raw points
-        data_list = [
-            {
-                "pos": pos,
-                "x": x,
-                "edge_index": edge_index,
-                "node_size": torch.ones(num_points, device=device, dtype=torch.long),
-                "super_index": None,
-                "y": y_hist,
-            }
-        ]
-
-        current_pos = pos
-        current_x = x
-        current_size = torch.ones(num_points, device=device, dtype=torch.long)
-        current_y = y_hist
-
-        for level in range(self.num_levels):
-            grid = self.grid_size * (2**level)
-
-            # Grid-based clustering
-            grid_coord = torch.floor(current_pos / grid).long()
-            # Unique grid cells
-            _, super_index = torch.unique(
-                grid_coord, dim=0, return_inverse=True
+        if not inter_mask.any():
+            return self._compute_horizontal_edge_attr(
+                pos=pos_parent,
+                edge_index=merged_edge_index,
+                normal=normal_parent,
+                log_length=log_length_parent,
+                log_surface=log_surface_parent,
+                log_volume=log_volume_parent,
+                log_size=log_size_parent,
             )
 
-            # Update previous level
-            data_list[-1]["super_index"] = super_index
+        child_src = child_src[inter_mask]
+        child_dst = child_dst[inter_mask]
+        parent_src = parent_src[inter_mask]
+        parent_dst = parent_dst[inter_mask]
 
-            # Aggregate to new level
-            num_superpoints = super_index.max().item() + 1
-            new_pos = scatter_mean(current_pos, super_index, dim=0)
-            new_x = scatter_mean(current_x, super_index, dim=0)
-            new_size = scatter_sum(current_size, super_index, dim=0)
-            new_y = scatter_sum(current_y, super_index, dim=0) if current_y is not None else None
+        canonical_src = torch.minimum(parent_src, parent_dst)
+        canonical_dst = torch.maximum(parent_src, parent_dst)
+        orientation = torch.where(parent_src <= parent_dst, 1.0, -1.0).to(pos_child.dtype)
 
-            sub = Cluster.from_super_index(super_index, current_pos.shape[0])
+        delta = (pos_child[child_dst] - pos_child[child_src]) * orientation.unsqueeze(1)
+        dist = delta.norm(dim=1)
+        num_super = pos_parent.shape[0]
+        pair_id = canonical_src * num_super + canonical_dst
+        unique_pair_id, inverse = torch.unique(pair_id, sorted=True, return_inverse=True)
 
-            data_list.append(
-                {
-                    "pos": new_pos,
-                    "x": new_x,
-                    "node_size": new_size,
-                    "sub": sub,
-                    "super_index": None,
-                    "y": new_y,
-                }
+        mean_off = scatter_mean(delta, inverse, dim=0)
+        base = base_vectors_3d(mean_off.clone())[inverse]
+        u = (delta * base[:, 0]).sum(dim=1, keepdim=True)
+        v = (delta * base[:, 1]).sum(dim=1, keepdim=True)
+        w = (delta * base[:, 2]).sum(dim=1, keepdim=True)
+        std_off = scatter_std(torch.cat((u, v, w), dim=1), inverse, dim=0).clip(-2, 2)
+        mean_dist = scatter_mean(dist, inverse, dim=0).sqrt().view(-1, 1)
+
+        stats_src = torch.div(unique_pair_id, num_super, rounding_mode="floor")
+        stats_dst = unique_pair_id % num_super
+        stats_edge_index = torch.stack([stats_src, stats_dst], dim=0)
+        merged_src = merged_edge_index[0]
+        merged_dst = merged_edge_index[1]
+        if unique_pair_id.numel() == 0:
+            return self._compute_horizontal_edge_attr(
+                pos=pos_parent,
+                edge_index=merged_edge_index,
+                normal=normal_parent,
+                log_length=log_length_parent,
+                log_surface=log_surface_parent,
+                log_volume=log_volume_parent,
+                log_size=log_size_parent,
             )
+        merged_canonical_src = torch.minimum(merged_src, merged_dst)
+        merged_canonical_dst = torch.maximum(merged_src, merged_dst)
+        merged_pair_id = merged_canonical_src * num_super + merged_canonical_dst
+        edge_stats_idx = torch.searchsorted(unique_pair_id, merged_pair_id)
+        valid_mask = edge_stats_idx < unique_pair_id.numel()
+        safe_idx = edge_stats_idx.clamp(max=unique_pair_id.numel() - 1)
+        valid_mask &= unique_pair_id[safe_idx] == merged_pair_id
 
-            current_pos = new_pos
-            current_x = new_x
-            current_size = new_size
-            current_y = new_y
+        if not valid_mask.all():
+            fallback = self._compute_horizontal_edge_attr(
+                pos=pos_parent,
+                edge_index=merged_edge_index,
+                normal=normal_parent,
+                log_length=log_length_parent,
+                log_surface=log_surface_parent,
+                log_volume=log_volume_parent,
+                log_size=log_size_parent,
+            )
+            if valid_mask.any():
+                signs = torch.where(
+                    merged_src[valid_mask] <= merged_dst[valid_mask], 1.0, -1.0
+                ).to(pos_child.dtype).unsqueeze(1)
+                idx = edge_stats_idx[valid_mask]
+                fallback[valid_mask, 0:3] = mean_off[idx] * signs
+                fallback[valid_mask, 3:6] = std_off[idx]
+                fallback[valid_mask, 6:7] = mean_dist[idx]
+            return fallback
 
-        return SuperpointHierarchy(data_list)
+        signs = torch.where(merged_src <= merged_dst, 1.0, -1.0).to(pos_child.dtype).unsqueeze(1)
+        idx = edge_stats_idx
+        edge_attr = self._compute_horizontal_edge_attr(
+            pos=pos_parent,
+            edge_index=merged_edge_index,
+            normal=normal_parent,
+            log_length=log_length_parent,
+            log_surface=log_surface_parent,
+            log_volume=log_volume_parent,
+            log_size=log_size_parent,
+        )
+        edge_attr[:, 0:3] = mean_off[idx] * signs
+        edge_attr[:, 3:6] = std_off[idx]
+        edge_attr[:, 6:7] = mean_dist[idx]
+        return edge_attr
 
-    def _neighbor_idx_to_edge_index(self, neighbor_idx: Tensor) -> Tensor:
-        """Convert KNN neighbor indices to edge_index format"""
-        N, K = neighbor_idx.shape
-        device = neighbor_idx.device
-
-        src = torch.arange(N, device=device).unsqueeze(1).expand(N, K)
-        src = src.reshape(-1)
-        dst = neighbor_idx.reshape(-1)
-
-        valid_mask = dst >= 0
-        src = src[valid_mask]
-        dst = dst[valid_mask]
-
-        return torch.stack([src, dst], dim=0)

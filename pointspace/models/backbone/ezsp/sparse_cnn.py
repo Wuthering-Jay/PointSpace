@@ -189,8 +189,8 @@ class SparseCNN(PointModule):
         self,
         in_channels: int,
         channels: List[int] = [32, 32, 32],
-        kernel_size: int = 3,
-        dilation: int = 1,
+        kernel_size: Union[int, List[int]] = 3,
+        dilation: Union[int, List[int]] = 1,
         norm: str = "gn",
         norm_eps: float = 1e-3,  # Larger eps for AMP stability
         activation: str = "relu",
@@ -209,6 +209,22 @@ class SparseCNN(PointModule):
         self.norm_type = norm
         self.norm_eps = norm_eps
         self._frozen = frozen
+        if isinstance(kernel_size, int):
+            kernel_schedule = [kernel_size] * len(channels)
+        else:
+            kernel_schedule = list(kernel_size)
+        if isinstance(dilation, int):
+            dilation_schedule = [dilation] * len(channels)
+        else:
+            dilation_schedule = list(dilation)
+        assert len(kernel_schedule) == len(channels), (
+            f"kernel_size expects {len(channels)} values, got {len(kernel_schedule)}"
+        )
+        assert len(dilation_schedule) == len(channels), (
+            f"dilation expects {len(channels)} values, got {len(dilation_schedule)}"
+        )
+        self.kernel_schedule = kernel_schedule
+        self.dilation_schedule = dilation_schedule
 
         # Input projection if channels don't match
         if in_channels != channels[0]:
@@ -226,8 +242,8 @@ class SparseCNN(PointModule):
             block = SparseConvBlock(
                 in_channels=prev_ch,
                 out_channels=ch,
-                kernel_size=kernel_size,
-                dilation=dilation,
+                kernel_size=kernel_schedule[i],
+                dilation=dilation_schedule[i],
                 norm=norm if (last_norm or not is_last) else "none",
                 norm_eps=norm_eps,
                 activation=activation if (last_activation or not is_last) else "none",

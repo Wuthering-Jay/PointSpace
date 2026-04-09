@@ -27,11 +27,21 @@ class_names = [
     "buildings"
     ]
 
-feature_keys = ["coord", "echo"]
-in_channels = 5
+partition_feature_keys = ["intensity"]
+point_hf_keys = partition_feature_keys
+post_cnn_point_hf_keys = [
+    "intensity",
+    "linearity",
+    "planarity",
+    "scattering",
+    "verticality",
+    "elevation",
+]
+feature_keys = partition_feature_keys
+in_channels = len(partition_feature_keys)
 
-weight = r"exp\dales\ezsp-stage2\model\model_last.pth"
-resume = True
+weight = r"exp\dales\ezsp-stage1\model\model_last.pth"
+resume = False
 evaluate = True
 test_only = False
 seed = 42
@@ -43,7 +53,7 @@ num_worker = 0
 gradient_accumulation_steps = 2
 
 # Training settings - Following official DALES Stage2 config
-epoch = 10  # 官方用600，这里先用100测试
+epoch = 600 
 clip_grad = 5.0
 
 # Mixed precision training - Now enabled with FP16-stable custom LayerNorm
@@ -61,13 +71,13 @@ mix_prob = 0.0
 sparse_cnn_config = dict(
     type="EZ-SparseCNN",
     in_channels=in_channels,
-    channels=[32, 64, 64],
-    kernel_size=3,
+    channels=[32, 32, 32],
+    kernel_size=[7, 3, 3],
     dilation=1,
     norm="gn",
     norm_eps=1e-4,
-    activation="relu",
-    residual=True,
+    activation="leakyrelu",
+    residual=False,
     global_residual=False,
     last_norm=True,
     last_activation=False,
@@ -77,7 +87,7 @@ sparse_cnn_config = dict(
 partition_config = dict(
     type="GreedyContourPriorPartition",
     reg=[0.015, 0.05, 0.15],
-    min_size=[3, 15, 50],
+    min_size=[5, 15, 70],
     k_adjacency=10,
     spatial_weight=0.05,
     edge_weight_mode="affinity_latent_distance",
@@ -85,28 +95,51 @@ partition_config = dict(
     w_adjacency=0.0,
     max_iterations=-1,
     edge_reduce="add",
-    build_edge_features=False,
+    build_edge_features=True,
     build_vertical_features=False,
 )
 
 transformer_config = dict(
     type="EZSPTransformer",
     num_classes=num_classes,
-    in_channels=67,
-    nano=True,
+    in_channels=32,
+    nano=False,
+    point_cnn_blocks=True,
+    point_mlp_on_cnn_feats=True,
+    point_mlp=[41, 64, 128],
     down_dim=[64, 128, 256],
-    down_in_mlp=[[67, 64], [134, 128], [201, 256]],
+    down_in_mlp=[[132, 64], [68, 128], [132, 256]],
     down_num_heads=[4, 8, 16],
     down_num_blocks=[2, 2, 2],
     down_ffn_ratio=1.0,
     up_dim=[128, 64],
-    up_in_mlp=[[454, 128], [259, 64]],
+    up_in_mlp=[[451, 128], [227, 64]],
     up_num_heads=[8, 4],
     up_num_blocks=[1, 1],
     up_ffn_ratio=1.0,
     use_pos=True,
+    use_node_hf=False,
+    use_diameter=True,
+    use_diameter_parent=False,
+    down_pool_dim=[64, 128],
     pool="max",
     fusion="cat",
+)
+
+graph_transform_config = dict(
+    type="HierarchyGraphTransform",
+    enabled=True,
+    training_only=True,
+    apply_levels="1+",
+    max_nodes=0,
+    max_edges=0,
+    n_min_edges=0,
+    n_max_edges=0,
+    add_self_loops=True,
+    pos_jitter_std=0.0,
+    pos_jitter_trunc=0.0,
+    edge_attr_jitter_std=0.0,
+    edge_attr_jitter_trunc=0.0,
 )
 
 model = dict(
@@ -117,21 +150,21 @@ model = dict(
     partition_module=partition_config,
     transformer=transformer_config,
     freeze_cnn=True,
-    backbone_out_channels=64,
+    backbone_out_channels=32,
+    post_cnn_keys=post_cnn_point_hf_keys,
+    graph_transform=graph_transform_config,
     criteria=[
-        dict(type="CrossEntropyLoss", loss_weight=1.0, ignore_index=num_classes, auto_class_weight=True),
-        dict(type="LovaszLoss", mode="multiclass", loss_weight=1.0, ignore_index=num_classes),
+        dict(type="WeightedFocalLoss", loss_weight=1.0, gamma=2.0, ignore_index=num_classes, auto_class_weight=True),
     ],
 )
 
-optimizer = dict(type="AdamW", lr=1e-3, weight_decay=1e-2)
+optimizer = dict(type="AdamW", lr=5e-3, weight_decay=1e-4)
 scheduler = dict(
     type="CosineAnnealingLR",
     total_steps=epoch,
 )
 
-# Differential learning rate for transformer (official: 0.1x base lr)
-param_dicts = [dict(keyword="transformer", lr_scale=0.1)]
+param_dicts = None
 
 data = dict(
     num_classes=num_classes,
@@ -161,13 +194,15 @@ data = dict(
                 hist_key="segment", 
                 hist_size=num_classes + 1,
                 quantize_coords=False,
-                feat_keys=feature_keys),
+                feat_keys=partition_feature_keys),
+            dict(type="PointFeatures", keys=["linearity", "planarity", "scattering", "verticality"], k=25, k_min=10),
+            dict(type="GroundElevation", model="ransac", xy_grid=5.0, scale=20.0),
         ],
         post_transform=[
             dict(type="ToTensor"),
             dict(type="Collect", 
-                 keys=["coord", "segment", "sub", "num_raw_points", "grid_size"], 
-                 feat_keys=feature_keys),
+                 keys=["coord", "segment", "sub", "num_raw_points", "grid_size", "intensity", "linearity", "planarity", "scattering", "verticality", "elevation"], 
+                 feat_keys=partition_feature_keys),
         ],
     ),
     val=dict(
@@ -190,14 +225,16 @@ data = dict(
                 hist_key="segment", 
                 hist_size=num_classes + 1, 
                 quantize_coords=False, 
-                feat_keys=feature_keys),
+                feat_keys=partition_feature_keys),
+            dict(type="PointFeatures", keys=["linearity", "planarity", "scattering", "verticality"], k=25, k_min=10),
+            dict(type="GroundElevation", model="ransac", xy_grid=5.0, scale=20.0),
         ],
         post_transform=[
             dict(type="ToTensor"),
             dict(
                 type="Collect", 
-                keys=["coord", "segment", "segment_raw", "sub", "num_raw_points", "grid_size"], 
-                feat_keys=feature_keys),
+                keys=["coord", "segment", "segment_raw", "sub", "num_raw_points", "grid_size", "intensity", "linearity", "planarity", "scattering", "verticality", "elevation"], 
+                feat_keys=partition_feature_keys),
         ],
     ),
     test=dict(
@@ -219,14 +256,16 @@ data = dict(
                 hist_key="segment", 
                 hist_size=num_classes + 1, 
                 quantize_coords=False, 
-                feat_keys=feature_keys),
+                feat_keys=partition_feature_keys),
+            dict(type="PointFeatures", keys=["linearity", "planarity", "scattering", "verticality"], k=25, k_min=10),
+            dict(type="GroundElevation", model="ransac", xy_grid=5.0, scale=20.0),
         ],
         post_transform=[
             dict(type="ToTensor"),
             dict(
                 type="Collect", 
-                keys=["coord", "segment", "segment_raw", "sub", "num_raw_points", "grid_size"], 
-                feat_keys=feature_keys),
+                keys=["coord", "segment", "segment_raw", "sub", "num_raw_points", "grid_size", "intensity", "linearity", "planarity", "scattering", "verticality", "elevation"], 
+                feat_keys=partition_feature_keys),
         ],
     ),
 )

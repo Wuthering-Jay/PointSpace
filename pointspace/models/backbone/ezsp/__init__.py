@@ -23,12 +23,14 @@ from pointspace.models.backbone.ezsp.superpoint_hierarchy import (
 )
 from pointspace.models.backbone.ezsp.graph_partition import (
     GreedyContourPriorPartition,
-    GreedyContourPriorPartitionSimple,
 )
-from pointspace.models.backbone.ezsp.voxel_to_point_decoder import (
-    VoxelToPointDecoder,
-    LightweightVoxelToPointDecoder,
+from pointspace.models.backbone.ezsp.hierarchy_graph_transform import (
+    HierarchyGraphTransform,
 )
+# from pointspace.models.backbone.ezsp.voxel_to_point_decoder import (
+#     VoxelToPointDecoder,
+#     LightweightVoxelToPointDecoder,
+# )
 from pointspace.models.backbone.ezsp.ezsp_transformer import EZSPTransformer
 
 __all__ = [
@@ -44,10 +46,11 @@ __all__ = [
     "SuperpointHierarchy",
     # Partition
     "GreedyContourPriorPartition",
-    "GreedyContourPriorPartitionSimple",
+    "HierarchyGraphTransform",
+    # "GreedyContourPriorPartitionSimple",
     # Voxel-to-point decoders
-    "VoxelToPointDecoder",
-    "LightweightVoxelToPointDecoder",
+    # "VoxelToPointDecoder",
+    # "LightweightVoxelToPointDecoder",
     # Transformer for semantic segmentation
     "EZSPTransformer",
 ]

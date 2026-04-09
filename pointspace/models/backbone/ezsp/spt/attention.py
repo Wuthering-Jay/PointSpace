@@ -252,10 +252,8 @@ class SelfAttentionBlock(nn.Module):
                 rpe = rpe.repeat(1, H)
             v = v + rpe.view(E, H, -1)
 
-        # Compute compatibility scores from query-key products
-        compat = torch.einsum("ehd, ehd -> eh", q, k)  # [E, H]
-
-        # Compute attention scores with scaled softmax
+        # Compute attention scores in FP32 to stabilize AMP training.
+        compat = torch.einsum("ehd, ehd -> eh", q.float(), k.float())  # [E, H]
         attn = softmax(compat, index=s, dim=0, num_nodes=N)  # [E, H]
 
         # Optional attention dropout
@@ -263,6 +261,7 @@ class SelfAttentionBlock(nn.Module):
             attn = self.attn_drop(attn)
 
         # Apply attention to values
+        attn = attn.to(v.dtype)
         x = (v * attn.unsqueeze(-1)).view(E, self.dim)  # [E, dim]
         x = scatter_sum(x, s, dim=0, dim_size=N)  # [N, dim]
 

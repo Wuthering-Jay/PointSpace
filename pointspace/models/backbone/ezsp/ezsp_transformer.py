@@ -62,6 +62,8 @@ class EZSPTransformer(nn.Module):
         point_mlp: Optional[List[int]] = None,
         point_drop: Optional[float] = None,
         nano: bool = False,
+        point_cnn_blocks: bool = False,
+        point_mlp_on_cnn_feats: bool = False,
         # Down stage params
         down_dim: Optional[List[int]] = None,
         down_in_mlp: Optional[List[List[int]]] = None,
@@ -142,6 +144,8 @@ class EZSPTransformer(nn.Module):
             point_mlp=point_mlp,
             point_drop=point_drop,
             nano=nano,
+            point_cnn_blocks=point_cnn_blocks,
+            point_mlp_on_cnn_feats=point_mlp_on_cnn_feats,
             down_dim=down_dim,
             down_in_mlp=down_in_mlp,
             down_out_mlp=down_out_mlp,

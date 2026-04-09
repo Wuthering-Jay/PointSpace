@@ -294,6 +294,18 @@ class Stage(nn.Module):
 
         # Input MLP
         if self.in_mlp is not None:
+            first_linear = None
+            for module in self.in_mlp.mlp:
+                if isinstance(module, nn.Linear):
+                    first_linear = module
+                    break
+            if first_linear is not None and x.shape[1] != first_linear.in_features:
+                expected_in = first_linear.in_features
+                if x.shape[1] > expected_in:
+                    x = x[:, :expected_in]
+                else:
+                    pad = x.new_zeros((x.shape[0], expected_in - x.shape[1]))
+                    x = torch.cat([x, pad], dim=1)
             x = self.in_mlp(x, batch=norm_index)
 
         # Transformer blocks
@@ -327,14 +339,18 @@ class DownNFuseStage(Stage):
     def __init__(
         self,
         *args,
-        pool: str = "max",
+        pool: Union[str, nn.Module] = "max",
         fusion: str = "cat",
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
 
         # Pooling operator
-        self.down_pool_block = pool_factory(pool)
+        # Accept either a pool object or a string
+        if isinstance(pool, nn.Module):
+            self.down_pool_block = pool
+        else:
+            self.down_pool_block = pool_factory(pool)
 
         # Fusion operator
         self.fusion = fusion_factory(fusion)
@@ -373,10 +389,67 @@ class DownNFuseStage(Stage):
         Returns:
             Tuple of (output features, parent diameter).
         """
+        # Auto-align parent feature dim for attentive query projection.
+        if (
+            x_parent is not None
+            and hasattr(self.down_pool_block, "q")
+            and isinstance(self.down_pool_block.q, nn.Linear)
+        ):
+            expected_q_in = self.down_pool_block.q.in_features
+            current_q_in = x_parent.shape[1]
+            if current_q_in != expected_q_in:
+                if current_q_in > expected_q_in:
+                    x_parent = x_parent[:, :expected_q_in]
+                else:
+                    pad = x_parent.new_zeros((x_parent.shape[0], expected_q_in - current_q_in))
+                    x_parent = torch.cat([x_parent, pad], dim=1)
+
         # Pool child features
         x_pooled = self.down_pool_block(
             x_child, x_parent, pool_index, edge_attr=v_edge_attr, num_pool=num_super
         )
+
+        # Auto-align cat-fusion inputs to match in_mlp expectation.
+        # This avoids brittle config coupling when handcrafted feature dims vary
+        # (e.g. with use_pos / dataset-specific feature sets).
+        if isinstance(self.fusion, CatFusion) and x_parent is not None and self.in_mlp is not None:
+            first_linear = None
+            for m in self.in_mlp.mlp:
+                if isinstance(m, nn.Linear):
+                    first_linear = m
+                    break
+            if first_linear is not None:
+                expected_in = first_linear.in_features
+                # Stage.forward will append extra dims before in_mlp:
+                # - use_pos -> +3
+                # - use_diameter -> +1
+                # - use_diameter_parent -> +1
+                pre_inject = 0
+                if self.use_pos and pos is not None:
+                    pre_inject += 3
+                if self.use_diameter:
+                    pre_inject += 1
+                if self.use_diameter_parent:
+                    pre_inject += 1
+                expected_fused = max(0, expected_in - pre_inject)
+                # Keep pooled branch as-is when possible; adjust parent branch first.
+                expected_parent = max(0, expected_fused - x_pooled.shape[1])
+                if x_parent.shape[1] != expected_parent:
+                    if x_parent.shape[1] > expected_parent:
+                        x_parent = x_parent[:, :expected_parent]
+                    else:
+                        pad = x_parent.new_zeros((x_parent.shape[0], expected_parent - x_parent.shape[1]))
+                        x_parent = torch.cat([x_parent, pad], dim=1)
+
+                # Final guard: if total still mismatched, trim/pad pooled branch too.
+                total = x_parent.shape[1] + x_pooled.shape[1]
+                if total != expected_fused:
+                    target_pooled = max(0, expected_fused - x_parent.shape[1])
+                    if x_pooled.shape[1] > target_pooled:
+                        x_pooled = x_pooled[:, :target_pooled]
+                    else:
+                        pad = x_pooled.new_zeros((x_pooled.shape[0], target_pooled - x_pooled.shape[1]))
+                        x_pooled = torch.cat([x_pooled, pad], dim=1)
 
         # Fuse parent and pooled child features
         x_fused = self.fusion(x_parent, x_pooled)
@@ -503,6 +576,8 @@ class PointStage(Stage):
         mlp_drop: Optional[float] = None,
         use_pos: bool = True,
         use_diameter_parent: bool = False,
+        cnn_blocks: bool = False,
+        point_mlp_on_cnn_feats: bool = False,
     ):
         if mlp_activation is None:
             mlp_activation = nn.LeakyReLU()
@@ -510,6 +585,11 @@ class PointStage(Stage):
         assert in_mlp is None or len(in_mlp) > 1, (
             "in_mlp should be a list of channels of length >= 2"
         )
+        if point_mlp_on_cnn_feats and not cnn_blocks:
+            raise ValueError(
+                "point_mlp_on_cnn_feats=True requires cnn_blocks=True so the "
+                "PointStage can treat `x` as the CNN branch."
+            )
 
         super().__init__(
             in_mlp[-1] if in_mlp is not None else None,
@@ -523,6 +603,8 @@ class PointStage(Stage):
             use_diameter=False,
             use_diameter_parent=use_diameter_parent,
         )
+        self.cnn_blocks = cnn_blocks
+        self.point_mlp_on_cnn_feats = point_mlp_on_cnn_feats
 
     def forward(
         self,
@@ -534,6 +616,7 @@ class PointStage(Stage):
         super_index: Optional[torch.Tensor] = None,
         edge_index: Optional[torch.Tensor] = None,
         edge_attr: Optional[torch.Tensor] = None,
+        x_mlp: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Forward pass.
@@ -547,6 +630,39 @@ class PointStage(Stage):
         Returns:
             Tuple of (output features, parent diameter).
         """
+        if self.cnn_blocks:
+            if self.point_mlp_on_cnn_feats:
+                x_fused = self.feature_fusion(x, x_mlp) if x_mlp is not None else x
+                return super().forward(
+                    x_fused,
+                    norm_index,
+                    pos,
+                    diameter,
+                    node_size,
+                    super_index,
+                    edge_index,
+                    edge_attr,
+                )
+
+            if x_mlp is None and self.in_mlp is not None:
+                raise ValueError(
+                    "PointStage needs handcrafted features in `x_mlp` when "
+                    "point_mlp_on_cnn_feats=False and an input MLP is configured."
+                )
+
+            x_mlp_out, diameter_parent = super().forward(
+                x_mlp,
+                norm_index,
+                pos,
+                diameter,
+                node_size,
+                super_index,
+                edge_index,
+                edge_attr,
+            )
+            x_out = self.feature_fusion(x, x_mlp_out) if x is not None else x_mlp_out
+            return x_out, diameter_parent
+
         return super().forward(
             x, norm_index, pos, diameter, node_size, super_index, edge_index, edge_attr
         )

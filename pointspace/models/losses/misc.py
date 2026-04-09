@@ -119,6 +119,95 @@ class BinaryFocalLoss(nn.Module):
 
 
 @LOSSES.register_module()
+class WeightedFocalLoss(nn.NLLLoss):
+    """Official SPT-style weighted focal loss on logits.
+
+    This mirrors the reference implementation closely so EZ-SP stage 2 can
+    use the same default criterion while still integrating with PointSpace's
+    class-weight injection flow.
+    """
+
+    def __init__(
+        self,
+        weight=None,
+        gamma=0.0,
+        reduction="mean",
+        ignore_index=-100,
+        loss_weight=1.0,
+        auto_class_weight=False,
+    ):
+        if reduction not in ("mean", "none"):
+            raise ValueError('Reduction must be one of: "mean", "none".')
+        weight_tensor = (
+            torch.as_tensor(weight, dtype=torch.float).clone()
+            if weight is not None
+            else None
+        )
+        super().__init__(
+            reduction=reduction,
+            ignore_index=ignore_index,
+            weight=weight_tensor,
+        )
+        self.gamma = gamma
+        self.loss_weight = loss_weight
+        self.auto_class_weight = auto_class_weight
+
+    def set_class_weight(self, class_weight):
+        if isinstance(class_weight, np.ndarray):
+            class_weight = torch.from_numpy(class_weight).float()
+        elif isinstance(class_weight, (list, tuple)):
+            class_weight = torch.tensor(class_weight, dtype=torch.float)
+        self.weight = class_weight
+
+    def forward(self, pred, target, sample_weight=None):
+        if pred.dim() == 1:
+            pred_binary = torch.zeros(
+                pred.shape[0], 2, dtype=pred.dtype, device=pred.device
+            )
+            neg_mask = pred < 0
+            pos_mask = pred > 0
+            pred_binary[neg_mask, 0] = -pred[neg_mask]
+            pred_binary[pos_mask, 1] = pred[pos_mask]
+            pred = pred_binary
+
+        target = target.long()
+        if sample_weight is None:
+            sample_weight = torch.ones_like(target, dtype=torch.float)
+        sample_weight = sample_weight / sample_weight.sum().clamp(min=1.0)
+
+        if pred.ndim > 2:
+            c = pred.shape[1]
+            pred = pred.permute(0, *range(2, pred.ndim), 1).reshape(-1, c)
+            target = target.view(-1)
+            sample_weight = sample_weight.view(-1)
+
+        valid_mask = target != self.ignore_index
+        target_shape = target.shape
+        target = target[valid_mask]
+        if target.numel() == 0:
+            return pred.sum() * 0.0
+        pred = pred[valid_mask]
+        sample_weight = sample_weight[valid_mask]
+
+        if self.weight is not None and self.weight.device != pred.device:
+            self.weight = self.weight.to(pred.device)
+
+        log_p = F.log_softmax(pred, dim=-1)
+        ce = super().forward(log_p, target)
+        log_pt = log_p.gather(dim=1, index=target.view(-1, 1)).squeeze(1)
+        pt = log_pt.exp()
+        focal_term = (1 - pt) ** self.gamma
+        loss = focal_term * ce * sample_weight
+
+        if self.reduction == "none":
+            out = torch.zeros(target_shape, dtype=pred.dtype, device=pred.device)
+            out[valid_mask] = loss
+            return out * self.loss_weight
+
+        return loss.sum() * self.loss_weight
+
+
+@LOSSES.register_module()
 class FocalLoss(nn.Module):
     def __init__(
         self,

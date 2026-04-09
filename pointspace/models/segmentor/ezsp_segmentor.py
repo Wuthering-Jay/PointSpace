@@ -93,9 +93,8 @@ class EZSPPartitionSegmentor(nn.Module):
         freeze_cnn: bool = True,
         backbone_out_channels: int = 32,
         allow_transformer_fallback: bool = True,
-        # Legacy parameters (ignored, kept for config compatibility)
-        use_voxel_to_point: bool = False,
-        voxel_to_point_decoder: Optional[dict] = None,
+        post_cnn_keys: Optional[list] = None,
+        graph_transform: Optional[dict] = None,
     ):
         super().__init__()
 
@@ -104,16 +103,8 @@ class EZSPPartitionSegmentor(nn.Module):
         self.freeze_cnn = freeze_cnn
         self.backbone_out_channels = backbone_out_channels
         self.allow_transformer_fallback = allow_transformer_fallback
-
-        # Legacy warning
-        if use_voxel_to_point or voxel_to_point_decoder is not None:
-            warnings.warn(
-                "use_voxel_to_point and voxel_to_point_decoder are deprecated. "
-                "The official EZ-SP architecture uses voxel-level (L1) partition, "
-                "not point-level. These parameters will be ignored.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
+        self.post_cnn_keys = list(post_cnn_keys) if post_cnn_keys is not None else []
+        self.graph_transform = None
 
         # SparseCNN (required for both stages)
         if sparse_cnn is not None:
@@ -226,6 +217,8 @@ class EZSPPartitionSegmentor(nn.Module):
                         f"Warning: Not all CNN parameters were frozen! "
                         f"({frozen_params}/{total_params})"
                     )
+            if graph_transform is not None:
+                self.graph_transform = build_model(graph_transform)
 
     def forward(self, input_dict: Dict) -> Dict:
         """
@@ -291,9 +284,13 @@ class EZSPPartitionSegmentor(nn.Module):
             # Training partition stage: work on voxels (L1 = nag[0])
             return self._forward_partition_stage(nag, input_dict, sub_cluster)
         else:
-            # Semantic stage or evaluation: may need L0 prepending
-            if sub_cluster is not None and num_raw_points is not None:
-                self._prepend_raw_point_level(nag, sub_cluster, num_raw_points)
+            # Semantic stage: keep the hierarchy voxel-rooted for the transformer,
+            # which is closer to the official EZ-SP semantic pipeline. Raw points
+            # are only used afterwards for prediction propagation / evaluation.
+            if self.post_cnn_keys:
+                nag[0]["point_hf"] = self._collect_point_stage_features(input_dict)
+            if self.graph_transform is not None:
+                nag = self.graph_transform(nag)
             return self._forward_semantic_stage(nag, point, input_dict, sub_cluster)
     
     def _labels_to_histogram(self, labels: torch.Tensor, num_bins: int) -> torch.Tensor:
@@ -377,84 +374,129 @@ class EZSPPartitionSegmentor(nn.Module):
         
         Critical: Loss is computed at SUPERPOINT level (not voxel/point level)!
         """
-        # 1. Transformer outputs superpoint-level logits
-        # NAG structure: [L0 (raw points), L1 (voxels), L2+ (superpoints)]
-        # Transformer operates on L1+ and returns superpoint-level predictions
-        seg_logits_superpoint = self.transformer(nag)  # [num_superpoints_L1, num_classes]
-        
+        # 1. Transformer outputs predictions on its finest processed level.
+        # In the official semantic pipeline this hierarchy is voxel-rooted, so we
+        # keep nag[0] = voxels and do not prepend raw points before the forward.
+        seg_logits_superpoint = self.transformer(nag)
+
         # If multi-stage output (list), use finest level (L1)
         if isinstance(seg_logits_superpoint, list):
             seg_logits_superpoint = seg_logits_superpoint[0]
+
+        output_level = self._infer_prediction_level(nag, seg_logits_superpoint)
         
         result = {}
         
-        # 2. Compute loss at SUPERPOINT level when labels are available
+        # 2. Compute loss at the prediction level when labels are available
         # (both train and eval, so evaluator can always log val_loss)
         if "segment" in input_dict:
-            # Extract superpoint-level label histogram from NAG
-            # NAG[1] contains voxel-level data (L1)
-            # In NAG terminology, L1 voxels ARE the "superpoints" for the first partition level
-            y_hist_L1 = nag[1].get('y')  # [num_superpoints_L1, num_classes+1]
+            y_hist_level = nag[output_level].get("y")
             
-            if y_hist_L1 is None:
-                # Fallback: use voxel-level labels from input_dict
+            if y_hist_level is None:
+                # Fallback: use voxel-level labels from input_dict when the
+                # prediction level is the voxel root.
                 y_voxel = input_dict.get("segment")
                 if y_voxel is None:
-                    raise ValueError("No labels found for training! NAG[1]['y'] is None and input_dict['segment'] is missing.")
+                    raise ValueError(
+                        "No labels found for training! "
+                        f"NAG[{output_level}]['y'] is None and input_dict['segment'] is missing."
+                    )
                 
                 # If y_voxel is histogram format, use it directly
                 if y_voxel.dim() == 2 and y_voxel.shape[1] == self.num_classes + 1:
-                    y_hist_L1 = y_voxel
+                    y_hist_level = y_voxel
                 else:
                     # If y_voxel is hard labels, convert to one-hot histogram
                     # (This should not happen if NAG is properly constructed)
-                    get_root_logger().warning("NAG[1]['y'] is None, using input_dict['segment'] as fallback")
+                    get_root_logger().warning(
+                        f"NAG[{output_level}]['y'] is None, using input_dict['segment'] as fallback"
+                    )
                     if y_voxel.dim() == 1:
                         # Hard labels: convert to histogram
                         import torch.nn.functional as F
-                        y_hist_L1 = F.one_hot(y_voxel.long(), num_classes=self.num_classes + 1).float()
+                        y_hist_level = F.one_hot(
+                            y_voxel.long(), num_classes=self.num_classes + 1
+                        ).float()
                     else:
                         # Already histogram
-                        y_hist_L1 = y_voxel
+                        y_hist_level = y_voxel
             
             # Extract target labels (argmax of histogram, excluding ignore class)
-            # y_hist_L1 shape: [num_superpoints, num_classes+1]
+            # y_hist_level shape: [num_nodes_at_output_level, num_classes+1]
             # Last column (index num_classes) is the ignore/void class
-            y_target = y_hist_L1[:, :self.num_classes].argmax(dim=1)  # [num_superpoints]
+            y_target = y_hist_level[:, :self.num_classes].argmax(dim=1)
             
-            # Compute loss at superpoint level
+            # Compute loss at the transformer output level
             loss = self.criteria(seg_logits_superpoint, y_target)
             result["loss"] = loss
             
-            # Store superpoint logits for debugging
+            # Store transformer-level logits for debugging
             result["seg_logits_superpoint"] = seg_logits_superpoint
         
-        # 3. Propagate predictions to point level (for evaluation and visualization)
+        # 3. Propagate predictions to voxel and raw-point levels for evaluation.
+        if output_level > 0:
+            seg_logits_voxel = nag.propagate_labels_to_points(
+                seg_logits_superpoint, from_level=output_level, to_level=0
+            )
+        else:
+            seg_logits_voxel = seg_logits_superpoint
+
         # This is ONLY for output, NOT for loss computation!
         if sub_cluster is not None:
-            # Use sub_cluster mapping: L1 (voxels) -> L0 (raw points)
+            # Use sub_cluster mapping: voxel -> raw point
             l0_super_index = sub_cluster.to_super_index()
-            seg_logits_l0 = seg_logits_superpoint[l0_super_index]  # [N, num_classes]
+            seg_logits_l0 = seg_logits_voxel[l0_super_index]
             result["seg_logits"] = seg_logits_l0
         else:
             # Fallback: use voxel_inverse if available
             voxel_inverse = input_dict.get("voxel_inverse")
             if voxel_inverse is not None:
                 if isinstance(voxel_inverse, torch.Tensor):
-                    seg_logits_l0 = seg_logits_superpoint[voxel_inverse]
+                    seg_logits_l0 = seg_logits_voxel[voxel_inverse]
                 else:
-                    seg_logits_l0 = seg_logits_superpoint[torch.from_numpy(voxel_inverse).long().to(seg_logits_superpoint.device)]
+                    seg_logits_l0 = seg_logits_voxel[
+                        torch.from_numpy(voxel_inverse).long().to(seg_logits_voxel.device)
+                    ]
                 result["seg_logits"] = seg_logits_l0
             else:
-                # No mapping available, return superpoint-level logits
+                # No mapping available, return voxel-level logits
                 # (This may cause dimension mismatch in evaluation, but prevents crash)
-                result["seg_logits"] = seg_logits_superpoint
-                get_root_logger().warning("No sub_cluster or voxel_inverse mapping found, returning superpoint-level logits")
+                result["seg_logits"] = seg_logits_voxel
+                get_root_logger().warning(
+                    "No sub_cluster or voxel_inverse mapping found, returning voxel-level logits"
+                )
         
-        # Also store voxel-level logits (same as superpoint in current NAG structure)
-        result["seg_logits_voxel"] = seg_logits_superpoint
+        result["seg_logits_voxel"] = seg_logits_voxel
 
         return result
+
+    def _infer_prediction_level(
+        self, nag: SuperpointHierarchy, seg_logits: torch.Tensor
+    ) -> int:
+        """Infer which hierarchy level the transformer currently predicts on."""
+        num_nodes = seg_logits.shape[0]
+        for level_idx, level in enumerate(nag.levels):
+            if level.num_points == num_nodes:
+                return level_idx
+        raise ValueError(
+            f"Unable to infer prediction level from logits shape {tuple(seg_logits.shape)} "
+            f"and hierarchy sizes {[level.num_points for level in nag.levels]}"
+        )
+
+    def _collect_point_stage_features(self, input_dict: Dict) -> Optional[torch.Tensor]:
+        """Collect handcrafted point features for the semantic PointStage."""
+        extra = []
+        for key in self.post_cnn_keys:
+            value = input_dict.get(key)
+            if value is None or not isinstance(value, torch.Tensor):
+                continue
+            if value.dim() == 1:
+                value = value.view(-1, 1)
+            extra.append(value.float())
+
+        if not extra:
+            return None
+        return torch.cat(extra, dim=1)
 
     def _compute_partition_metrics(
         self, nag: SuperpointHierarchy, input_dict: Dict, sub_cluster: Optional[Cluster]

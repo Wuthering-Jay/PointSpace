@@ -28,8 +28,9 @@ class_names = [
     "buildings"
     ]
 
-feature_keys = ["coord", "echo"]
-in_channels = 5
+partition_feature_keys = ["intensity"]
+feature_keys = partition_feature_keys
+in_channels = len(partition_feature_keys)
 
 weight = None
 resume = True
@@ -40,10 +41,10 @@ seed = 42
 batch_size_train = 16
 batch_size_val = 2
 batch_size_test = 2
-num_worker = 4
+num_worker = 8
 gradient_accumulation_steps = 2
 
-epoch = 1
+epoch = 3
 clip_grad = 5.0
 
 enable_amp = True
@@ -59,13 +60,13 @@ mix_prob = 0.0
 sparse_cnn_config = dict(
     type="EZ-SparseCNN",
     in_channels=in_channels,
-    channels=[32, 64, 64],
-    kernel_size=3,
+    channels=[32, 32, 32],
+    kernel_size=[7, 3, 3],
     dilation=1,
     norm="gn",
     norm_eps=1e-4,
-    activation="relu",
-    residual=True,
+    activation="leakyrelu",
+    residual=False,
     global_residual=False,
     last_norm=True,
     last_activation=False,
@@ -74,8 +75,8 @@ sparse_cnn_config = dict(
 
 partition_config = dict(
     type="GreedyContourPriorPartition",
-    reg=[0.015, 0.05, 0.15],
-    min_size=[3, 15, 50],
+    reg=[0.015],
+    min_size=[10],
     k_adjacency=10,
     spatial_weight=0.05,
     edge_weight_mode="affinity_latent_distance",
@@ -93,7 +94,7 @@ partition_criterion_config = dict(
     alpha=0.5,
     temperature=0.1,
     adaptive_sampling=True,
-    adaptive_sampling_ratio=0.75,
+    adaptive_sampling_ratio=0.7,
     num_classes=num_classes,
     loss_weight=1.0,
 )
@@ -105,12 +106,10 @@ model = dict(
     sparse_cnn=sparse_cnn_config,
     partition_module=partition_config,
     partition_criterion=partition_criterion_config,
-    backbone_out_channels=64,
-    use_voxel_to_point=False,
-    voxel_to_point_decoder=None,
+    backbone_out_channels=32,
 )
 
-optimizer = dict(type="AdamW", lr=0.01, weight_decay=1e-4)
+optimizer = dict(type="AdamW", lr=5e-4, weight_decay=1e-4)
 scheduler = dict(type="CosineAnnealingLR", total_steps=epoch, eta_min=1e-6)
 param_dicts = None
 

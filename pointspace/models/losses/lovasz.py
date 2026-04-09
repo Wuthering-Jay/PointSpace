@@ -244,7 +244,8 @@ class LovaszLoss(_Loss):
                 y_pred, y_true, per_image=self.per_image, ignore=self.ignore_index
             )
         elif self.mode == MULTICLASS_MODE:
-            y_pred = y_pred.softmax(dim=1)
+            # Lovasz is sensitive to low-precision probability ranking under AMP.
+            y_pred = y_pred.float().softmax(dim=1)
             loss = _lovasz_softmax(
                 y_pred,
                 y_true,

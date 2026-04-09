@@ -12,6 +12,7 @@ import scipy.stats
 from scipy.stats import binned_statistic_2d
 from scipy.ndimage import convolve, gaussian_filter, map_coordinates
 from scipy.interpolate import NearestNDInterpolator, RegularGridInterpolator
+from scipy.spatial import cKDTree
 import numpy as np
 import torch
 from torchvision import transforms
@@ -188,6 +189,252 @@ class RobustLogIntensity(object):
         intensity_norm = np.clip(intensity_norm, self.clip_min, self.clip_max)
         
         data_dict["intensity"] = intensity_norm
+        return data_dict
+
+
+def _fit_plane_least_squares(xy, z):
+    """Fit z = ax + by + c by least squares."""
+    if xy.shape[0] < 3:
+        return np.array([0.0, 0.0, float(np.median(z) if z.size > 0 else 0.0)], dtype=np.float32)
+    a = np.concatenate([xy.astype(np.float64), np.ones((xy.shape[0], 1), dtype=np.float64)], axis=1)
+    coef, *_ = np.linalg.lstsq(a, z.astype(np.float64), rcond=None)
+    return coef.astype(np.float32)
+
+
+def _predict_plane(coef, xy):
+    return (xy[:, 0] * coef[0] + xy[:, 1] * coef[1] + coef[2]).astype(np.float32)
+
+
+def _local_min_mask_xy(coord, xy_grid):
+    """Keep only the lowest-Z point in each XY cell."""
+    if xy_grid is None or xy_grid <= 0 or coord.shape[0] == 0:
+        return np.ones(coord.shape[0], dtype=bool)
+
+    grid = np.floor(coord[:, :2] / float(xy_grid)).astype(np.int64)
+    min_z = {}
+    min_idx = {}
+    for i in range(coord.shape[0]):
+        key = (int(grid[i, 0]), int(grid[i, 1]))
+        z = float(coord[i, 2])
+        if key not in min_z or z < min_z[key]:
+            min_z[key] = z
+            min_idx[key] = i
+    mask = np.zeros(coord.shape[0], dtype=bool)
+    mask[list(min_idx.values())] = True
+    return mask
+
+
+def _compute_geometric_features_np(
+    coord,
+    k=25,
+    k_min=5,
+    add_self_as_neighbor=True,
+):
+    """Compute a subset of official PointFeatures on CPU with numpy/scipy."""
+    n = coord.shape[0]
+    coord = np.asarray(coord, dtype=np.float32)
+    if n == 0:
+        return {
+            "linearity": np.empty((0, 1), dtype=np.float32),
+            "planarity": np.empty((0, 1), dtype=np.float32),
+            "scattering": np.empty((0, 1), dtype=np.float32),
+            "verticality": np.empty((0, 1), dtype=np.float32),
+            "normal": np.empty((0, 3), dtype=np.float32),
+        }
+
+    k_eff = int(max(1, min(k, n)))
+    tree = cKDTree(coord)
+    _, nn = tree.query(coord, k=k_eff)
+    if k_eff == 1:
+        nn = nn[:, None]
+
+    if not add_self_as_neighbor:
+        # cKDTree includes self for exact queries; drop it when asked.
+        nn = nn[:, 1:] if nn.shape[1] > 1 else nn[:, :0]
+
+    if nn.shape[1] == 0:
+        zero_1 = np.zeros((n, 1), dtype=np.float32)
+        zero_3 = np.zeros((n, 3), dtype=np.float32)
+        return {
+            "linearity": zero_1.copy(),
+            "planarity": zero_1.copy(),
+            "scattering": zero_1.copy(),
+            "verticality": zero_1.copy(),
+            "normal": zero_3,
+        }
+
+    pts = coord[nn]  # [N, K, 3]
+    center = pts.mean(axis=1, keepdims=True)
+    centered = pts - center
+    cov = np.einsum("nki,nkj->nij", centered, centered) / max(pts.shape[1], 1)
+
+    eigval, eigvec = np.linalg.eigh(cov)
+    eigval = np.clip(eigval, a_min=0.0, a_max=None).astype(np.float32)
+    eigvec = eigvec.astype(np.float32)
+
+    normal = eigvec[:, :, 0]
+    flip_mask = normal[:, 2] < 0
+    normal[flip_mask] *= -1.0
+
+    lambda_1 = np.sqrt(eigval[:, 2])
+    lambda_2 = np.sqrt(eigval[:, 1])
+    lambda_3 = np.sqrt(eigval[:, 0])
+
+    denom = lambda_1 + 1e-3
+    linearity = ((lambda_1 - lambda_2) / denom).reshape(-1, 1)
+    planarity = ((lambda_2 - lambda_3) / denom).reshape(-1, 1)
+    scattering = (lambda_3 / denom).reshape(-1, 1)
+
+    unary = (np.abs(eigvec) * eigval[:, None, :]).sum(axis=2)
+    verticality = (unary[:, 2] / (np.linalg.norm(unary, axis=1) + 1e-8)).reshape(-1, 1)
+    verticality *= 2.0
+
+    if pts.shape[1] < k_min:
+        linearity.fill(0.0)
+        planarity.fill(0.0)
+        scattering.fill(0.0)
+        verticality.fill(0.0)
+        normal.fill(0.0)
+
+    return {
+        "linearity": linearity.astype(np.float32),
+        "planarity": planarity.astype(np.float32),
+        "scattering": scattering.astype(np.float32),
+        "verticality": verticality.astype(np.float32),
+        "normal": normal.astype(np.float32),
+    }
+
+
+@TRANSFORMS.register_module()
+class PointFeatures(object):
+    """Minimal PointFeatures subset aligned with official EZ-SP needs.
+
+    Currently supports the DALES-relevant geometric keys:
+    `linearity`, `planarity`, `scattering`, `verticality`, `normal`.
+    """
+
+    _SUPPORTED_KEYS = {"linearity", "planarity", "scattering", "verticality", "normal"}
+
+    def __init__(
+        self,
+        keys=None,
+        k_min=5,
+        k=25,
+        add_self_as_neighbor=True,
+        overwrite=True,
+    ):
+        self.keys = list(keys) if keys is not None else ["linearity", "planarity", "scattering", "verticality"]
+        self.k_min = k_min
+        self.k = k
+        self.add_self_as_neighbor = add_self_as_neighbor
+        self.overwrite = overwrite
+
+    def __call__(self, data_dict):
+        if "coord" not in data_dict or len(data_dict["coord"]) == 0:
+            return data_dict
+
+        requested = [k for k in self.keys if k in self._SUPPORTED_KEYS]
+        if not requested:
+            return data_dict
+
+        if not self.overwrite:
+            requested = [k for k in requested if k not in data_dict]
+            if not requested:
+                return data_dict
+
+        features = _compute_geometric_features_np(
+            data_dict["coord"],
+            k=self.k,
+            k_min=self.k_min,
+            add_self_as_neighbor=self.add_self_as_neighbor,
+        )
+        for key in requested:
+            data_dict[key] = features[key]
+
+        if "index_valid_keys" not in data_dict:
+            data_dict["index_valid_keys"] = []
+        for key in requested:
+            if key not in data_dict["index_valid_keys"]:
+                data_dict["index_valid_keys"].append(key)
+        return data_dict
+
+
+@TRANSFORMS.register_module()
+class GroundElevation(object):
+    """Approximate official GroundElevation for outdoor point clouds."""
+
+    def __init__(
+        self,
+        z_threshold=None,
+        verticality_threshold=None,
+        xy_grid=None,
+        model="ransac",
+        scale=3.0,
+        k=3,
+    ):
+        self.z_threshold = z_threshold
+        self.verticality_threshold = verticality_threshold
+        self.xy_grid = xy_grid
+        self.model = model
+        self.scale = scale
+        self.k = max(1, int(k))
+        assert model in ["ransac", "knn", "mlp"]
+
+    def __call__(self, data_dict):
+        if self.scale <= 0 or "coord" not in data_dict or len(data_dict["coord"]) == 0:
+            return data_dict
+
+        coord = np.asarray(data_dict["coord"], dtype=np.float32)
+        mask = np.ones(coord.shape[0], dtype=bool)
+
+        if self.z_threshold is not None:
+            mask &= coord[:, 2] <= (coord[:, 2].min() + float(self.z_threshold))
+
+        if (
+            self.verticality_threshold is not None
+            and 0 < self.verticality_threshold < 1
+            and "verticality" in data_dict
+        ):
+            verticality = np.asarray(data_dict["verticality"]).reshape(-1)
+            mask &= verticality < float(self.verticality_threshold)
+
+        if self.xy_grid is not None and self.xy_grid > 0:
+            mask &= _local_min_mask_xy(coord, self.xy_grid)
+
+        ref = coord[mask]
+        if ref.shape[0] == 0:
+            ref = coord
+
+        xy = coord[:, :2]
+        ref_xy = ref[:, :2]
+        ref_z = ref[:, 2]
+
+        if self.model == "knn" and ref.shape[0] > 0:
+            tree = cKDTree(ref_xy)
+            k_eff = min(self.k, ref.shape[0])
+            dist, idx = tree.query(xy, k=k_eff)
+            if k_eff == 1:
+                dist = dist[:, None]
+                idx = idx[:, None]
+            weight = 1.0 / np.maximum(dist, 1e-3)
+            z_ground = (weight * ref_z[idx]).sum(axis=1) / np.maximum(weight.sum(axis=1), 1e-6)
+        else:
+            coef = _fit_plane_least_squares(ref_xy, ref_z)
+            if self.model == "ransac" and ref.shape[0] >= 6:
+                pred_ref = _predict_plane(coef, ref_xy)
+                resid = np.abs(ref_z - pred_ref)
+                thresh = np.percentile(resid, 70)
+                inlier = resid <= max(thresh, 1e-2)
+                if inlier.sum() >= 3:
+                    coef = _fit_plane_least_squares(ref_xy[inlier], ref_z[inlier])
+            z_ground = _predict_plane(coef, xy)
+
+        elevation = ((coord[:, 2] - z_ground) / float(self.scale)).reshape(-1, 1).astype(np.float32)
+        data_dict["elevation"] = elevation
+        if "index_valid_keys" not in data_dict:
+            data_dict["index_valid_keys"] = []
+        if "elevation" not in data_dict["index_valid_keys"]:
+            data_dict["index_valid_keys"].append("elevation")
         return data_dict
 
 

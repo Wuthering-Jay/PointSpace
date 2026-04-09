@@ -69,6 +69,13 @@ def pool_factory(
         return SumPool()
     if pool == "std":
         return StdPool()
+    if pool == "attentive":
+        return AttentivePool(*args, **kwargs)
+    if isinstance(pool, str):
+        raise ValueError(
+            f"Unknown pool type '{pool}'. "
+            f"Supported: 'max', 'min', 'mean', 'sum', 'std', 'attentive'"
+        )
     return pool(*args, **kwargs)
 
 
@@ -264,10 +271,8 @@ class BaseAttentivePool(nn.Module):
                 rpe = rpe.repeat(1, H)
             q = q + rpe.view(Nc, H, -1)
 
-        # Compute compatibility scores from query-key products
-        compat = torch.einsum("nhd, nhd -> nh", q, k)  # [Nc, H]
-
-        # Compute attention scores with scaled softmax
+        # Compute attentive pooling scores in FP32 to stabilize AMP.
+        compat = torch.einsum("nhd, nhd -> nh", q.float(), k.float())  # [Nc, H]
         attn = softmax(compat, index=index, dim=0, num_nodes=Np)  # [Nc, H]
 
         # Optional attention dropout
@@ -275,6 +280,7 @@ class BaseAttentivePool(nn.Module):
             attn = self.attn_drop(attn)
 
         # Apply attention to values
+        attn = attn.to(v.dtype)
         x = (v * attn.unsqueeze(-1)).view(Nc, self.dim)  # [Nc, C]
         x = scatter_sum(x, index, dim=0, dim_size=Np)  # [Np, C]
 
@@ -332,7 +338,7 @@ class AttentivePool(BaseAttentivePool):
         """Initialize AttentivePool.
 
         Args:
-            q_in_dim: Input dimension for query projection.
+            q_in_dim: Input dimension for query projection. If None, defaults to dim.
             Other args: See BaseAttentivePool.
         """
         super().__init__(
@@ -352,7 +358,10 @@ class AttentivePool(BaseAttentivePool):
             heads_share_rpe=heads_share_rpe,
         )
 
-        # Query projection from parent features
+        # Query projection from parent features.
+        # Keep this non-lazy to stay compatible with global weight init.
+        if q_in_dim is None:
+            q_in_dim = dim
         self.q = nn.Linear(q_in_dim, qk_dim * num_heads, bias=qkv_bias)
 
     def _get_query(self, x_parent: torch.Tensor) -> torch.Tensor:

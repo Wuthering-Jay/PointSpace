@@ -196,6 +196,8 @@ class SPT(nn.Module):
         point_mlp: Optional[List[int]] = None,
         point_drop: Optional[float] = None,
         nano: bool = False,
+        point_cnn_blocks: bool = False,
+        point_mlp_on_cnn_feats: bool = False,
         # Down stage params
         down_dim: Optional[List[int]] = None,
         down_pool_dim: Optional[List[int]] = None,
@@ -338,10 +340,49 @@ class SPT(nn.Module):
         num_down = len(down_dim) - int(nano) if down_dim else 0
         num_up = len(up_dim) if up_dim else 0
         needs_h_edge_hf = any(x > 0 for x in (down_num_blocks or []) + (up_num_blocks or []))
-        needs_v_edge_hf = num_down > 0 and isinstance(
-            pool_factory(pool[0], down_pool_dim[0] if down_pool_dim else None),
-            BaseAttentivePool,
-        )
+        
+        # Pre-build pool objects with correct dimensions
+        # Note: pool list has len(down_dim) elements, but we only use elements from start_idx onward
+        pool_objects = [None] * len(pool)  # Initialize with None
+        if num_down > 0 and down_pool_dim:
+            start_idx = int(nano)
+            for i in range(start_idx, len(pool)):
+                # Map pool index to down_pool_dim index
+                # For nano=True: i=1,2 maps to down_pool_dim[0,1]
+                # For nano=False: i=0,1,2,... maps to down_pool_dim[0,1,2,...]
+                pool_dim_idx = i - start_idx
+                if pool_dim_idx < len(down_pool_dim):
+                    pool_dim = down_pool_dim[pool_dim_idx]
+                    
+                    # Determine child feature dimension for pooling
+                    # For first DownNFuseStage (i=start_idx): x_child comes from first_stage
+                    if i == start_idx:
+                        child_dim = down_dim[0] if nano else down_dim[0]
+                    else:
+                        child_dim = down_dim[i - 1]
+
+                    # Create pool with explicit attentive dimensions:
+                    # - dim / output dim follows child stream
+                    # - q_in_dim is inferred lazily from x_parent at runtime to
+                    #   tolerate dataset/use_pos-driven handcrafted feature changes
+                    if isinstance(pool[i], str) and pool[i] == "attentive":
+                        pool_objects[i] = pool_factory(
+                            pool[i],
+                            child_dim,
+                            in_dim=child_dim,
+                        )
+                    else:
+                        pool_objects[i] = pool_factory(pool[i], pool_dim)
+                else:
+                    # Fallback if down_pool_dim is shorter than expected
+                    pool_objects[i] = pool_factory(pool[i])
+            needs_v_edge_hf = pool_objects[start_idx] is not None and isinstance(
+                pool_objects[start_idx], BaseAttentivePool
+            )
+        else:
+            # Fallback: create pool objects without dimensions
+            pool_objects = [pool_factory(p) for p in pool]
+            needs_v_edge_hf = False
 
         # Build handcrafted feature MLPs
         node_mlp_channels = node_mlp if use_node_hf else None
@@ -416,6 +457,8 @@ class SPT(nn.Module):
                 mlp_drop=point_drop,
                 use_pos=use_pos,
                 use_diameter_parent=use_diameter_parent,
+                cnn_blocks=point_cnn_blocks,
+                point_mlp_on_cnn_feats=point_mlp_on_cnn_feats,
             )
 
         # Feature fusion operator
@@ -468,7 +511,7 @@ class SPT(nn.Module):
                         q_delta_rpe=q_delta_rpe,
                         qk_share_rpe=qk_share_rpe,
                         q_on_minus_rpe=q_on_minus_rpe,
-                        pool=pool[i_down],
+                        pool=pool_objects[i_down],  # Use pre-built pool object
                         fusion=fusion,
                         use_pos=use_pos,
                         use_diameter=use_diameter,
@@ -710,8 +753,23 @@ class SPT(nn.Module):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Forward first stage."""
         norm_index = self._get_norm_index(data)
+        x = data.get("x")
+        point_hf = data.get("point_hf")
+        if isinstance(self.first_stage, PointStage):
+            return self.first_stage(
+                x,
+                norm_index,
+                pos=data.get("pos"),
+                diameter=None,
+                node_size=data.get("node_size"),
+                super_index=data.get("super_index"),
+                edge_index=data.get("edge_index"),
+                edge_attr=data.get("edge_attr"),
+                x_mlp=point_hf,
+            )
+        first_x = point_hf if point_hf is not None else x
         return self.first_stage(
-            data.get("x") if self.use_node_hf else None,
+            first_x,
             norm_index,
             pos=data.get("pos"),
             diameter=None,
@@ -733,7 +791,7 @@ class SPT(nn.Module):
         prev_level_data = hierarchy.get_level(i_level - 1)
         is_last = i_level == hierarchy.num_levels - 1
 
-        x_hf = level_data.get("x") if self.use_node_hf else None
+        x_hf = level_data.get("node_hf") if self.use_node_hf else None
         norm_index = self._get_norm_index(level_data)
 
         return stage(
@@ -762,7 +820,7 @@ class SPT(nn.Module):
         """Forward up stage."""
         level_data = hierarchy.get_level(i_level)
 
-        x_hf = level_data.get("x") if self.use_node_hf else None
+        x_hf = level_data.get("node_hf") if self.use_node_hf else None
         x_skip_fused = self.feature_fusion(x_skip, x_hf)
         norm_index = self._get_norm_index(level_data)
 

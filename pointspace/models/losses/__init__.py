@@ -6,6 +6,7 @@ from .misc import (
     DiceLoss,
     FocalLoss,
     BinaryFocalLoss,
+    WeightedFocalLoss,
     MSELoss,
     L1Loss,
     SmoothL1Loss,
