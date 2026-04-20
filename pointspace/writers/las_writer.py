@@ -402,6 +402,20 @@ class LASWriter(BaseWriter):
             logger.debug("  -> curvature 字段已写入")
 
         # ========== 超点分割 (Superpoint Partition) ==========
+        oracle_pred = kwargs.get("oracle_pred", None)
+        if oracle_pred is not None:
+            oracle_pred = np.asarray(oracle_pred, dtype=np.int32)
+            if oracle_pred.shape[0] != n_points:
+                raise ValueError(
+                    f"oracle_pred 长度 ({oracle_pred.shape[0]}) 与点数 ({n_points}) 不匹配"
+                )
+            self._add_extra_dim(las, "oracle_pred", oracle_pred, np.int32)
+            logger.debug(
+                f"  -> oracle_pred 字段已写入 "
+                f"(unique labels: {np.unique(oracle_pred).tolist()})"
+            )
+
+        # ========== 超点分割 (Superpoint Partition) ==========
         # 支持多级超点标签，字段名格式：superpoint_level_1, superpoint_level_2, ...
         # 用于 EZ-SP 等可学习超点分割方法的输出
         for key, value in kwargs.items():

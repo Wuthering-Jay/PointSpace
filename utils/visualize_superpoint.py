@@ -16,7 +16,7 @@ def get_paper_ready_colors(labels):
     # 方案 A (默认): 'turbo' - 适合超点/聚类类别较多(>20)的情况。色彩丰富、感知均匀、质感高级。
     # 方案 B: 'tab20' - 适合类别较少(<20)的情况。最经典的论文分类标准柔和配色。
     # 方案 C: 'Set3' - 莫兰迪色系/马卡龙色系，非常淡雅，适合浅色背景展示。
-    cmap = plt.get_cmap('tab20') 
+    cmap = plt.get_cmap('Set3') 
     
     color_palette = cmap(np.linspace(0, 1, num_classes))
     
@@ -111,14 +111,16 @@ def process_pointclouds(input_path, output_dir):
             return
             
     elif os.path.isdir(input_path):
-        search_paths = [
-            Path(input_path).rglob('*.las'),
-            Path(input_path).rglob('*.laz'),
-            Path(input_path).rglob('*.LAS'),
-            Path(input_path).rglob('*.LAZ')
-        ]
-        for generator in search_paths:
-            files_to_process.extend(list(generator))
+        # Windows 下 glob / rglob 对大小写通常不敏感，
+        # 分别搜索 *.las / *.LAS 会把同一批文件重复加入列表。
+        # 这里统一扫描一次，再按后缀过滤并去重，避免进度条翻倍。
+        seen = set()
+        for file in Path(input_path).rglob('*'):
+            if file.is_file() and file.suffix.lower() in {'.las', '.laz'}:
+                resolved = str(file.resolve())
+                if resolved not in seen:
+                    seen.add(resolved)
+                    files_to_process.append(file)
             
     if not files_to_process:
         print("⚠️ 未找到任何需要处理的 .las 或 .laz 文件。")
@@ -143,7 +145,7 @@ if __name__ == "__main__":
     # 你可以在这里修改为你的实际路径
     # INPUT_PATH 可以是单个文件路径，比如 'data/cloud.laz' 
     # 也可以是文件夹路径，比如 'data/pointclouds'
-    INPUT_PATH = r"E:\data\DALES\dales_las\tile\pred" 
-    OUTPUT_DIR = r"E:\data\DALES\dales_las\tile\pred-visualized"
+    INPUT_PATH = r"E:\data\DALES\dales_las\tile\output" 
+    OUTPUT_DIR = r"E:\data\DALES\dales_las\tile\output-visualized"
     
     process_pointclouds(INPUT_PATH, OUTPUT_DIR)

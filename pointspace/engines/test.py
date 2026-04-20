@@ -2185,23 +2185,8 @@ class EZSPPartitionTester(TesterBase):
             # Get scene info
             data_name = data_dict.pop("name", f"scene_{idx}")
             
-            # Debug: Check what keys are available
-            if idx == 0:
-                logger.info(f"[DEBUG] data_dict keys: {list(data_dict.keys())}")
-                if 'segment' in data_dict:
-                    logger.info(f"[DEBUG] segment shape: {data_dict['segment'].shape}")
-                if 'segment_raw' in data_dict:
-                    logger.info(f"[DEBUG] segment_raw shape: {data_dict['segment_raw'].shape}")
-            
             # For partition evaluation, use raw point-level labels
             segment = data_dict.pop("segment_raw", None)
-            if segment is None:
-                segment = data_dict.pop("segment", None)
-                if idx == 0:
-                    logger.info(f"[DEBUG] Using 'segment' (voxel-level), shape: {segment.shape if segment is not None else None}")
-            else:
-                if idx == 0:
-                    logger.info(f"[DEBUG] Using 'segment_raw' (point-level), shape: {segment.shape if segment is not None else None}")
             
             # Handle fragment-based processing if present
             if "fragment_list" in data_dict:
@@ -2277,11 +2262,6 @@ class EZSPPartitionTester(TesterBase):
             
             # Compute Oracle metrics if we have ground truth
             if segment is not None:
-                if idx == 0:
-                    logger.info(f"[DEBUG Metrics] segment shape: {segment.shape if hasattr(segment, 'shape') else type(segment)}")
-                    logger.info(f"[DEBUG Metrics] y_pred: {y_pred.shape if y_pred is not None else None}")
-                    logger.info(f"[DEBUG Metrics] output_dict keys: {list(output_dict.keys())}")
-                
                 if y_pred is not None:
                     # Move to numpy for metric computation
                     y_pred_np = y_pred.cpu().numpy() if isinstance(y_pred, torch.Tensor) else y_pred
@@ -2320,8 +2300,6 @@ class EZSPPartitionTester(TesterBase):
                     iou = np.mean(iou_class[mask])
                     acc = sum(intersection) / (sum(target) + 1e-10)
                 else:
-                    if idx == 0:
-                        logger.warning("[DEBUG Metrics] y_pred is None, skipping metrics computation")
                     iou = 0.0
                     acc = 0.0
             else:
@@ -2339,11 +2317,6 @@ class EZSPPartitionTester(TesterBase):
                         sp_level_np = sp_level.cpu().numpy() if isinstance(sp_level, torch.Tensor) else sp_level
                         write_kwargs[f"superpoint_level_{level + 1}"] = sp_level_np.astype(np.int32)
                     
-                    if idx == 0:
-                        logger.info(f"[DEBUG Writer] Writing {len(sp_multi)} levels of superpoint IDs to points")
-                        for level, sp_level in enumerate(sp_multi):
-                            logger.info(f"  Level {level + 1}: {sp_level.shape[0]} points")
-                
                 # Final superpoint labels (highest level)
                 elif superpoint_labels is not None:
                     sp_labels_np = superpoint_labels.cpu().numpy() if isinstance(superpoint_labels, torch.Tensor) else superpoint_labels
@@ -2353,9 +2326,6 @@ class EZSPPartitionTester(TesterBase):
                 if y_pred is not None:
                     y_pred_np = y_pred.cpu().numpy() if isinstance(y_pred, torch.Tensor) else y_pred
                     write_kwargs["oracle_pred"] = y_pred_np.astype(np.int32)
-                    
-                    if idx == 0:
-                        logger.info(f"[DEBUG Writer] Writing Oracle predictions: {y_pred_np.shape[0]} points")
                 
                 if write_kwargs:
                     general_writer.write(data_name, **write_kwargs)
@@ -2411,7 +2381,7 @@ class EZSPPartitionTester(TesterBase):
                 all_acc = sum(intersection) / (sum(target) + 1e-10)
                 
                 logger.info(
-                    "Partition Test Result: Oracle mIoU/mAcc/allAcc {:.4f}/{:.4f}/{:.4f}".format(
+                    "Partition Test Result:  Oracle mIoU {:.4f}  Oracle mAcc {:.4f}  Oracle OA {:.4f}".format(
                         m_iou, m_acc, all_acc
                     )
                 )
@@ -2419,11 +2389,15 @@ class EZSPPartitionTester(TesterBase):
                 # Per-class breakdown
                 names = self.cfg.data.names
                 if names is not None:
+                    max_name_len = max(len(n) for n in names)
                     for i in range(min(len(names), num_classes)):
                         logger.info(
-                            "Class_{idx}-{name} Result: Oracle IoU {iou:.4f}".format(
-                                idx=i, name=names[i], iou=iou_class[i]
+                            "  Class {:2d} - {:<{w}} | Oracle IoU {:.4f}".format(
+                                i, names[i], iou_class[i], w=max_name_len
                             )
+                            # "Class_{idx}-{name} Result: Oracle IoU {iou:.4f}".format(
+                            #     idx=i, name=names[i], iou=iou_class[i]
+                            # )
                         )
             else:
                 logger.info("No ground truth available for evaluation.")

@@ -28,17 +28,16 @@ class_names = [
     "buildings"
     ]
 
-partition_feature_keys = ["intensity"]
-feature_keys = partition_feature_keys
-in_channels = len(partition_feature_keys)
+feature_keys = ["coord", "echo"]
+in_channels = 5
 
-weight = None
+weight = "exp/dales/ezsp-stage1/model/model_last.pth"
 resume = True
 evaluate = True
 test_only = False
 seed = 42
 
-batch_size_train = 16
+batch_size_train = 8
 batch_size_val = 2
 batch_size_test = 2
 num_worker = 8
@@ -75,8 +74,8 @@ sparse_cnn_config = dict(
 
 partition_config = dict(
     type="GreedyContourPriorPartition",
-    reg=[0.015],
-    min_size=[10],
+    reg=[0.015, 0.05, 0.15],
+    min_size=[5, 15, 70],
     k_adjacency=10,
     spatial_weight=0.05,
     edge_weight_mode="affinity_latent_distance",
@@ -165,14 +164,10 @@ data = dict(
         remap_class=True,
         ignore_index=ignore_index,
         test_mode=False,
-        loop=5,
+        loop=1,
         transform=[
             dict(type="ZPercentileCenterShift", percentile=2.0),
-            dict(type="RandomDropout", dropout_ratio=0.2, dropout_application_ratio=0.2),
-            dict(type="RandomRotate", angle=[-1, 1], axis="z", center=[0, 0, 0], p=0.5),
-            dict(type="RandomScale", scale=[0.9, 1.1]),
-            dict(type="RandomFlip", p=0.5),
-            dict(type="RandomJitter", sigma=0.005, clip=0.02),
+            # Keep validation deterministic so Oracle partition metrics are stable.
             dict(type="SaveNodeIndex", key="sub"),
             dict(type="Copy", keys_dict={"segment": "segment_raw"}),
             dict(

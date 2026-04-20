@@ -171,6 +171,13 @@ def test_official_dales_configs_are_selected():
     assert stage1["feature_keys"] == ["intensity"]
     assert stage1["in_channels"] == 1
     assert stage1["sparse_cnn_config"]["kernel_size"] == [7, 3, 3]
+    assert stage1["data"]["val"]["loop"] == 1
+    assert [t["type"] for t in stage1["data"]["val"]["transform"]] == [
+        "ZPercentileCenterShift",
+        "SaveNodeIndex",
+        "Copy",
+        "GridSampling3D",
+    ]
 
     assert stage2["epoch"] == 600
     assert stage2["optimizer"]["lr"] == pytest.approx(5e-3)
