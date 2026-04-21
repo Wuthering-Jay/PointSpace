@@ -189,17 +189,6 @@ class SemSegEvaluator(HookBase):
             pred = output.max(1)[1]
             segment = input_dict["segment"]
             
-            # Debug logging for first iteration
-            if i == 0:
-                self.trainer.logger.info(f"[Evaluator Debug] output shape: {output.shape}")
-                self.trainer.logger.info(f"[Evaluator Debug] pred shape: {pred.shape}")
-                self.trainer.logger.info(f"[Evaluator Debug] segment shape: {segment.shape}")
-                self.trainer.logger.info(f"[Evaluator Debug] segment dtype: {segment.dtype}")
-                if segment.dim() > 1:
-                    self.trainer.logger.info(f"[Evaluator Debug] segment is histogram format")
-                self.trainer.logger.info(f"[Evaluator Debug] Has inverse: {'inverse' in input_dict.keys()}")
-                self.trainer.logger.info(f"[Evaluator Debug] Has origin_segment: {'origin_segment' in input_dict.keys()}")
-            
             # Handle different scenarios for superpoint vs regular models:
             # 1. Regular models with inverse: use inverse to propagate pred, use segment_raw
             # 2. Superpoint models without inverse: pred already at point-level, use segment_raw directly

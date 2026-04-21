@@ -3,10 +3,12 @@ from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 from distutils.sysconfig import get_config_vars
 
-(opt,) = get_config_vars("OPT")
-os.environ["OPT"] = " ".join(
-    flag for flag in opt.split() if flag != "-Wstrict-prototypes"
-)
+opt_vars = get_config_vars("OPT")
+if opt_vars and opt_vars[0] is not None:
+    opt = opt_vars[0]
+    os.environ["OPT"] = " ".join(
+        flag for flag in opt.split() if flag != "-Wstrict-prototypes"
+    )
 
 src = "src"
 sources = [

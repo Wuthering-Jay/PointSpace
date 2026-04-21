@@ -1,4 +1,5 @@
 import sys
+import torch
 import torch.nn as nn
 import spconv.pytorch as spconv
 
@@ -82,11 +83,27 @@ class PointSequential(PointModule):
                 input = module(input)
             # Spconv module
             elif spconv.modules.is_spconv_module(module):
-                if isinstance(input, Point):
-                    input.sparse_conv_feat = module(input.sparse_conv_feat)
-                    input.feat = input.sparse_conv_feat.features
+                # spconv 在 eval + AMP(fp16) 下可能触发 kernel/tuner 失败，
+                # 这里统一在推理/验证时强制 FP32，避免各个 backbone 逐个包裹。
+                if self.training:
+                    if isinstance(input, Point):
+                        input.sparse_conv_feat = module(input.sparse_conv_feat)
+                        input.feat = input.sparse_conv_feat.features
+                    else:
+                        input = module(input)
                 else:
-                    input = module(input)
+                    with torch.amp.autocast("cuda", enabled=False):
+                        if isinstance(input, Point):
+                            if hasattr(input, "sparse_conv_feat") and input.sparse_conv_feat is not None:
+                                input.sparse_conv_feat = input.sparse_conv_feat.replace_feature(
+                                    input.sparse_conv_feat.features.float()
+                                )
+                            input.sparse_conv_feat = module(input.sparse_conv_feat)
+                            input.feat = input.sparse_conv_feat.features
+                        else:
+                            if isinstance(input, spconv.SparseConvTensor):
+                                input = input.replace_feature(input.features.float())
+                            input = module(input)
             elif is_ocnn_module(module):
                 if isinstance(input, Point):
                     input.octree.features[-1] = module(
