@@ -5,13 +5,13 @@ train_data_dir = r"E:\data\DALES\dales_las\tile\train"
 val_data_dir = r"E:\data\DALES\dales_las\tile\test"
 test_data_dir = r"E:\data\DALES\dales_las\tile\test"
 pred_save_dir = r"E:\data\DALES\dales_las\tile\pred"
-save_path = "exp/dales/semseg-pt-v3m1-1-base"
+save_path = "exp/dales/semseg-pt-v3m2-0-base"
 
 # -------------------------------------------------------
 # 1. General settings
 # -------------------------------------------------------
 num_classes = 8
-grid_size = 0.25
+grid_size = 0.5
 ignore_index = -1
 dataset_type = "LasDataset"
 required_classes = [1, 2, 3, 4, 5, 6, 7, 8]
@@ -31,7 +31,7 @@ in_channels = 5
 # -------------------------------------------------------
 # 2. Checkpoint / run control
 # -------------------------------------------------------
-weight = "exp/dales/semseg-pt-v3m1-1-base/model/model_last.pth"   # path to pretrained / fine-tune weight
+weight = "exp/dales/semseg-pt-v3m2-0-base/model/model_last.pth"   # path to pretrained / fine-tune weight
 # weight = None
 resume = True      # resume from the latest checkpoint
 evaluate = True     # run evaluation after each training epoch
@@ -41,10 +41,10 @@ seed = 42           # fixed seed (None = auto-random, value is logged)
 # -------------------------------------------------------
 # 3. Resource & batch settings
 # -------------------------------------------------------
-batch_size_train = 6       # effective batch = micro_batch × gradient_accumulation_steps
+batch_size_train = 12       # effective batch = micro_batch × gradient_accumulation_steps
                            #   micro_batch = batch_size_train // gradient_accumulation_steps
-batch_size_val = 2         # None → auto 1 per GPU (no gradient → less memory than train)
-batch_size_test = 2        # None → auto 1 per GPU; >1 = fragments per forward in SemSegTester
+batch_size_val = 4         # None → auto 1 per GPU (no gradient → less memory than train)
+batch_size_test = 4        # None → auto 1 per GPU; >1 = fragments per forward in SemSegTester
 num_worker = 4            # total dataloader workers across all GPUs
 gradient_accumulation_steps = 2  # effective batch = 2, micro_batch per step = 3
 
@@ -78,7 +78,7 @@ model = dict(
     num_classes=num_classes,
     backbone_out_channels=64,
     backbone=dict(
-        type="PT-v3m1",
+        type="PT-v3m2",
         in_channels=in_channels,
         order=["z", "z-trans", "hilbert", "hilbert-trans"],
         stride=(2, 2, 2, 2),
@@ -96,19 +96,17 @@ model = dict(
         attn_drop=0.0,
         proj_drop=0.0,
         drop_path=0.3,
-        shuffle_orders=True,
+        layer_scale=None,
         pre_norm=True,
+        shuffle_orders=True,
         enable_rpe=True,
         enable_flash=False,
         upcast_attention=False,
         upcast_softmax=False,
+        traceable=True,
+        mask_token=False,
         enc_mode=False,
-        pdnorm_bn=False,
-        pdnorm_ln=False,
-        pdnorm_decouple=True,
-        pdnorm_adaptive=False,
-        pdnorm_affine=True,
-        pdnorm_conditions=("Dales"),
+        freeze_encoder=False,
     ),
     criteria=[
         dict(type="CrossEntropyLoss", loss_weight=1.0, ignore_index=-1, auto_class_weight=True),

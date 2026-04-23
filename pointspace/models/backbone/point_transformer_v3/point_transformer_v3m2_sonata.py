@@ -341,7 +341,12 @@ class Block(PointModule):
 
     def forward(self, point: Point):
         shortcut = point.feat
-        point = self.cpe(point)
+        # spconv 在 eval + fp16 下可能触发 kernel 选择失败，强制用 FP32 更稳
+        if self.training:
+            point = self.cpe(point)
+        else:
+            with torch.amp.autocast("cuda", enabled=False):
+                point = self.cpe(point)
         point.feat = shortcut + point.feat
         shortcut = point.feat
         if self.pre_norm:
