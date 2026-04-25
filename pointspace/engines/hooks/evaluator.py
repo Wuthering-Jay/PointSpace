@@ -189,40 +189,24 @@ class SemSegEvaluator(HookBase):
             pred = output.max(1)[1]
             segment = input_dict["segment"]
             
-            # Handle different scenarios for superpoint vs regular models:
-            # 1. Regular models with inverse: use inverse to propagate pred, use segment_raw
-            # 2. Superpoint models without inverse: pred already at point-level, use segment_raw directly
-            # 3. Models without segment_raw: convert histogram segment to hard labels if needed
-            
             if "segment_raw" in input_dict.keys():
                 # For superpoint models: pred is already at point level (chain-propagated in model)
                 # Just use segment_raw for ground truth (original point-level labels)
                 segment = input_dict["segment_raw"]
-                if i == 0:
-                    self.trainer.logger.info(f"[Evaluator Debug] Using segment_raw: {segment.shape}")
                 
                 # Apply inverse to pred if available (regular models that need voxel->point mapping)
                 if "inverse" in input_dict.keys():
                     pred = pred[input_dict["inverse"]]
-                    if i == 0:
-                        self.trainer.logger.info(f"[Evaluator Debug] Applied inverse to pred: {pred.shape}")
                 
                 # Handle histogram format for segment_raw (shouldn't happen, but be defensive)
                 if segment.dim() > 1:
                     segment = segment[:, :self.trainer.cfg.data.num_classes].argmax(dim=1)
-                    if i == 0:
-                        self.trainer.logger.info(f"[Evaluator Debug] segment_raw after argmax: {segment.shape}")
+
             else:
                 # Fallback: no origin_segment, use voxel-level segment
                 if segment.dim() > 1:
                     # Histogram label format [N, C+1] -> hard label [N]
                     segment = segment[:, :self.trainer.cfg.data.num_classes].argmax(dim=1)
-                    if i == 0:
-                        self.trainer.logger.info(f"[Evaluator Debug] segment after argmax: {segment.shape}")
-            
-            if i == 0:
-                self.trainer.logger.info(f"[Evaluator Debug] Final pred shape: {pred.shape}")
-                self.trainer.logger.info(f"[Evaluator Debug] Final segment shape: {segment.shape}")
             
             intersection, union, target = intersection_and_union_gpu(
                 pred,

@@ -5,7 +5,7 @@ train_data_dir = r"E:\data\DALES\dales_las\tile\train"
 val_data_dir = r"E:\data\DALES\dales_las\tile\test"
 test_data_dir = r"E:\data\DALES\dales_las\tile\test"
 pred_save_dir = r"E:\data\DALES\dales_las\tile\pred"
-save_path = "exp/dales/semseg-pt-v3m1-1-base"
+save_path = "exp/dales/semseg-pt-v3m1-2-flash"
 
 # -------------------------------------------------------
 # 1. General settings
@@ -31,7 +31,7 @@ in_channels = 5
 # -------------------------------------------------------
 # 2. Checkpoint / run control
 # -------------------------------------------------------
-weight = "exp/dales/semseg-pt-v3m1-1-base/model/model_last.pth"   # path to pretrained / fine-tune weight
+weight = "exp/dales/semseg-pt-v3m1-2-flash/model/model_last.pth"   # path to pretrained / fine-tune weight
 # weight = None
 resume = True      # resume from the latest checkpoint
 evaluate = True     # run evaluation after each training epoch
@@ -41,10 +41,10 @@ seed = 42           # fixed seed (None = auto-random, value is logged)
 # -------------------------------------------------------
 # 3. Resource & batch settings
 # -------------------------------------------------------
-batch_size_train = 6       # effective batch = micro_batch × gradient_accumulation_steps
+batch_size_train = 8       # effective batch = micro_batch × gradient_accumulation_steps
                            #   micro_batch = batch_size_train // gradient_accumulation_steps
-batch_size_val = 2         # None → auto 1 per GPU (no gradient → less memory than train)
-batch_size_test = 2        # None → auto 1 per GPU; >1 = fragments per forward in SemSegTester
+batch_size_val = 4         # None → auto 1 per GPU (no gradient → less memory than train)
+batch_size_test = 4        # None → auto 1 per GPU; >1 = fragments per forward in SemSegTester
 num_worker = 4            # total dataloader workers across all GPUs
 gradient_accumulation_steps = 2  # effective batch = 2, micro_batch per step = 3
 
@@ -98,8 +98,8 @@ model = dict(
         drop_path=0.3,
         shuffle_orders=True,
         pre_norm=True,
-        enable_rpe=True,
-        enable_flash=False,
+        enable_rpe=False,
+        enable_flash=True,
         upcast_attention=False,
         upcast_softmax=False,
         enc_mode=False,
@@ -135,7 +135,7 @@ hooks = [
     dict(type="ModelHook"),
     dict(type="IterationTimer", warmup_iter=2),
     dict(type="InformationWriter", interval=10),
-    dict(type="CacheCleaner", time_multiplier=5, step_clean_interval=100),
+    dict(type="CacheCleaner", time_multiplier=5, step_clean_interval=250),
     dict(type="SemSegEvaluator",log_interval=10),
     dict(type="CheckpointSaver", save_freq=None),
     dict(type="PreciseEvaluator", test_last=False),
