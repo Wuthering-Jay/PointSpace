@@ -1,4 +1,4 @@
-from pointspace.datasets.preprocessing.scannet.meta_data.scannet200_constants import (
+from pointcept.datasets.preprocessing.scannet.meta_data.scannet200_constants import (
     CLASS_LABELS_200,
 )
 

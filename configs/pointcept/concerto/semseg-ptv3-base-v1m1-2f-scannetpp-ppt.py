@@ -1,4 +1,4 @@
-from pointspace.datasets.preprocessing.scannet.meta_data.scannet200_constants import (
+from pointcept.datasets.preprocessing.scannet.meta_data.scannet200_constants import (
     CLASS_LABELS_200,
 )
 
@@ -62,7 +62,7 @@ model = dict(
     backbone_out_channels=64,
     conditions=("ScanNet200", "ScanNet++", "Structured3D"),
     template="[x]",
-    clip_model="/high_perf_store3/l3_data/zhangyujia/models/clip/ViT-B-16.pt",
+    clip_model="ViT-B/16",
     # fmt: off
     class_names = [
         CLASS_LABELS_200,

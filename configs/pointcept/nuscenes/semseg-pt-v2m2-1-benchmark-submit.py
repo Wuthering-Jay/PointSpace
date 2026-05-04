@@ -109,7 +109,7 @@ data = dict(
             dict(
                 type="Collect",
                 keys=("coord", "segment"),
-                feat_keys=("coord", "intensity"),
+                feat_keys=("coord", "strength"),
             ),
         ],
         test_mode=False,
@@ -129,7 +129,7 @@ data = dict(
                 dict(
                     type="Collect",
                     keys=("coord", "index"),
-                    feat_keys=("coord", "intensity"),
+                    feat_keys=("coord", "strength"),
                 ),
             ],
             aug_transform=[

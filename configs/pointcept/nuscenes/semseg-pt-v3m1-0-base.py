@@ -119,7 +119,7 @@ data = dict(
             dict(
                 type="Collect",
                 keys=("coord", "grid_coord", "segment"),
-                feat_keys=("coord", "intensity"),
+                feat_keys=("coord", "strength"),
             ),
         ],
         test_mode=False,
@@ -144,7 +144,7 @@ data = dict(
             dict(
                 type="Collect",
                 keys=("coord", "grid_coord", "segment", "origin_segment", "inverse"),
-                feat_keys=("coord", "intensity"),
+                feat_keys=("coord", "strength"),
             ),
         ],
         test_mode=False,
@@ -179,7 +179,7 @@ data = dict(
                 dict(
                     type="Collect",
                     keys=("coord", "grid_coord", "index"),
-                    feat_keys=("coord", "intensity"),
+                    feat_keys=("coord", "strength"),
                 ),
             ],
             aug_transform=[
