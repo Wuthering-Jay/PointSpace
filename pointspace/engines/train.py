@@ -381,15 +381,33 @@ class Trainer(TrainerBase):
         ``DefaultSegmentor``, ``DefaultSegmentorV2``), so the mechanism is
         not tied to a specific task.
         """
+        def _requires_auto_class_weight(criteria_obj):
+            if criteria_obj is None:
+                return False
+            inner = getattr(criteria_obj, "criteria", None)
+            if inner is None:
+                inner = [criteria_obj]
+            return any(getattr(loss_obj, "auto_class_weight", False) for loss_obj in inner)
+
         train_data = self.train_loader.dataset
         class_weight = getattr(train_data, "class_weight", None)
-        if class_weight is None:
-            return
 
         # Unwrap DDP to reach the real model
         model = self.model.module if hasattr(self.model, "module") else self.model
         criteria = getattr(model, "criteria", None)
-        if criteria is None:
+        aux_criteria = getattr(model, "aux_criteria", None)
+
+        need_class_weight = _requires_auto_class_weight(criteria) or _requires_auto_class_weight(
+            aux_criteria
+        )
+
+        if class_weight is None:
+            if need_class_weight:
+                raise ValueError(
+                    "Found loss with auto_class_weight=True, but the training dataset "
+                    "did not provide class_weight. Set dataset.class_weight to a manual "
+                    "list/array or a supported auto-compute mode."
+                )
             return
 
         if hasattr(criteria, "set_class_weight"):
@@ -400,7 +418,6 @@ class Trainer(TrainerBase):
             )
 
         # Also inject into aux_criteria if it exists (for DeepLASegmentor HDS)
-        aux_criteria = getattr(model, "aux_criteria", None)
         if aux_criteria is not None and hasattr(aux_criteria, "set_class_weight"):
             aux_criteria.set_class_weight(class_weight)
             self.logger.info(

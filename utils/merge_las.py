@@ -393,8 +393,8 @@ def merge_las_tiles(input_path: Union[str, Path],
     
 if __name__ == "__main__":
     
-    input_path = r"E:\data\DALES\dales_las\tile\pred"
-    output_dir = r"E:\data\DALES\dales_las\tile\output"
+    input_path = r"E:\data\铁二院\第二批\优化\nl\tile\pred"
+    output_dir = r"E:\data\铁二院\第二批\优化\nl\tile\output"
     
     merge_las_tiles(
         input_path=input_path,

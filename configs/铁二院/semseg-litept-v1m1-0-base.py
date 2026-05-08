@@ -1,29 +1,23 @@
 # -------------------------------------------------------
 # 0. Path settings
 # -------------------------------------------------------
-train_data_dir = r"E:\data\DALES\dales_las\tile\train"
-val_data_dir = r"E:\data\DALES\dales_las\tile\test"
-test_data_dir = r"E:\data\DALES\dales_las\tile\test"
-pred_save_dir = r"E:\data\DALES\dales_las\tile\pred"
-save_path = "exp/dales/semseg-litept-v1m1-3-base"
+train_data_dir = r"E:\data\铁二院\第二批\优化\nl\tile50\train"
+val_data_dir = r"E:\data\铁二院\第二批\优化\nl\tile50\val"
+test_data_dir = r"E:\data\铁二院\第二批\优化\nl\tile50\val"
+pred_save_dir = r"E:\data\铁二院\第二批\优化\nl\tile50\pred1"
+save_path = "exp/铁二院-nl/semseg-litept-v1m1-1-base"
 
 # -------------------------------------------------------
 # 1. General settings
 # -------------------------------------------------------
-num_classes = 8
+num_classes = 2
 grid_size = 0.25
 ignore_index = -1
 dataset_type = "LasDataset"
-required_classes = [1, 2, 3, 4, 5, 6, 7, 8]
+required_classes = [1, 2]
 class_names = [
+    "non-ground",
     "ground",
-    "vegetation",
-    "cars",
-    "trucks",
-    "power lines",
-    "fences",
-    "poles",
-    "buildings",
 ]
 feature_keys = ["coord", "echo"]
 in_channels = 5
@@ -31,7 +25,7 @@ in_channels = 5
 # -------------------------------------------------------
 # 2. Checkpoint / run control
 # -------------------------------------------------------
-weight = "exp/dales/semseg-litept-v1m1-3-base/model/model_last.pth"   # path to pretrained / fine-tune weight
+weight = "exp/铁二院-nl/semseg-litept-v1m1-1-base/model/model_last.pth"   # path to pretrained / fine-tune weight
 # weight = None
 resume = True      # resume from the latest checkpoint
 evaluate = True     # run evaluation after each training epoch
@@ -41,10 +35,10 @@ seed = 42           # fixed seed (None = auto-random, value is logged)
 # -------------------------------------------------------
 # 3. Resource & batch settings
 # -------------------------------------------------------
-batch_size_train = 32       # effective batch = micro_batch × gradient_accumulation_steps
+batch_size_train = 6       # effective batch = micro_batch × gradient_accumulation_steps
                            #   micro_batch = batch_size_train // gradient_accumulation_steps
-batch_size_val = 8         # None → auto 1 per GPU (no gradient → less memory than train)
-batch_size_test = 8        # None → auto 1 per GPU; >1 = fragments per forward in SemSegTester
+batch_size_val = 4         # None → auto 1 per GPU (no gradient → less memory than train)
+batch_size_test = 4        # None → auto 1 per GPU; >1 = fragments per forward in SemSegTester
 num_worker = 4            # total dataloader workers across all GPUs
 gradient_accumulation_steps = 2  # effective batch = 2, micro_batch per step = 3
 
@@ -85,14 +79,14 @@ model = dict(
         enc_depths=(2, 2, 2, 6, 2),
         enc_channels=(36, 72, 144, 252, 504),
         enc_num_head=(2, 4, 8, 14, 28),
-        enc_patch_size=(192, 192, 192, 192, 192),
+        enc_patch_size=(1024, 1024, 1024, 1024, 1024),
         enc_conv=(True, True, True, False, False),
         enc_attn=(False, False, False, True, True),
         enc_rope_freq=(100.0, 100.0, 100.0, 100.0, 100.0),
         dec_depths=(0, 0, 0, 0),
         dec_channels=(72, 72, 144, 252),
         dec_num_head=(4, 4, 8, 14),
-        dec_patch_size=(192, 192, 192, 192),
+        dec_patch_size=(1024, 1024, 1024, 1024),
         dec_conv=(False, False, False, False),
         dec_attn=(False, False, False, False),
         dec_rope_freq=(100.0, 100.0, 100.0, 100.0),
@@ -105,10 +99,11 @@ model = dict(
         pre_norm=True,
         shuffle_orders=True,
         enc_mode=False,
+        enable_flash=False,
     ),
     criteria=[
         dict(type="CrossEntropyLoss", loss_weight=1.0, ignore_index=-1, auto_class_weight=True),
-        dict(type="LovaszLoss", mode="multiclass", loss_weight=1.0, ignore_index=-1),
+        # dict(type="LovaszLoss", mode="multiclass", loss_weight=1.0, ignore_index=-1),
     ],
 )
 
@@ -159,7 +154,7 @@ data = dict(
         remap_class=True,              # Remap to continuous
         class_weight='sqrt',           # Recommended: sqrt method
         weight_sample=0.2,             # Use 20% of data for weight computation
-        weighted_sampler=True,         # Enable WeightedRandomSampler
+        weighted_sampler=False,         # Enable WeightedRandomSampler
         test_mode=False,
         loop=5,
         # Data augmentation

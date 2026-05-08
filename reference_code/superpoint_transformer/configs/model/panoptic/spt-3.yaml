@@ -1,4 +1,0 @@
-# @package model
-defaults:
-  - /model/semantic/spt-3.yaml
-  - /model/panoptic/_instance.yaml

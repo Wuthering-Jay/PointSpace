@@ -1153,8 +1153,8 @@ class LASTileProcessor:
 if __name__ == "__main__":
     processor = LASTileProcessor(
         # 路径与格式配置
-        input_path=r"E:\data\铁二院\第二批\new\nl\train",  # 原始数据路径
-        output_dir=r"E:\data\铁二院\第二批\new\nl\tile\train", # 输出路径
+        input_path=r"E:\data\铁二院\第二批\优化\nl\val",  # 原始数据路径
+        output_dir=r"E:\data\铁二院\第二批\优化\nl\tile50\val", # 输出路径
         output_format='las',          # 输出格式
 
         # 分块参数

@@ -128,7 +128,10 @@ class LasDataset(DefaultDataset):
         # Skipped in test mode: weights are only used for loss / sampling during
         # training, and scanning the dataset would waste time at inference.
         if self.class_weight_mode is not None and not test_mode:
-            self._compute_class_weights()
+            if isinstance(self.class_weight_mode, (list, tuple, np.ndarray)):
+                self._set_manual_class_weight(self.class_weight_mode)
+            else:
+                self._compute_class_weights()
 
         # Compute sample weights for WeightedRandomSampler (train only)
         if self.weighted_sampler and not test_mode:
@@ -274,6 +277,10 @@ class LasDataset(DefaultDataset):
         - 'effective': 1 - beta^class_count (Class-Balanced Loss, good for long-tail)
         """
         logger = get_root_logger()
+
+        if isinstance(self.class_weight_mode, (list, tuple, np.ndarray)):
+            self._set_manual_class_weight(self.class_weight_mode)
+            return
         
         # Parse class_weight parameter (use class_weight_mode for method config)
         weight_method = 'sqrt'  # default method
@@ -379,6 +386,25 @@ class LasDataset(DefaultDataset):
             logger.info(f"    Class {orig_cls:3d} -> {cls:3d}: {count:10,} points ({count/total_points*100:5.2f}%), weight={weight:.4f}")
         
         logger.info(f"  Computed weights ({weight_method}): {weights}")
+
+    def _set_manual_class_weight(self, class_weight):
+        """Use user-provided class weights directly without auto-computation."""
+        logger = get_root_logger()
+        weights = np.asarray(class_weight, dtype=np.float32).reshape(-1)
+
+        if weights.size == 0:
+            raise ValueError("Manual class_weight must not be empty.")
+
+        if self.class2id is not None:
+            n_classes = len(self.class2id)
+            if weights.size != n_classes:
+                raise ValueError(
+                    f"Manual class_weight length mismatch: got {weights.size}, "
+                    f"expected {n_classes}."
+                )
+
+        self.class_weight = weights
+        logger.info(f"Using manual class weights directly: {weights}")
 
     def _compute_sample_weights(self):
         """
@@ -670,7 +696,12 @@ class LasDataset(DefaultDataset):
         # Publish so _scan_classes / _init_class_mapping can access it
         self.data_list = data_list
 
-        if self.required_class is not None or self.remap_class:
+        if (
+            self.required_class is not None
+            or self.remap_class
+            or self.class_weight_mode is not None
+            or self.weighted_sampler
+        ):
             self._init_class_mapping()
 
         return data_list

@@ -1,29 +1,23 @@
 # -------------------------------------------------------
 # 0. Path settings
 # -------------------------------------------------------
-train_data_dir = r"E:\data\DALES\dales_las\tile\train"
-val_data_dir = r"E:\data\DALES\dales_las\tile\test"
-test_data_dir = r"E:\data\DALES\dales_las\tile\test"
-pred_save_dir = r"E:\data\DALES\dales_las\tile\pred"
-save_path = "exp/dales/semseg-litept-v1m1-3-base"
+train_data_dir = r"E:\data\铁二院\第二批\优化\nl\tile50\train"
+val_data_dir = r"E:\data\铁二院\第二批\优化\nl\tile50\val"
+test_data_dir = r"E:\data\铁二院\第二批\优化\nl\tile50\val"
+pred_save_dir = r"E:\data\铁二院\第二批\优化\nl\tile50\pred"
+save_path = "exp/铁二院-nl/semseg-pt-v3m1-0-base"
 
 # -------------------------------------------------------
 # 1. General settings
 # -------------------------------------------------------
-num_classes = 8
+num_classes = 2
 grid_size = 0.25
 ignore_index = -1
 dataset_type = "LasDataset"
-required_classes = [1, 2, 3, 4, 5, 6, 7, 8]
+required_classes = [1, 2]
 class_names = [
+    "non-ground",
     "ground",
-    "vegetation",
-    "cars",
-    "trucks",
-    "power lines",
-    "fences",
-    "poles",
-    "buildings",
 ]
 feature_keys = ["coord", "echo"]
 in_channels = 5
@@ -31,7 +25,7 @@ in_channels = 5
 # -------------------------------------------------------
 # 2. Checkpoint / run control
 # -------------------------------------------------------
-weight = "exp/dales/semseg-litept-v1m1-3-base/model/model_last.pth"   # path to pretrained / fine-tune weight
+weight = "exp/铁二院-nl/semseg-pt-v3m1-0-base/model/model_last.pth"   # path to pretrained / fine-tune weight
 # weight = None
 resume = True      # resume from the latest checkpoint
 evaluate = True     # run evaluation after each training epoch
@@ -41,11 +35,11 @@ seed = 42           # fixed seed (None = auto-random, value is logged)
 # -------------------------------------------------------
 # 3. Resource & batch settings
 # -------------------------------------------------------
-batch_size_train = 32       # effective batch = micro_batch × gradient_accumulation_steps
+batch_size_train = 4       # effective batch = micro_batch × gradient_accumulation_steps
                            #   micro_batch = batch_size_train // gradient_accumulation_steps
-batch_size_val = 8         # None → auto 1 per GPU (no gradient → less memory than train)
-batch_size_test = 8        # None → auto 1 per GPU; >1 = fragments per forward in SemSegTester
-num_worker = 4            # total dataloader workers across all GPUs
+batch_size_val = 2         # None → auto 1 per GPU (no gradient → less memory than train)
+batch_size_test = 2        # None → auto 1 per GPU; >1 = fragments per forward in SemSegTester
+num_worker = 0            # total dataloader workers across all GPUs
 gradient_accumulation_steps = 2  # effective batch = 2, micro_batch per step = 3
 
 # -------------------------------------------------------
@@ -76,39 +70,43 @@ mix_prob = 0.0      # MixUp / CutMix probability
 model = dict(
     type="DefaultSegmentorV2",
     num_classes=num_classes,
-    backbone_out_channels=72,
+    backbone_out_channels=64,
     backbone=dict(
-        type="LitePT-v1m1",
+        type="PT-v3m1",
         in_channels=in_channels,
-        order=("z", "z-trans", "hilbert", "hilbert-trans"),
+        order=["z", "z-trans", "hilbert", "hilbert-trans"],
         stride=(2, 2, 2, 2),
         enc_depths=(2, 2, 2, 6, 2),
-        enc_channels=(36, 72, 144, 252, 504),
-        enc_num_head=(2, 4, 8, 14, 28),
-        enc_patch_size=(192, 192, 192, 192, 192),
-        enc_conv=(True, True, True, False, False),
-        enc_attn=(False, False, False, True, True),
-        enc_rope_freq=(100.0, 100.0, 100.0, 100.0, 100.0),
-        dec_depths=(0, 0, 0, 0),
-        dec_channels=(72, 72, 144, 252),
-        dec_num_head=(4, 4, 8, 14),
-        dec_patch_size=(192, 192, 192, 192),
-        dec_conv=(False, False, False, False),
-        dec_attn=(False, False, False, False),
-        dec_rope_freq=(100.0, 100.0, 100.0, 100.0),
+        enc_channels=(32, 64, 128, 256, 512),
+        enc_num_head=(2, 4, 8, 16, 32),
+        enc_patch_size=(128, 128, 128, 128, 128),
+        dec_depths=(1, 1, 1, 1),
+        dec_channels=(64, 64, 128, 256),
+        dec_num_head=(4, 4, 8, 16),
+        dec_patch_size=(128, 128, 128, 128),
         mlp_ratio=4,
         qkv_bias=True,
         qk_scale=None,
         attn_drop=0.0,
         proj_drop=0.0,
         drop_path=0.3,
-        pre_norm=True,
         shuffle_orders=True,
+        pre_norm=True,
+        enable_rpe=True,
+        enable_flash=False,
+        upcast_attention=False,
+        upcast_softmax=False,
         enc_mode=False,
+        pdnorm_bn=False,
+        pdnorm_ln=False,
+        pdnorm_decouple=True,
+        pdnorm_adaptive=False,
+        pdnorm_affine=True,
+        pdnorm_conditions=("Dales"),
     ),
     criteria=[
         dict(type="CrossEntropyLoss", loss_weight=1.0, ignore_index=-1, auto_class_weight=True),
-        dict(type="LovaszLoss", mode="multiclass", loss_weight=1.0, ignore_index=-1),
+        # dict(type="LovaszLoss", mode="multiclass", loss_weight=1.0, ignore_index=-1),
     ],
 )
 
@@ -131,7 +129,7 @@ hooks = [
     dict(type="ModelHook"),
     dict(type="IterationTimer", warmup_iter=2),
     dict(type="InformationWriter", interval=10),
-    dict(type="CacheCleaner", time_multiplier=5, step_clean_interval=200),
+    dict(type="CacheCleaner", time_multiplier=5, step_clean_interval=100),
     dict(type="SemSegEvaluator",log_interval=10),
     dict(type="CheckpointSaver", save_freq=None),
     dict(type="PreciseEvaluator", test_last=False),
@@ -159,7 +157,7 @@ data = dict(
         remap_class=True,              # Remap to continuous
         class_weight='sqrt',           # Recommended: sqrt method
         weight_sample=0.2,             # Use 20% of data for weight computation
-        weighted_sampler=True,         # Enable WeightedRandomSampler
+        weighted_sampler=False,         # Enable WeightedRandomSampler
         test_mode=False,
         loop=5,
         # Data augmentation
