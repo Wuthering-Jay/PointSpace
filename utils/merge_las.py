@@ -33,7 +33,7 @@ class LASMerger:
     - 若存在 orig_idx 字段，利用其作为直接索引（O(n)）恢复原始点序并去重
     - 重叠检测：通过 np.bincount 统计每个 orig_idx 出现次数
     - 投票融合：对 vote_dims 中的离散属性使用多数投票（如 classification）
-    - 均值融合：对 average_dims 中的连续属性取均值（如 hag）
+    - 均值融合：对 average_dims 中的连续属性取均值
     - 其余属性直接散射写入（坐标、intensity 等不变属性）
     
     核心算法复杂度：O(n)，其中 n = 所有 tile 总点数之和
@@ -60,8 +60,7 @@ class LASMerger:
             vote_dims: Dimensions to aggregate via majority voting when overlap exists.
                        Default: {'classification'}
             average_dims: Dimensions to aggregate via averaging when overlap exists.
-                          Default: empty set (no averaging). Useful for float extra dims
-                          like 'hag' when computed per-tile.
+                          Default: empty set (no averaging).
         """
         self.input_path = Path(input_path)
         self.output_dir = Path(output_dir) if output_dir else self.input_path.parent
@@ -393,12 +392,12 @@ def merge_las_tiles(input_path: Union[str, Path],
     
 if __name__ == "__main__":
     
-    input_path = r"E:\data\铁二院\第二批\优化\nl\tile\pred"
-    output_dir = r"E:\data\铁二院\第二批\优化\nl\tile\output"
+    input_path = r"E:\data\H3D\tile\pred"
+    output_dir = r"E:\data\H3D\pred"
     
     merge_las_tiles(
         input_path=input_path,
         output_dir=output_dir,
         # vote_dims={'classification'},  # 默认对 classification 多数投票
-        # average_dims={'hag'},          # 可选：对 hag 取均值
+        # average_dims={'some_float_dim'},  # 可选：对连续属性取均值
     )

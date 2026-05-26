@@ -1,11 +1,11 @@
 # -------------------------------------------------------
 # 0. Path settings
 # -------------------------------------------------------
-train_data_dir = r"E:\data\铁二院\第二批\优化\nl\tile50\train"
-val_data_dir = r"E:\data\铁二院\第二批\优化\nl\tile50\val"
-test_data_dir = r"E:\data\铁二院\第二批\优化\nl\tile50\val"
-pred_save_dir = r"E:\data\铁二院\第二批\优化\nl\tile50\pred1"
-save_path = "exp/铁二院-nl/semseg-litept-v1m1-1-base"
+train_data_dir = r"E:\data\铁二院\第二批\优化\nl\tile\train"
+val_data_dir = r"E:\data\铁二院\第二批\优化\nl\tile\val"
+test_data_dir = r"E:\data\铁二院\第二批\优化\nl\tile\val"
+pred_save_dir = r"E:\data\铁二院\第二批\优化\nl\tile\pred"
+save_path = "exp/铁二院-nl/semseg-litept-v1m1-0-base"
 
 # -------------------------------------------------------
 # 1. General settings
@@ -18,6 +18,7 @@ required_classes = [1, 2]
 class_names = [
     "non-ground",
     "ground",
+    # "vehicle"
 ]
 feature_keys = ["coord", "echo"]
 in_channels = 5
@@ -25,7 +26,7 @@ in_channels = 5
 # -------------------------------------------------------
 # 2. Checkpoint / run control
 # -------------------------------------------------------
-weight = "exp/铁二院-nl/semseg-litept-v1m1-1-base/model/model_last.pth"   # path to pretrained / fine-tune weight
+weight = "exp/铁二院-nl/semseg-litept-v1m1-0-base/model/model_last.pth"   # path to pretrained / fine-tune weight
 # weight = None
 resume = True      # resume from the latest checkpoint
 evaluate = True     # run evaluation after each training epoch
@@ -35,7 +36,7 @@ seed = 42           # fixed seed (None = auto-random, value is logged)
 # -------------------------------------------------------
 # 3. Resource & batch settings
 # -------------------------------------------------------
-batch_size_train = 6       # effective batch = micro_batch × gradient_accumulation_steps
+batch_size_train = 12       # effective batch = micro_batch × gradient_accumulation_steps
                            #   micro_batch = batch_size_train // gradient_accumulation_steps
 batch_size_val = 4         # None → auto 1 per GPU (no gradient → less memory than train)
 batch_size_test = 4        # None → auto 1 per GPU; >1 = fragments per forward in SemSegTester
@@ -46,6 +47,7 @@ gradient_accumulation_steps = 2  # effective batch = 2, micro_batch per step = 3
 # 4. Training loop
 # -------------------------------------------------------
 epoch = 10        # total epochs; val runs after every epoch
+loop = 5
 clip_grad = None    # gradient clipping (None = disabled)
 
 # -------------------------------------------------------
@@ -99,11 +101,11 @@ model = dict(
         pre_norm=True,
         shuffle_orders=True,
         enc_mode=False,
-        enable_flash=False,
+        enable_flash=True,
     ),
     criteria=[
         dict(type="CrossEntropyLoss", loss_weight=1.0, ignore_index=-1, auto_class_weight=True),
-        # dict(type="LovaszLoss", mode="multiclass", loss_weight=1.0, ignore_index=-1),
+        dict(type="LovaszLoss", mode="multiclass", loss_weight=1.0, ignore_index=-1),
     ],
 )
 
@@ -152,11 +154,11 @@ data = dict(
         data_path=train_data_dir,  # Use specific train path
         required_class=required_classes,  # Filter unwanted classes
         remap_class=True,              # Remap to continuous
-        class_weight='sqrt',           # Recommended: sqrt method
+        class_weight=[1,3,3],           # Recommended: sqrt method
         weight_sample=0.2,             # Use 20% of data for weight computation
-        weighted_sampler=False,         # Enable WeightedRandomSampler
+        weighted_sampler=False,        # Enable WeightedRandomSampler
         test_mode=False,
-        loop=5,
+        loop=loop,
         # Data augmentation
         transform=[
             dict(type="ZPercentileCenterShift", percentile=2.0),
@@ -190,7 +192,7 @@ data = dict(
         remap_class=True,
         ignore_index=ignore_index,
         test_mode=False,
-        loop=5,  # Validation doesn't need loop
+        loop=loop,  # Validation doesn't need loop
         # Validation uses minimal transforms (no random augmentation for deterministic eval)
         transform=[
             dict(type="Copy", keys_dict={"segment": "origin_segment"}),

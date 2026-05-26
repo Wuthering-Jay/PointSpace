@@ -1,10 +1,18 @@
 import os
 import json
+import time
+import hashlib
+import atexit
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 import laspy
 from copy import deepcopy
+from collections import OrderedDict
+from tempfile import NamedTemporaryFile
+from tqdm import tqdm
 
 from pointspace.utils.logger import get_root_logger
+import pointspace.utils.comm as comm
 
 from .builder import DATASETS
 from .defaults import DefaultDataset
@@ -54,8 +62,6 @@ class LasDataset(DefaultDataset):
         "color",
         "intensity",
         "echo",  # Combined first/last return info (2D: is_first, is_last)
-        "hag",  # Height above ground
-        "z_base", # Z_base height
         "normal",  # Normal vectors (normal_x, normal_y, normal_z extra dims)
         "superpoint",  # Superpoint segment ID
         "segment",
@@ -80,18 +86,54 @@ class LasDataset(DefaultDataset):
         weight_sample=0.2,
         weighted_sampler=False,
         target_key=None,
+        enable_tile_cache=False,
+        tile_cache_backend="none",
+        tile_cache_size=None,
+        tile_cache_dir=None,
+        tile_cache_compression="auto",
+        tile_cache_cleanup="auto",
+        tile_cache_rebuild=False,
+        tile_cache_num_workers=None,
     ):
         self.required_class = required_class
         self.remap_class = remap_class
         self.class_weight_mode = class_weight
         self.weight_sample = weight_sample
         self.weighted_sampler = weighted_sampler
+        self._transform_cfg = deepcopy(transform) if transform is not None else []
+        self._post_transform_cfg = deepcopy(post_transform) if post_transform is not None else []
+        self._aug_transform_cfg = deepcopy(aug_transform) if aug_transform is not None else []
+        self.enable_tile_cache = bool(enable_tile_cache)
+        self.tile_cache_backend = (tile_cache_backend or "none").lower()
+        self.tile_cache_size = tile_cache_size
+        self.tile_cache_dir = tile_cache_dir
+        self.tile_cache_compression = (tile_cache_compression or "auto").lower()
+        self.tile_cache_cleanup = (tile_cache_cleanup or "auto").lower()
+        self.tile_cache_rebuild = bool(tile_cache_rebuild)
+        self.tile_cache_num_workers = tile_cache_num_workers
 
         # Class mapping will be initialized in get_data_list
         self.class2id = None  # Original class -> remapped ID
         self.id2class = None  # Remapped ID -> original class
         self.class_weight = None  # Computed class weights
         self.sample_weights = None  # Weights for WeightedRandomSampler
+        self._class_lut = None
+        self._mapped_id_to_index = {}
+        self._required_fields = {"coord", "segment"}
+        self._need_core_bbox = False
+        self._base_tile_cache = OrderedDict()
+        self._cache_enabled = False
+        self._cache_root_dir = None
+        self._cache_manifest_path = None
+        self._cache_signature = None
+        self._cache_stats_dir = None
+        self._cache_stats_path = None
+        self._cache_stats = {
+            "cache_read": 0,
+            "las_read": 0,
+        }
+        self._cache_stats_dirty = 0
+        self._cache_stats_flush_interval = 20
 
         # Store optional override params for potential use in get_data_list
         self._data_path = data_path
@@ -123,6 +165,10 @@ class LasDataset(DefaultDataset):
         # Compose(None) is a transparent no-op, so None is safe here.
         self.post_transform = Compose(post_transform)
         self.aug_transform = [Compose(aug) for aug in (aug_transform or [])]
+        self._required_fields, self._need_core_bbox = self._infer_required_fields()
+        if target_key:
+            self._required_fields.add(target_key)
+        self._initialize_cache_settings()
 
         # Compute class weights after data_list is initialized.
         # Skipped in test mode: weights are only used for loss / sampling during
@@ -139,6 +185,496 @@ class LasDataset(DefaultDataset):
                 self._compute_terrain_sample_weights()
             else:
                 self._compute_sample_weights()
+
+    def _initialize_cache_settings(self):
+        if self.test_mode or not self.enable_tile_cache:
+            return
+        self._cache_enabled = True
+
+        cache_payload = {
+            "version": 1,
+            "required_fields": sorted(self._required_fields),
+            "need_core_bbox": self._need_core_bbox,
+            "required_class": self.required_class,
+            "remap_class": self.remap_class,
+            "ignore_index": self.ignore_index,
+            "target_key": getattr(self, "target_key", None),
+        }
+        signature_raw = json.dumps(cache_payload, sort_keys=True, ensure_ascii=True)
+        self._cache_signature = hashlib.sha1(signature_raw.encode("utf-8")).hexdigest()[:16]
+
+        if self.tile_cache_dir is not None:
+            cache_root = self.tile_cache_dir
+        else:
+            base_dir = self._data_path or self.data_root
+            cache_root = os.path.join(os.path.dirname(os.path.abspath(base_dir)), ".ps_cache", "las")
+
+        self._cache_root_dir = os.path.join(cache_root, self._cache_signature)
+        self._cache_manifest_path = os.path.join(self._cache_root_dir, "manifest.json")
+        self._cache_stats_dir = os.path.join(self._cache_root_dir, "stats")
+        os.makedirs(self._cache_root_dir, exist_ok=True)
+        os.makedirs(self._cache_stats_dir, exist_ok=True)
+        self._write_cache_manifest(cache_payload)
+        self._cache_stats_path = os.path.join(
+            self._cache_stats_dir, f"pid-{os.getpid()}.json"
+        )
+        atexit.register(self._flush_cache_stats)
+        self._prepare_tile_cache()
+
+    def _resolve_cache_build_workers(self):
+        if self.tile_cache_num_workers is not None:
+            return max(1, int(self.tile_cache_num_workers))
+        cpu_count = os.cpu_count() or 4
+        return min(4, cpu_count)
+
+    def _prepare_tile_cache(self):
+        if not self._cache_enabled:
+            return
+        logger = get_root_logger()
+        if comm.get_world_size() > 1 and not comm.is_main_process():
+            comm.synchronize()
+            logger.info(f"Tile cache ready for split='{self.split}' after main-process build")
+            return
+        to_build = []
+        for data_path in self.data_list:
+            cache_path = self._cache_file_path(data_path)
+            if self.tile_cache_rebuild or not self._is_cache_valid(cache_path, data_path):
+                to_build.append(data_path)
+
+        total = len(self.data_list)
+        if len(to_build) == 0:
+            logger.info(
+                f"Tile cache ready for split='{self.split}': 0/{total} files need rebuild"
+            )
+            if comm.get_world_size() > 1:
+                comm.synchronize()
+            return
+
+        logger.info(
+            f"Building tile cache for split='{self.split}': {len(to_build)}/{total} files"
+        )
+        max_workers = self._resolve_cache_build_workers()
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(self._build_single_cache_file, data_path): data_path
+                for data_path in to_build
+            }
+            progress = tqdm(
+                total=len(to_build),
+                desc=f"Cache {self.split}",
+                unit="file",
+            )
+            first_error = None
+            for future in as_completed(futures):
+                data_path = futures[future]
+                try:
+                    future.result()
+                except Exception as e:
+                    if first_error is None:
+                        first_error = (data_path, e)
+                finally:
+                    progress.update(1)
+            progress.close()
+        if first_error is not None:
+            data_path, error = first_error
+            raise RuntimeError(f"Failed to build tile cache for '{data_path}': {error}") from error
+        logger.info(
+            f"Tile cache build finished for split='{self.split}': built {len(to_build)} files"
+        )
+        if comm.get_world_size() > 1:
+            comm.synchronize()
+
+    def _write_cache_manifest(self, payload):
+        if not self._cache_manifest_path:
+            return
+        manifest = dict(payload)
+        manifest.update(
+            {
+                "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "data_path": self._data_path,
+                "split": self.split,
+            }
+        )
+        try:
+            with open(self._cache_manifest_path, "w", encoding="utf-8") as f:
+                json.dump(manifest, f, ensure_ascii=False, indent=2)
+        except OSError:
+            pass
+
+    def _cache_file_path(self, data_path):
+        tile_name = os.path.splitext(os.path.basename(data_path))[0]
+        tile_hash = hashlib.sha1(os.path.abspath(data_path).encode("utf-8")).hexdigest()[:12]
+        return os.path.join(self._cache_root_dir, f"{tile_name}-{tile_hash}.pscache.npz")
+
+    def _cache_lock_path(self, cache_path):
+        return cache_path + ".lock"
+
+    def _record_cache_stat(self, key, delta=1):
+        if key not in self._cache_stats:
+            return
+        self._ensure_cache_stats_path()
+        self._cache_stats[key] += delta
+        self._cache_stats_dirty += 1
+        if self._cache_stats_dirty >= self._cache_stats_flush_interval:
+            self._flush_cache_stats()
+
+    def _ensure_cache_stats_path(self):
+        if not self._cache_stats_dir:
+            return
+        expected_path = os.path.join(self._cache_stats_dir, f"pid-{os.getpid()}.json")
+        if self._cache_stats_path != expected_path:
+            self._cache_stats_path = expected_path
+            atexit.register(self._flush_cache_stats)
+
+    def _flush_cache_stats(self):
+        self._ensure_cache_stats_path()
+        if not self._cache_stats_path:
+            return
+        try:
+            with open(self._cache_stats_path, "w", encoding="utf-8") as f:
+                json.dump(self._cache_stats, f, ensure_ascii=True)
+            self._cache_stats_dirty = 0
+        except OSError:
+            pass
+
+    def log_tile_cache_config(self, logger=None):
+        if logger is None or not self.enable_tile_cache:
+            return
+        logger.info(
+            "Tile cache config: "
+            f"enabled={'on' if self._cache_enabled else 'off'}, "
+            f"compression={self.tile_cache_compression}, "
+            f"rebuild={self.tile_cache_rebuild}, "
+            f"build_workers={self._resolve_cache_build_workers()}"
+        )
+        if self._cache_enabled and self._cache_root_dir:
+            logger.info(f"Tile cache dir: {self._cache_root_dir}")
+
+    def summarize_tile_cache_stats(self, logger=None):
+        if logger is None or not self.enable_tile_cache:
+            return
+        summary = self.get_tile_cache_stats()
+        total_loads = summary["cache_read"] + summary["las_read"]
+        hit_rate = summary["cache_read"] / total_loads if total_loads > 0 else 0.0
+        logger.info(
+            "Tile cache stats: "
+            f"cache_read={summary['cache_read']}, "
+            f"las_read={summary['las_read']}, "
+            f"hit_rate={hit_rate:.2%}"
+        )
+
+    def get_tile_cache_stats(self):
+        self._flush_cache_stats()
+        summary = {key: 0 for key in self._cache_stats}
+        if self._cache_stats_dir and os.path.isdir(self._cache_stats_dir):
+            for name in os.listdir(self._cache_stats_dir):
+                if not name.endswith(".json"):
+                    continue
+                path = os.path.join(self._cache_stats_dir, name)
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        stats = json.load(f)
+                except (OSError, json.JSONDecodeError):
+                    continue
+                for key, value in stats.items():
+                    if key in summary:
+                        summary[key] += int(value)
+        return summary
+
+    def _cache_write_mode(self, data_dict):
+        if self.tile_cache_compression == "compressed":
+            return "compressed"
+        if self.tile_cache_compression == "store":
+            return "store"
+        total_bytes = sum(
+            value.nbytes for value in data_dict.values() if isinstance(value, np.ndarray)
+        )
+        return "compressed" if total_bytes <= 64 * 1024 * 1024 else "store"
+
+    def _load_disk_cache(self, cache_path):
+        try:
+            with np.load(cache_path, allow_pickle=False) as cached:
+                return {key: cached[key].copy() for key in cached.files if not key.startswith("__meta_")}
+        except Exception:
+            return None
+
+    def _is_cache_valid(self, cache_path, data_path):
+        if not os.path.exists(cache_path):
+            return False
+        try:
+            stat = os.stat(data_path)
+            with np.load(cache_path, allow_pickle=False) as cached:
+                source_size = int(cached["__meta_source_size"][0])
+                source_mtime_ns = int(cached["__meta_source_mtime_ns"][0])
+                version = int(cached["__meta_cache_version"][0])
+            return (
+                version == 1
+                and source_size == stat.st_size
+                and source_mtime_ns == stat.st_mtime_ns
+            )
+        except Exception:
+            return False
+
+    def _save_disk_cache(self, cache_path, data_dict):
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        arrays = {key: value for key, value in data_dict.items() if isinstance(value, np.ndarray)}
+        if not arrays:
+            return
+        source_stat = os.stat(data_dict["__source_path"]) if "__source_path" in data_dict else None
+        if source_stat is not None:
+            arrays["__meta_source_size"] = np.array([source_stat.st_size], dtype=np.int64)
+            arrays["__meta_source_mtime_ns"] = np.array([source_stat.st_mtime_ns], dtype=np.int64)
+        arrays["__meta_cache_version"] = np.array([1], dtype=np.int32)
+
+        with NamedTemporaryFile(
+            prefix="pscache-",
+            suffix=".npz",
+            dir=os.path.dirname(cache_path),
+            delete=False,
+        ) as tmp_file:
+            tmp_path = tmp_file.name
+        try:
+            if self._cache_write_mode(data_dict) == "compressed":
+                np.savez_compressed(tmp_path, **arrays)
+            else:
+                np.savez(tmp_path, **arrays)
+            os.replace(tmp_path, cache_path)
+        finally:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+
+    def _build_single_cache_file(self, data_path):
+        data_dict = self._load_las_sample(data_path)
+        data_dict["__source_path"] = data_path
+        cache_path = self._cache_file_path(data_path)
+        self._save_disk_cache(cache_path, data_dict)
+
+    def cleanup_tile_cache(self, logger=None, force=False):
+        self._flush_cache_stats()
+        if not self._cache_enabled or not self._cache_root_dir:
+            return
+        if not os.path.isdir(self._cache_root_dir):
+            return
+
+        import shutil
+
+        try:
+            shutil.rmtree(self._cache_root_dir, ignore_errors=False)
+            if logger is not None:
+                logger.info(f"Removed tile cache directory: {self._cache_root_dir}")
+        except OSError as e:
+            if logger is not None:
+                logger.warning(f"Failed to remove tile cache directory '{self._cache_root_dir}': {e}")
+
+    def _iter_cfg_dicts(self, cfg):
+        if cfg is None:
+            return
+        if isinstance(cfg, dict):
+            yield cfg
+            for value in cfg.values():
+                yield from self._iter_cfg_dicts(value)
+        elif isinstance(cfg, (list, tuple)):
+            for item in cfg:
+                yield from self._iter_cfg_dicts(item)
+
+    def _iter_cfg_strings(self, cfg):
+        if isinstance(cfg, str):
+            yield cfg
+        elif isinstance(cfg, dict):
+            for key, value in cfg.items():
+                yield from self._iter_cfg_strings(key)
+                yield from self._iter_cfg_strings(value)
+        elif isinstance(cfg, (list, tuple)):
+            for item in cfg:
+                yield from self._iter_cfg_strings(item)
+
+    def _infer_required_fields(self):
+        required = {"coord", "segment"}
+        all_cfg = [self._transform_cfg, self._post_transform_cfg, self._aug_transform_cfg]
+
+        for cfg_dict in self._iter_cfg_dicts(all_cfg):
+            transform_type = cfg_dict.get("type")
+            if transform_type == "Collect":
+                keys = cfg_dict.get("keys", [])
+                if isinstance(keys, str):
+                    keys = [keys]
+                required.update(keys)
+                offset_keys = cfg_dict.get("offset_keys_dict", {}) or {}
+                required.update(offset_keys.values())
+                optional_keys = cfg_dict.get("optional_keys", []) or []
+                required.update(optional_keys)
+                for cfg_key, cfg_value in cfg_dict.items():
+                    if cfg_key.endswith("_keys") and isinstance(cfg_value, (list, tuple)):
+                        required.update(cfg_value)
+            elif transform_type == "Copy":
+                keys_dict = cfg_dict.get("keys_dict", {}) or {}
+                required.update(keys_dict.keys())
+
+        # Transforms may not name their consumed field explicitly in config.
+        color_transform_types = {
+            "ChromaticAutoContrast",
+            "ChromaticTranslation",
+            "ChromaticJitter",
+            "RandomColorGrayScale",
+            "RandomColorJitter",
+            "HueSaturationTranslation",
+            "RandomDropColor",
+            "RandomColorDrop",
+            "NormalizeColor",
+            "NormalizeColor8bit",
+        }
+        for cfg_dict in self._iter_cfg_dicts(all_cfg):
+            if cfg_dict.get("type") in color_transform_types:
+                required.add("color")
+
+        all_strings = set(self._iter_cfg_strings(all_cfg))
+        required.update(field for field in self.VALID_ASSETS if field in all_strings)
+        need_core_bbox = "core_bbox" in all_strings
+        return required, need_core_bbox
+
+    def _build_class_lut(self):
+        self._class_lut = None
+        self._mapped_id_to_index = {}
+        if not self.class2id:
+            return
+
+        mapped_ids = sorted(set(self.class2id.values()))
+        self._mapped_id_to_index = {
+            mapped_id: idx for idx, mapped_id in enumerate(mapped_ids)
+        }
+
+        orig_classes = list(self.class2id.keys())
+        if not orig_classes:
+            return
+        min_class = min(orig_classes)
+        max_class = max(orig_classes)
+        if min_class < 0:
+            return
+        lut = np.full(max_class + 1, self.ignore_index, dtype=np.int32)
+        for orig_class, new_class in self.class2id.items():
+            lut[int(orig_class)] = int(new_class)
+        self._class_lut = lut
+
+    def _clone_sample_dict(self, data_dict):
+        cloned = {}
+        for key, value in data_dict.items():
+            if isinstance(value, np.ndarray):
+                cloned[key] = value.copy()
+            else:
+                cloned[key] = deepcopy(value)
+        return cloned
+
+    def _get_cached_or_load_base_sample(self, data_path):
+        if self._cache_enabled:
+            cache_path = self._cache_file_path(data_path)
+            if not self._is_cache_valid(cache_path, data_path):
+                raise RuntimeError(
+                    f"Tile cache missing or stale for '{data_path}'. "
+                    "Rebuild the cache or disable tile cache for this split."
+                )
+            data_dict = self._load_disk_cache(cache_path)
+            if data_dict is None:
+                raise RuntimeError(
+                    f"Failed to load tile cache '{cache_path}'. "
+                    "Rebuild the cache or disable tile cache for this split."
+                )
+            self._record_cache_stat("cache_read")
+            return data_dict
+
+        self._record_cache_stat("las_read")
+        return self._load_las_sample(data_path)
+
+    def _read_extra_dimension(self, las, dim_name, dtype=np.float32):
+        try:
+            return np.asarray(getattr(las, dim_name), dtype=dtype)
+        except (AttributeError, KeyError):
+            try:
+                return np.asarray(las[dim_name], dtype=dtype)
+            except (AttributeError, KeyError, ValueError):
+                return None
+
+    def _load_las_sample(self, data_path):
+        data_dict = {}
+        las = laspy.read(data_path)
+        dim_names = set(las.point_format.dimension_names)
+
+        num_points = len(las.points)
+        coord = np.empty((num_points, 3), dtype=np.float32)
+        coord[:, 0] = np.asarray(las.x, dtype=np.float32)
+        coord[:, 1] = np.asarray(las.y, dtype=np.float32)
+        coord[:, 2] = np.asarray(las.z, dtype=np.float32)
+        data_dict["coord"] = coord
+
+        if "color" in self._required_fields and {"red", "green", "blue"}.issubset(dim_names):
+            color = np.empty((num_points, 3), dtype=np.float32)
+            color[:, 0] = np.asarray(las.red, dtype=np.float32)
+            color[:, 1] = np.asarray(las.green, dtype=np.float32)
+            color[:, 2] = np.asarray(las.blue, dtype=np.float32)
+            color *= np.float32(1.0 / 256.0)
+            data_dict["color"] = color
+
+        if "classification" in dim_names:
+            segment = np.asarray(las.classification, dtype=np.int32)
+            if self.class2id is not None:
+                segment = self._map_classes(segment)
+            data_dict["segment"] = segment.reshape(-1)
+
+        if "intensity" in self._required_fields and "intensity" in dim_names:
+            intensity = np.asarray(las.intensity, dtype=np.float32).reshape(-1, 1)
+            data_dict["intensity"] = intensity
+
+        if "echo" in self._required_fields:
+            if {"return_number", "number_of_returns"}.issubset(dim_names):
+                return_number = np.asarray(las.return_number)
+                number_of_returns = np.asarray(las.number_of_returns)
+                echo = np.full((num_points, 2), -1.0, dtype=np.float32)
+                echo[return_number == 1, 0] = 1.0
+                echo[return_number == number_of_returns, 1] = 1.0
+                data_dict["echo"] = echo
+            else:
+                data_dict["echo"] = np.ones((num_points, 2), dtype=np.float32)
+
+        if "normal" in self._required_fields and {"normal_x", "normal_y", "normal_z"}.issubset(dim_names):
+            nx = self._read_extra_dimension(las, "normal_x")
+            ny = self._read_extra_dimension(las, "normal_y")
+            nz = self._read_extra_dimension(las, "normal_z")
+            if nx is not None and ny is not None and nz is not None:
+                normal = np.empty((num_points, 3), dtype=np.float32)
+                normal[:, 0] = nx
+                normal[:, 1] = ny
+                normal[:, 2] = nz
+                data_dict["normal"] = normal
+
+        if "superpoint" in self._required_fields and "superpoint" in dim_names:
+            superpoint = self._read_extra_dimension(las, "superpoint", dtype=np.int64)
+            if superpoint is not None:
+                data_dict["superpoint"] = superpoint
+
+        target_key = getattr(self, "target_key", None)
+        if target_key and target_key not in data_dict and target_key in dim_names:
+            target = self._read_extra_dimension(las, target_key)
+            if target is not None:
+                data_dict[target_key] = target.reshape(-1, 1) if target.ndim == 1 else target
+
+        if self._need_core_bbox:
+            for vlr in las.header.vlrs:
+                if (
+                    getattr(vlr, "user_id", None) == "PointSpace"
+                    and getattr(vlr, "record_id", None) == 1001
+                ):
+                    try:
+                        bbox_data = json.loads(vlr.record_data.decode("utf-8"))
+                        data_dict["core_bbox"] = np.array(
+                            bbox_data["core_bbox"], dtype=np.float32
+                        )
+                    except (json.JSONDecodeError, KeyError, UnicodeDecodeError):
+                        pass
+                    break
+
+        return data_dict
     
     def _scan_classes(self):
         """
@@ -264,6 +800,7 @@ class LasDataset(DefaultDataset):
             if self.required_class is not None:
                 logger.info(f"Class filtering enabled without remapping")
                 logger.info(f"  Valid classes: {valid_classes}")
+        self._build_class_lut()
     
     def _compute_class_weights(self):
         """
@@ -347,28 +884,29 @@ class LasDataset(DefaultDataset):
         weights = np.zeros(n_classes, dtype=np.float32)
         
         for cls, count in class_counts.items():
-            if cls in self.id2class:  # Valid class
-                idx = cls if not self.remap_class else list(self.id2class.keys()).index(cls)
-                freq = count / total_points
-                
-                if weight_method == 'inverse':
-                    # Original: 1 / frequency
-                    weights[idx] = 1.0 / (freq + 1e-6)
-                elif weight_method == 'sqrt':
-                    # Square root: 1 / sqrt(frequency)
-                    weights[idx] = 1.0 / (np.sqrt(freq) + 1e-6)
-                elif weight_method == 'log':
-                    # Logarithmic: 1 / log(1 + frequency)
-                    weights[idx] = 1.0 / (np.log(1 + freq) + 1e-6)
-                elif weight_method == 'balanced':
-                    # Sklearn style: n_samples / (n_classes * class_count)
-                    weights[idx] = total_points / (n_classes * count)
-                elif weight_method == 'effective':
-                    # Class-Balanced Loss: (1 - beta) / (1 - beta^count)
-                    weights[idx] = (1 - beta) / (1 - beta ** count + 1e-6)
-                else:
-                    logger.warning(f"Unknown weight method '{weight_method}', using 'sqrt'")
-                    weights[idx] = 1.0 / (np.sqrt(freq) + 1e-6)
+            idx = self._mapped_id_to_index.get(cls)
+            if idx is None:
+                continue
+            freq = count / total_points
+            
+            if weight_method == 'inverse':
+                # Original: 1 / frequency
+                weights[idx] = 1.0 / (freq + 1e-6)
+            elif weight_method == 'sqrt':
+                # Square root: 1 / sqrt(frequency)
+                weights[idx] = 1.0 / (np.sqrt(freq) + 1e-6)
+            elif weight_method == 'log':
+                # Logarithmic: 1 / log(1 + frequency)
+                weights[idx] = 1.0 / (np.log(1 + freq) + 1e-6)
+            elif weight_method == 'balanced':
+                # Sklearn style: n_samples / (n_classes * class_count)
+                weights[idx] = total_points / (n_classes * count)
+            elif weight_method == 'effective':
+                # Class-Balanced Loss: (1 - beta) / (1 - beta^count)
+                weights[idx] = (1 - beta) / (1 - beta ** count + 1e-6)
+            else:
+                logger.warning(f"Unknown weight method '{weight_method}', using 'sqrt'")
+                weights[idx] = 1.0 / (np.sqrt(freq) + 1e-6)
         
         # Normalize weights (except for 'balanced' and 'effective' which are already balanced)
         if weight_method not in ['balanced', 'effective']:
@@ -380,7 +918,9 @@ class LasDataset(DefaultDataset):
         logger.info(f"  Class distribution:")
         for cls in sorted(class_counts.keys()):
             count = class_counts[cls]
-            idx = cls if not self.remap_class else list(self.id2class.keys()).index(cls)
+            idx = self._mapped_id_to_index.get(cls)
+            if idx is None:
+                continue
             weight = weights[idx] if idx < len(weights) else 0
             orig_cls = self.id2class.get(cls, cls)
             logger.info(f"    Class {orig_cls:3d} -> {cls:3d}: {count:10,} points ({count/total_points*100:5.2f}%), weight={weight:.4f}")
@@ -488,8 +1028,9 @@ class LasDataset(DefaultDataset):
         for idx, class_set in enumerate(sample_class_sets):
             weight = 0.0
             for cls in class_set:
-                if 0 <= cls < len(self.class_weight):
-                    weight += self.class_weight[cls]
+                weight_idx = self._mapped_id_to_index.get(cls)
+                if weight_idx is not None:
+                    weight += self.class_weight[weight_idx]
             sample_weights[idx] = weight if weight > 0 else 1.0  # Default weight of 1.0 for empty samples
         
         # Normalize to avoid numerical issues (sum = n_samples)
@@ -635,12 +1176,20 @@ class LasDataset(DefaultDataset):
         Returns:
             Mapped class labels (unmapped classes -> ignore_index)
         """
-        mapped = np.full_like(segment, self.ignore_index, dtype=np.int32)
-        
+        segment = np.asarray(segment)
+        if self.class2id is None:
+            return segment.astype(np.int32, copy=False)
+
+        if self._class_lut is not None:
+            mapped = np.full(segment.shape, self.ignore_index, dtype=np.int32)
+            valid_mask = (segment >= 0) & (segment < self._class_lut.shape[0])
+            if np.any(valid_mask):
+                mapped[valid_mask] = self._class_lut[segment[valid_mask]]
+            return mapped
+
+        mapped = np.full(segment.shape, self.ignore_index, dtype=np.int32)
         for orig_class, new_class in self.class2id.items():
-            mask = segment == orig_class
-            mapped[mask] = new_class
-        
+            mapped[segment == orig_class] = new_class
         return mapped
     
     def get_data_list(self):
@@ -709,127 +1258,13 @@ class LasDataset(DefaultDataset):
     def get_data(self, idx):
         data_path = self.data_list[idx % len(self.data_list)]
         name = self.get_data_name(idx)
-
-        data_dict = {}
-
-        # Read LAS/LAZ file (supports LAS 1.1, 1.2, 1.3, 1.4)
         try:
-            las = laspy.read(data_path)
-            
-            # Always extract coordinates
-            data_dict["coord"] = np.vstack((las.x, las.y, las.z)).transpose().astype(np.float32)
-            
-            # Extract RGB color if available
-            if hasattr(las, "red") and hasattr(las, "green") and hasattr(las, "blue"):
-                # LAS stores RGB as 16-bit, normalize to [0, 255]
-                red = np.array(las.red) / 256.0
-                green = np.array(las.green) / 256.0
-                blue = np.array(las.blue) / 256.0
-                data_dict["color"] = np.vstack((red, green, blue)).transpose().astype(np.float32)
-            
-            # Extract classification as segment if available
-            if hasattr(las, "classification"):
-                segment = np.array(las.classification, dtype=np.int32)
-                # Apply class mapping
-                # CRITICAL: _map_classes will:
-                #   1. Remap valid classes (e.g., 1->0, 2->1, ..., 8->7)
-                #   2. Set all removed/invalid classes to ignore_index (e.g., 0->8)
-                # This ensures ignore_index is applied AFTER remapping, avoiding conflicts
-                if self.class2id is not None:
-                    segment = self._map_classes(segment)
-                data_dict["segment"] = segment
-            
-            # Extract intensity if available
-            if hasattr(las, "intensity"):
-                intensity = np.array(las.intensity, dtype=np.float32).reshape(-1, 1)
-                data_dict["intensity"] = intensity
-            
-            # Extract echo information (first/last return) as 2D feature
-            if hasattr(las, "return_number") and hasattr(las, "number_of_returns"):
-                return_number = np.array(las.return_number, dtype=np.int32)
-                number_of_returns = np.array(las.number_of_returns, dtype=np.int32)
-                
-                # is_first: 1 if first return, -1 otherwise
-                is_first = np.where(return_number == 1, 1, -1).astype(np.float32)
-                
-                # is_last: 1 if last return, -1 otherwise
-                is_last = np.where(return_number == number_of_returns, 1, -1).astype(np.float32)
-                
-                # Combine into 2D echo feature
-                data_dict["echo"] = np.vstack((is_first, is_last)).transpose().copy()  # ensure contiguous
-            else:
-                # If echo info not available, create default echo feature
-                # All points treated as both first and last return (single return)
-                n_points = data_dict["coord"].shape[0]
-                data_dict["echo"] = np.ones((n_points, 2), dtype=np.float32)
-
-            # Extract height above ground (HAG) if available
-            # HAG is typically stored as an extra dimension, not a standard LAS field
-            if "hag" in las.point_format.dimension_names:
-                try:
-                    hag = np.array(las.hag, dtype=np.float32).reshape(-1, 1)
-                    data_dict["hag"] = hag
-                except (AttributeError, KeyError):
-                    # Fallback: try dictionary-style access
-                    try:
-                        hag = np.array(las["hag"], dtype=np.float32).reshape(-1, 1)
-                        data_dict["hag"] = hag
-                    except (AttributeError, KeyError):
-                        pass  # HAG not available
-
-            # Extract Z_base height if available (another common extra dimension)
-            if "z_base" in las.point_format.dimension_names:
-                try:
-                    zbase = np.array(las.z_base, dtype=np.float32).reshape(-1, 1)
-                    data_dict["z_base"] = zbase
-                    data_dict["z_delta"] = data_dict["coord"][:, 2:3] - zbase
-                except (AttributeError, KeyError):
-                    # Fallback: try dictionary-style access
-                    try:
-                        zbase = np.array(las["z_base"], dtype=np.float32).reshape(-1, 1)
-                        data_dict["z_base"] = zbase
-                        data_dict["z_delta"] = data_dict["coord"][:, 2:3] - zbase
-                    except (AttributeError, KeyError):
-                        pass  # Z_base not available
-
-            # Extract normal vectors if available (stored as extra dims by tile_las.py)
-            dim_names = las.point_format.dimension_names
-            if "normal_x" in dim_names and "normal_y" in dim_names and "normal_z" in dim_names:
-                try:
-                    nx = np.array(las.normal_x, dtype=np.float32)
-                    ny = np.array(las.normal_y, dtype=np.float32)
-                    nz = np.array(las.normal_z, dtype=np.float32)
-                    data_dict["normal"] = np.stack((nx, ny, nz), axis=1)  # (N, 3)
-                except (AttributeError, KeyError):
-                    pass  # Normal vectors not available
-
-            # Extract superpoint segment ID if available (stored as extra dim by tile_las.py)
-            if "superpoint" in las.point_format.dimension_names:
-                try:
-                    superpoint = np.array(las.superpoint, dtype=np.int64)
-                    # Only keep valid superpoints (>= 0), invalid ones (-1) will be handled in loss
-                    data_dict["superpoint"] = superpoint
-                except (AttributeError, KeyError):
-                    pass  # Superpoint not available
-
-            # Extract core_bbox from PointSpace VLR (written by tile_las.py buffered tiling)
-            for vlr in las.header.vlrs:
-                if (getattr(vlr, 'user_id', None) == "PointSpace"
-                        and getattr(vlr, 'record_id', None) == 1001):
-                    try:
-                        bbox_data = json.loads(vlr.record_data.decode('utf-8'))
-                        data_dict["core_bbox"] = np.array(
-                            bbox_data["core_bbox"], dtype=np.float32
-                        )  # [xmin, ymin, xmax, ymax]
-                    except (json.JSONDecodeError, KeyError, UnicodeDecodeError):
-                        pass
-                    break
-
+            data_dict = self._get_cached_or_load_base_sample(data_path)
         except Exception as e:
             logger = get_root_logger()
             logger.error(f"Error reading {data_path}: {e}")
             # Create empty data with minimal required fields
-            data_dict["coord"] = np.zeros((0, 3), dtype=np.float32)
+            data_dict = {"coord": np.zeros((0, 3), dtype=np.float32)}
         
         # Add metadata
         data_dict["name"] = name

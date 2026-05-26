@@ -1,11 +1,3 @@
-from .cnf_head import (
-    DualBranchCNFHead,
-    SingleBranchCNFHead,
-    RelativeFourierEncoding,
-)
+"""Model head registry exports."""
 
-__all__ = [
-    "DualBranchCNFHead",
-    "SingleBranchCNFHead",
-    "RelativeFourierEncoding",
-]
+__all__ = []

@@ -174,7 +174,7 @@ data = dict(
             dict(type="ToTensor"),
             dict(
                 type="Collect",
-                keys=["coord", "segment","hag"],  # 只需要coord和segment
+                keys=["coord", "segment"],
                 feat_keys=feature_keys,
             ),
         ],
@@ -208,7 +208,7 @@ data = dict(
             dict(type="ToTensor"),
             dict(
                 type="Collect",
-                keys=["coord", "segment","hag"],  # 只需要coord和segment
+                keys=["coord", "segment"],
                 feat_keys=feature_keys,
             ),
         ],
@@ -248,7 +248,7 @@ data = dict(
             dict(type="ToTensor"),
             dict(
                 type="Collect",
-                keys=["coord", "index","hag"],
+                keys=["coord", "index"],
                 feat_keys=feature_keys,
             ),
         ],

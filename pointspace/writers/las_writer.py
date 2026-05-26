@@ -45,7 +45,7 @@ class LASWriter(BaseWriter):
            （GPS time, Intensity, RGB, 回波, 自定义字段等），
            仅覆写/追加推理结果字段。
 
-           对于 **pred_coord（CNF 密网格输出）**，上述模式有所不同：
+           对于 **pred_coord（外部提供的稠密坐标输出）**，上述模式有所不同：
            仅从源文件借用 scale、offset 和坐标系 VLR（GeoKey / WKT），
            输出始终为标准 LAS 1.2 / point_format=0，以保证最大兼容性。
 
@@ -95,15 +95,15 @@ class LASWriter(BaseWriter):
                 在有源文件模式 (source_dir) 下允许为 None，此时坐标
                 和点数从源文件获取。无源文件且 coord 为 None 时抛异常。
             **kwargs: 推理结果字段，支持:
-                pred_coord (np.ndarray): CNF 预测坐标 (Q, 3)。当提供时
+                pred_coord (np.ndarray): 外部提供的预测坐标 (Q, 3)。当提供时
                     忽略 coord 和源文件，直接从 pred_coord 创建新 LAS。
                 pred_sem (np.ndarray): 语义分割标签 (N,)
                 pred_ins (np.ndarray): 实例分割 ID (N,)
                 pred_panoptic (np.ndarray): 全景分割标签（预留）
                 pred_bbox (np.ndarray): 3D 检测框（预留）
                 pred_reg (np.ndarray): 回归值（预留）
-                slope (np.ndarray): CNF 地形坡度 (Q,)
-                curvature (np.ndarray): CNF 地形曲率 (Q,)
+                slope (np.ndarray): 派生坡度属性 (Q,)
+                curvature (np.ndarray): 派生曲率属性 (Q,)
                 color (np.ndarray): RGB 颜色 (N, 3)（仅无源文件模式使用）
                 extra_dims (dict): 额外自定义维度 {name: (np.ndarray, dtype_str)}
 
@@ -116,7 +116,7 @@ class LASWriter(BaseWriter):
         """
         out_path = os.path.join(self.save_dir, f"{data_name}{self._ext}")
 
-        # ---------- pred_coord shortcut (CNF dense-grid output) ----------
+        # ---------- pred_coord shortcut (dense coordinate output) ----------
         pred_coord = kwargs.pop("pred_coord", None)
         if pred_coord is not None:
             pred_coord = np.asarray(pred_coord, dtype=np.float64)
@@ -380,7 +380,7 @@ class LASWriter(BaseWriter):
                     f"pred_reg 维度不合法: ndim={pred_reg.ndim}, 期望 1 或 2"
                 )
 
-        # ========== CNF 地形派生属性 (Slope / Curvature) ==========
+        # ========== 派生地形属性 (Slope / Curvature) ==========
         slope = kwargs.get("slope", None)
         if slope is not None:
             slope = np.asarray(slope, dtype=np.float64)

@@ -14,4 +14,3 @@ from .misc import (
 )
 from .lovasz import LovaszLoss
 from .superpoint import SuperpointConsistencyLoss
-from .partition_criterion import PartitionCriterion, PartitionCriterionV2

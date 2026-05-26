@@ -137,9 +137,3 @@ class PointModel(PointModule, HookBase):
         super().__init__(*args, **kwargs)
 
 
-# Backward-compatible re-export (implementation moved to EZ-SP backbone)
-from pointspace.models.backbone.ezsp.voxel_to_point_decoder import (
-    VoxelToPointDecoder,
-    LightweightVoxelToPointDecoder,
-)
-

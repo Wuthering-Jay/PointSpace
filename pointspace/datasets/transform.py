@@ -33,8 +33,6 @@ def index_operator(data_dict, index, duplicate=False):
             "normal",
             "superpoint",
             "intensity",
-            "hag",
-            "z_base",
             "echo",
             "segment",
             "instance",
@@ -150,13 +148,19 @@ class ToTensor(object):
 
 
 @TRANSFORMS.register_module()
-class NormalizeColor(object):
+class NormalizeColor8bit(object):
     def __call__(self, data_dict):
         if "color" in data_dict.keys():
             data_dict["color"] = data_dict["color"] / 255
         return data_dict
     
-
+@TRANSFORMS.register_module()
+class NormalizeColor16bit(object):
+    def __call__(self, data_dict):
+        if "color" in data_dict.keys():
+            data_dict["color"] = data_dict["color"] / 65535
+        return data_dict
+    
 @TRANSFORMS.register_module()
 class RobustLogIntensity(object):
     """
@@ -1268,6 +1272,10 @@ class GridSample(object):
 
         elif self.mode == "test":  # test mode
             data_part_list = []
+            inverse_map = None
+            if self.return_inverse:
+                inverse_map = np.zeros_like(inverse)
+                inverse_map[idx_sort] = inverse
             for i in range(count.max()):
                 idx_select = np.cumsum(np.insert(count, 0, 0)[0:-1]) + i % count
                 idx_part = idx_sort[idx_select]
@@ -1275,9 +1283,9 @@ class GridSample(object):
                 data_part["index"] = idx_part
                 # Store grid_size for later use (e.g., Point.sparsify())
                 data_part["grid_size"] = self.grid_size
-                if self.return_inverse:
-                    data_part["inverse"] = np.zeros_like(inverse)
-                    data_part["inverse"][idx_sort] = inverse
+                if inverse_map is not None and i == 0:
+                    # Only one fragment needs to carry the full inverse mapping.
+                    data_part["inverse"] = inverse_map
                 if self.return_grid_coord:
                     data_part["grid_coord"] = grid_coord[idx_part]
                     if "grid_coord" not in data_part["index_valid_keys"]:
@@ -1474,6 +1482,10 @@ class GridSample_Maxloop(GridSample):
                 idx_sort, count, self.max_test_loops
             )
             data_part_list = []
+            inverse_map = None
+            if self.return_inverse:
+                inverse_map = np.zeros_like(inverse)
+                inverse_map[idx_sort] = inverse
             for batch_indices in list_of_batch_indices:
                 if len(batch_indices) == 0:
                     continue
@@ -1482,9 +1494,9 @@ class GridSample_Maxloop(GridSample):
                 data_part["index"] = batch_indices
                 # Store grid_size for later use (e.g., Point.sparsify())
                 data_part["grid_size"] = self.grid_size
-                if self.return_inverse:
-                    data_part["inverse"] = np.zeros_like(inverse)
-                    data_part["inverse"][idx_sort] = inverse
+                if inverse_map is not None and not data_part_list:
+                    # Only one fragment needs to carry the full inverse mapping.
+                    data_part["inverse"] = inverse_map
                 if self.return_grid_coord:
                     data_part["grid_coord"] = grid_coord[batch_indices]
                     data_dict["index_valid_keys"].append("grid_coord")

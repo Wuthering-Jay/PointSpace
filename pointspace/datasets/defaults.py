@@ -39,7 +39,6 @@ class DefaultDataset(Dataset):
         "color",
         "normal",
         "intensity",
-        "hag",
         "echo",
         "segment",
         "instance",

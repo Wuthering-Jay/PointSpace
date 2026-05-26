@@ -1,4 +1,4 @@
-"""
+﻿"""
 Evaluate Hook
 
 Author: Xiaoyang Wu (xiaoyang.wu.cs@gmail.com)
@@ -318,9 +318,9 @@ class SemSegEvaluator(HookBase):
 class RegressionEvaluator(HookBase):
     """Validation evaluator for per-point regression tasks.
 
-    Computes MAE, RMSE and R² over the entire validation set each epoch.
+    Computes MAE, RMSE and R虏 over the entire validation set each epoch.
     Uses ``"reg_pred"`` from model output and reads the ground-truth from
-    a configurable ``target_key`` field in the input dict (e.g. ``"hag"``).
+    a configurable ``target_key`` field in the input dict (e.g. ``"intensity"``).
 
     The *best-model* metric tracked is **negative MAE** (higher is better)
     so that the existing ``CheckpointSaver`` logic (which keeps the model
@@ -328,11 +328,11 @@ class RegressionEvaluator(HookBase):
 
     Args:
         target_key (str): Key in ``input_dict`` that holds the regression
-            ground-truth (e.g. ``"hag"``, ``"intensity"``).
+            ground-truth (e.g. ``"intensity"``).
         log_interval (int): Log progress every *log_interval* batches.
     """
 
-    def __init__(self, target_key="hag", log_interval=1):
+    def __init__(self, target_key="intensity", log_interval=1):
         self.target_key = target_key
         self.log_interval = max(1, log_interval)
 
@@ -414,7 +414,7 @@ class RegressionEvaluator(HookBase):
         total_count = max(total_count, 1)
         mae = sum_abs_err / total_count
         rmse = (sum_sq_err / total_count) ** 0.5
-        # R² = 1 - SS_res / SS_tot
+        # R虏 = 1 - SS_res / SS_tot
         mean_target = sum_target / total_count
         ss_tot = sum_target_sq - total_count * mean_target ** 2
         ss_res = sum_sq_err
@@ -443,7 +443,7 @@ class RegressionEvaluator(HookBase):
                 )
 
         self.trainer.logger.info("<<<<<<<<<<<<<<<<< End Evaluation <<<<<<<<<<<<<<<<<")
-        # Use negative MAE as metric (higher is better → compatible with Saver)
+        # Use negative MAE as metric (higher is better 鈫?compatible with Saver)
         self.trainer.comm_info["current_metric_value"] = -mae
         self.trainer.comm_info["current_metric_name"] = "neg_MAE"
 
@@ -460,7 +460,7 @@ class SemSegRegressionEvaluator(HookBase):
     Computes **both** sets of metrics in one pass:
 
     * Segmentation: mIoU / mAcc / allAcc (same as ``SemSegEvaluator``)
-    * Regression  : MAE / RMSE / R²      (same as ``RegressionEvaluator``)
+    * Regression  : MAE / RMSE / R虏      (same as ``RegressionEvaluator``)
 
     ``primary_metric`` controls which metric is used for best-model
     selection via ``current_metric_value`` (default ``"mIoU"``).
@@ -471,7 +471,7 @@ class SemSegRegressionEvaluator(HookBase):
         log_interval (int): Log every *n* batches.
     """
 
-    def __init__(self, target_key="hag", primary_metric="mIoU", log_interval=1):
+    def __init__(self, target_key="intensity", primary_metric="mIoU", log_interval=1):
         self.target_key = target_key
         self.primary_metric = primary_metric
         self.log_interval = max(1, log_interval)
@@ -1058,363 +1058,3 @@ class InsSegEvaluator(HookBase):
             self.trainer.comm_info["current_metric_name"] = "AP50"  # save for saver
 
 
-@HOOKS.register_module()
-class CnfEvaluator(HookBase):
-    """Validation evaluator for Conditional Neural Field (CNF) tasks.
-
-    Each validation batch contains *query* points (``query_coord``,
-    ``query_gt``) that are disjoint from the support set.  The
-    model's ``cnf_pred`` output is compared against ``query_gt``.
-
-    Metrics computed every epoch:
-        - **MAE**  – mean absolute error
-        - **RMSE** – root mean square error
-        - **MaxE** – maximum absolute error (sensitivity to outliers)
-        - **R²**   – coefficient of determination
-
-    Best-model tracking uses **−RMSE** (higher is better), compatible
-    with :class:`CheckpointSaver`.
-
-    Args:
-        log_interval (int): Print progress every *log_interval* batches.
-    """
-
-    def __init__(self, log_interval=1):
-        self.log_interval = max(1, log_interval)
-
-    def before_train(self):
-        if self.trainer.writer is not None and self.trainer.cfg.enable_wandb:
-            wandb.define_metric("val/*", step_metric="Epoch")
-
-    def after_epoch(self):
-        if self.trainer.cfg.evaluate:
-            self.eval()
-
-    def eval(self):
-        self.trainer.logger.info(">>>>>>>>>>>>>>>> Start Evaluation >>>>>>>>>>>>>>>>")
-        self.trainer.model.eval()
-        auto_cast = _build_autocast(self.trainer.cfg)
-        from pointspace.engines.hooks.misc import CacheCleaner
-
-        _cache_cleaner = next(
-            (h for h in self.trainer.hooks if isinstance(h, CacheCleaner)), None
-        )
-
-        sum_abs_err = 0.0
-        sum_sq_err = 0.0
-        sum_target = 0.0
-        sum_target_sq = 0.0
-        max_abs_err = 0.0
-        total_count = 0
-
-        for i, input_dict in enumerate(self.trainer.val_loader):
-            _iter_start = time.perf_counter()
-            for key in input_dict.keys():
-                if isinstance(input_dict[key], torch.Tensor):
-                    input_dict[key] = input_dict[key].cuda(non_blocking=True)
-
-            with torch.no_grad(), auto_cast():
-                output_dict = self.trainer.model(input_dict)
-
-            pred = output_dict["cnf_pred"].detach().float().reshape(-1)
-            target = input_dict["query_gt"].float().reshape(-1)
-            loss = output_dict["loss"]
-
-            diff = pred - target
-            n = pred.numel()
-            abs_diff = diff.abs()
-            sum_abs_err += abs_diff.sum().item()
-            sum_sq_err += (diff ** 2).sum().item()
-            sum_target += target.sum().item()
-            sum_target_sq += (target ** 2).sum().item()
-            batch_max = abs_diff.max().item() if n > 0 else 0.0
-            if batch_max > max_abs_err:
-                max_abs_err = batch_max
-            total_count += n
-
-            self.trainer.storage.put_scalar("val_loss", loss.item())
-            # Log per-component losses if returned by dual-branch model
-            for lk in ("loss_base", "loss_final", "loss_reg"):
-                if lk in output_dict:
-                    self.trainer.storage.put_scalar(
-                        f"val_{lk}", output_dict[lk].item()
-                    )
-
-            if (i + 1) % self.log_interval == 0 or (i + 1) == len(
-                self.trainer.val_loader
-            ):
-                self.trainer.logger.info(
-                    "Val: [{iter}/{max_iter}] Loss {loss:.4f}".format(
-                        iter=i + 1,
-                        max_iter=len(self.trainer.val_loader),
-                        loss=loss.item(),
-                    )
-                )
-            if _cache_cleaner is not None:
-                _cache_cleaner.check_and_clean(
-                    time.perf_counter() - _iter_start,
-                    f"val iter {i + 1}/{len(self.trainer.val_loader)}",
-                )
-
-        loss_avg = self.trainer.storage.history("val_loss").avg
-
-        # Aggregate across ranks for DDP
-        if comm.get_world_size() > 1:
-            stats = torch.tensor(
-                [sum_abs_err, sum_sq_err, sum_target, sum_target_sq,
-                 max_abs_err, total_count],
-                dtype=torch.float64,
-                device="cuda",
-            )
-            dist.all_reduce(stats, op=dist.ReduceOp.SUM)
-            # max_abs_err needs MAX reduction, not SUM
-            max_tensor = torch.tensor([max_abs_err], dtype=torch.float64, device="cuda")
-            dist.all_reduce(max_tensor, op=dist.ReduceOp.MAX)
-            sum_abs_err, sum_sq_err, sum_target, sum_target_sq, _, total_count = (
-                stats.tolist()
-            )
-            max_abs_err = max_tensor.item()
-
-        total_count = max(total_count, 1)
-        mae = sum_abs_err / total_count
-        rmse = (sum_sq_err / total_count) ** 0.5
-        mean_target = sum_target / total_count
-        ss_tot = sum_target_sq - total_count * mean_target ** 2
-        ss_res = sum_sq_err
-        r2 = 1.0 - ss_res / max(ss_tot, 1e-10)
-
-        self.trainer.logger.info(
-            "Val result: MAE {:.6f} | RMSE {:.6f} | MaxE {:.6f} | R^2 {:.6f}".format(
-                mae, rmse, max_abs_err, r2
-            )
-        )
-
-        current_epoch = self.trainer.epoch + 1
-        if self.trainer.writer is not None:
-            self.trainer.writer.add_scalar("val/loss", loss_avg, current_epoch)
-            self.trainer.writer.add_scalar("val/MAE", mae, current_epoch)
-            self.trainer.writer.add_scalar("val/RMSE", rmse, current_epoch)
-            self.trainer.writer.add_scalar("val/MaxE", max_abs_err, current_epoch)
-            self.trainer.writer.add_scalar("val/R2", r2, current_epoch)
-            if self.trainer.cfg.enable_wandb:
-                wandb.log(
-                    {
-                        "Epoch": current_epoch,
-                        "val/loss": loss_avg,
-                        "val/MAE": mae,
-                        "val/RMSE": rmse,
-                        "val/MaxE": max_abs_err,
-                        "val/R2": r2,
-                    },
-                    step=wandb.run.step,
-                )
-
-        self.trainer.logger.info("<<<<<<<<<<<<<<<<< End Evaluation <<<<<<<<<<<<<<<<<")
-        # Negative RMSE as best-model metric (higher = better)
-        self.trainer.comm_info["current_metric_value"] = -rmse
-        self.trainer.comm_info["current_metric_name"] = "neg_RMSE"
-
-    def after_train(self):
-        self.trainer.logger.info(
-            "Best {}: {:.6f}".format("neg_RMSE", self.trainer.best_metric_value)
-        )
-
-
-@HOOKS.register_module()
-class EZSPPartitionEvaluator(HookBase):
-    """Validation evaluator for EZ-SP partition learning (Stage 1).
-    
-    This evaluator computes partition quality metrics without requiring
-    semantic segmentation outputs. It evaluates:
-    
-    1. **Oracle mIoU**: The best possible mIoU if each superpoint takes
-       its majority class label. Higher = better boundary alignment.
-    2. **Oracle OA**: Overall accuracy with oracle labels.
-    3. **Superpoint statistics**: Number of superpoints, average size, etc.
-    
-    Unlike SemSegEvaluator, this does not require 'seg_logits' in the output.
-    The model output should contain 'y_pred' and 'y_true' tensors.
-    
-    Args:
-        log_interval: Log every N iterations during validation.
-        write_cls_iou: Whether to write per-class IoU to tensorboard.
-    """
-    
-    def __init__(self, log_interval: int = 1, write_cls_iou: bool = False):
-        self.log_interval = max(1, log_interval)
-        self.write_cls_iou = write_cls_iou
-    
-    def before_train(self):
-        if self.trainer.writer is not None and self.trainer.cfg.enable_wandb:
-            wandb.define_metric("val/*", step_metric="Epoch")
-    
-    def after_epoch(self):
-        if self.trainer.cfg.evaluate:
-            self.eval()
-    
-    def eval(self):
-        self.trainer.logger.info(">>>>>>>>>>>>>>>> Start Partition Evaluation >>>>>>>>>>>>>>>>")
-        self.trainer.model.eval()
-        auto_cast = _build_autocast(self.trainer.cfg)
-        
-        from pointspace.engines.hooks.misc import CacheCleaner
-        _cache_cleaner = next(
-            (h for h in self.trainer.hooks if isinstance(h, CacheCleaner)), None
-        )
-        
-        # Accumulators for Oracle mIoU computation
-        num_classes = self.trainer.cfg.data.num_classes
-        ignore_index = getattr(self.trainer.cfg.data, "ignore_index", -1)
-        
-        # Per-class counters for IoU
-        intersection_total = np.zeros(num_classes, dtype=np.float64)
-        union_total = np.zeros(num_classes, dtype=np.float64)
-        target_total = np.zeros(num_classes, dtype=np.float64)
-        
-        # Statistics
-        total_samples = 0
-        total_superpoints = 0
-        
-        for i, input_dict in enumerate(self.trainer.val_loader):
-            _iter_start = time.perf_counter()
-            
-            for key in input_dict.keys():
-                if isinstance(input_dict[key], torch.Tensor):
-                    input_dict[key] = input_dict[key].cuda(non_blocking=True)
-            
-            with torch.no_grad(), auto_cast():
-                output_dict = self.trainer.model(input_dict)
-            
-            # Extract predictions and ground truth
-            # Model returns y_pred (oracle predictions) and y_true (ground truth)
-            if "y_pred" not in output_dict or "y_true" not in output_dict:
-                # Skip this batch if no valid output
-                continue
-            
-            y_pred = output_dict["y_pred"]
-            y_true = output_dict["y_true"]
-            
-            # Handle inverse mapping if present
-            if "inverse" in input_dict.keys():
-                if "origin_segment" in input_dict.keys():
-                    y_true = input_dict["origin_segment"]
-                    if y_pred.shape[0] != y_true.shape[0]:
-                        y_pred = y_pred[input_dict["inverse"]]
-            
-            # Compute intersection and union per class
-            intersection, union, target = intersection_and_union_gpu(
-                y_pred,
-                y_true,
-                num_classes,
-                ignore_index,
-            )
-            
-            # DDP sync
-            if comm.get_world_size() > 1:
-                dist.all_reduce(intersection)
-                dist.all_reduce(union)
-                dist.all_reduce(target)
-            
-            intersection = intersection.cpu().numpy()
-            union = union.cpu().numpy()
-            target = target.cpu().numpy()
-            
-            intersection_total += intersection
-            union_total += union
-            target_total += target
-            
-            total_samples += 1
-            
-            # Get superpoint statistics if available
-            if "oracle_acc" in output_dict:
-                oracle_acc = output_dict["oracle_acc"].item()
-            else:
-                valid_mask = y_true >= 0
-                if valid_mask.any():
-                    oracle_acc = (y_pred[valid_mask] == y_true[valid_mask]).float().mean().item()
-                else:
-                    oracle_acc = 0.0
-            
-            # Log progress
-            if (i + 1) % self.log_interval == 0 or (i + 1) == len(self.trainer.val_loader):
-                self.trainer.logger.info(
-                    "Val: [{iter}/{max_iter}] Oracle Acc: {acc:.4f}".format(
-                        iter=i + 1,
-                        max_iter=len(self.trainer.val_loader),
-                        acc=oracle_acc,
-                    )
-                )
-            
-            # Cache cleaning
-            if _cache_cleaner is not None:
-                _cache_cleaner.check_and_clean(
-                    time.perf_counter() - _iter_start,
-                    f"val iter {i + 1}/{len(self.trainer.val_loader)}",
-                )
-        
-        # Compute final metrics
-        iou_class = intersection_total / (union_total + 1e-10)
-        acc_class = intersection_total / (target_total + 1e-10)
-        m_iou = np.mean(iou_class)
-        m_acc = np.mean(acc_class)
-        all_acc = sum(intersection_total) / (sum(target_total) + 1e-10)
-        
-        # Log results
-        self.trainer.logger.info(
-            "Val result:  Oracle mIoU {:.4f}  Oracle mAcc {:.4f}  Oracle OA {:.4f}".format(
-                m_iou, m_acc, all_acc
-            )
-        )
-        
-        # Per-class breakdown
-        names = self.trainer.cfg.data.names
-        if names is not None and len(names) == num_classes:
-            precision_class = intersection_total / (
-                intersection_total + np.maximum(union_total - target_total, 0) + 1e-10
-            )
-            f1_class = 2 * precision_class * acc_class / (precision_class + acc_class + 1e-10)
-            max_name_len = max(len(n) for n in names)
-            
-            for j in range(num_classes):
-                self.trainer.logger.info(
-                    "  Class {:2d} - {:<{w}} | Oracle IoU {:.4f}".format(
-                        j, names[j], iou_class[j], w=max_name_len
-                    )
-                )
-        
-        # TensorBoard / WandB logging
-        current_epoch = self.trainer.epoch + 1
-        if self.trainer.writer is not None:
-            self.trainer.writer.add_scalar("val/oracle_mIoU", m_iou, current_epoch)
-            self.trainer.writer.add_scalar("val/oracle_mAcc", m_acc, current_epoch)
-            self.trainer.writer.add_scalar("val/oracle_OA", all_acc, current_epoch)
-            
-            if self.trainer.cfg.enable_wandb:
-                wandb.log(
-                    {
-                        "Epoch": current_epoch,
-                        "val/oracle_mIoU": m_iou,
-                        "val/oracle_mAcc": m_acc,
-                        "val/oracle_OA": all_acc,
-                    },
-                    step=wandb.run.step,
-                )
-            
-            if self.write_cls_iou and names is not None:
-                for j in range(num_classes):
-                    self.trainer.writer.add_scalar(
-                        f"val/oracle_cls_{j}-{names[j]} IoU",
-                        iou_class[j],
-                        current_epoch,
-                    )
-        
-        self.trainer.logger.info("<<<<<<<<<<<<<<<<< End Partition Evaluation <<<<<<<<<<<<<<<<<")
-        
-        # Save metric for checkpoint saver (higher is better)
-        self.trainer.comm_info["current_metric_value"] = m_iou
-        self.trainer.comm_info["current_metric_name"] = "oracle_mIoU"
-    
-    def after_train(self):
-        self.trainer.logger.info(
-            "Best {}: {:.4f}".format("oracle_mIoU", self.trainer.best_metric_value)
-        )

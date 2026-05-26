@@ -19,7 +19,7 @@ try:
 except ImportError:
     flash_attn = None
 
-from pointspace.models.point_prompt_training import PDNorm
+from pointspace.models.backbone.point_prompt_training import PDNorm
 from pointspace.models.builder import MODELS
 from pointspace.models.utils.misc import offset2bincount
 from pointspace.models.utils.structure import Point
