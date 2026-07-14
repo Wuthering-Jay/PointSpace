@@ -530,6 +530,16 @@ class LasDataset(DefaultDataset):
             if cfg_dict.get("type") in color_transform_types:
                 required.add("color")
 
+        field_transform_types = {
+            "RandomDropEcho": "echo",
+            "RandomDropIntensity": "intensity",
+            "RobustLogIntensity": "intensity",
+        }
+        for cfg_dict in self._iter_cfg_dicts(all_cfg):
+            field = field_transform_types.get(cfg_dict.get("type"))
+            if field is not None:
+                required.add(field)
+
         all_strings = set(self._iter_cfg_strings(all_cfg))
         required.update(field for field in self.VALID_ASSETS if field in all_strings)
         need_core_bbox = "core_bbox" in all_strings

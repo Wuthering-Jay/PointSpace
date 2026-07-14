@@ -1119,6 +1119,44 @@ class RandomDropNormal(object):
 
 
 @TRANSFORMS.register_module()
+class RandomDropEcho(object):
+    def __init__(self, drop_ratio=0.2, drop_application_ratio=0.5):
+        self.drop_ratio = drop_ratio
+        self.drop_application_ratio = drop_application_ratio
+        self.drop_value = 0.0
+
+    def __call__(self, data_dict):
+        if (
+            "echo" in data_dict.keys()
+            and random.random() < self.drop_application_ratio
+        ):
+            n = len(data_dict["echo"])
+            num_to_drop = int(n * self.drop_ratio)
+            idx = np.random.choice(n, num_to_drop, replace=False)
+            data_dict["echo"][idx] = self.drop_value
+        return data_dict
+
+
+@TRANSFORMS.register_module()
+class RandomDropIntensity(object):
+    def __init__(self, drop_ratio=0.2, drop_application_ratio=0.5):
+        self.drop_ratio = drop_ratio
+        self.drop_application_ratio = drop_application_ratio
+        self.drop_value = 0.0
+
+    def __call__(self, data_dict):
+        if (
+            "intensity" in data_dict.keys()
+            and random.random() < self.drop_application_ratio
+        ):
+            n = len(data_dict["intensity"])
+            num_to_drop = int(n * self.drop_ratio)
+            idx = np.random.choice(n, num_to_drop, replace=False)
+            data_dict["intensity"][idx] = self.drop_value
+        return data_dict
+
+
+@TRANSFORMS.register_module()
 class RandomColorDrop(object):
     def __init__(self, p=0.2, color_augment=0.0):
         self.p = p

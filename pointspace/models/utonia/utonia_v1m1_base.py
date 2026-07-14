@@ -529,6 +529,16 @@ class Utonia(PointModel):
         return point
 
     @staticmethod
+    def _resolve_grid_size(grid_size):
+        if torch.is_tensor(grid_size):
+            return grid_size.reshape(-1)[0]
+        if isinstance(grid_size, (list, tuple)):
+            if len(grid_size) == 0:
+                raise ValueError("grid_size cannot be an empty sequence.")
+            return Utonia._resolve_grid_size(grid_size[0])
+        return grid_size
+
+    @staticmethod
     def pool_corr(point, correspondence):
         inverse_list = []
         idx_ptr_list = []
@@ -589,13 +599,14 @@ class Utonia(PointModel):
 
         # prepare global_point, mask_global_point, local_point
         with torch.no_grad():
+            grid_size = self._resolve_grid_size(data_dict["grid_size"])
             # global_point & masking
             global_point = Point(
                 feat=data_dict["global_feat"],
                 coord=data_dict["global_coord"],
                 origin_coord=data_dict["global_origin_coord"],
                 offset=data_dict["global_offset"],
-                grid_size=data_dict["grid_size"][0],
+                grid_size=grid_size,
             )
 
             global_mask, global_cluster = self.generate_mask(
@@ -605,9 +616,9 @@ class Utonia(PointModel):
             if self.mask_jitter is not None:
                 mask_global_coord[global_mask] += torch.clip(
                     torch.randn_like(mask_global_coord[global_mask]).mul(
-                        self.mask_jitter * data_dict["grid_size"][0]
+                        self.mask_jitter * grid_size
                     ),
-                    max=(self.mask_jitter * data_dict["grid_size"][0]) * 2,
+                    max=(self.mask_jitter * grid_size) * 2,
                 )
 
             mask_global_point = Point(
@@ -616,9 +627,13 @@ class Utonia(PointModel):
                 origin_coord=data_dict["global_origin_coord"],
                 mask=global_mask,
                 offset=data_dict["global_offset"],
-                grid_size=data_dict["grid_size"][0],
+                grid_size=grid_size,
             )
-            major_view_correspondence = data_dict["global_correspondence"]
+            major_view_correspondence = (
+                data_dict["global_correspondence"]
+                if self.enc2d_loss_weight > 0
+                else None
+            )
 
             # local point & matching
             local_point = Point(
@@ -626,7 +641,7 @@ class Utonia(PointModel):
                 coord=data_dict["local_coord"],
                 origin_coord=data_dict["local_origin_coord"],
                 offset=data_dict["local_offset"],
-                grid_size=data_dict["grid_size"][0],
+                grid_size=grid_size,
             )
 
             # create result dictionary for return

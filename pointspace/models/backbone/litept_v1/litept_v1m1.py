@@ -531,6 +531,7 @@ class GridPooling(PointModule):
         if self.traceable:
             point_dict["pooling_inverse"] = cluster
             point_dict["pooling_parent"] = point
+            point_dict["idx_ptr"] = idx_ptr
         point = Point(point_dict)
         if self.norm is not None:
             point = self.norm(point)
