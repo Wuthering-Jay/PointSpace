@@ -10,6 +10,7 @@ from uuid import uuid4
 import os
 import time
 import numpy as np
+from pathlib import Path as FilePath
 from collections import OrderedDict
 from functools import partial
 from packaging import version
@@ -18,6 +19,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 import torch.utils.data
+from safetensors.torch import save_file as save_safetensors
 from scipy.spatial import ConvexHull
 from matplotlib.path import Path
 
@@ -197,6 +199,206 @@ class TesterBase:
     @staticmethod
     def collate_fn(batch):
         raise collate_fn(batch)
+
+
+@TESTERS.register_module()
+class HPSDFeatureTester(TesterBase):
+    """提取 HPSD 逐点特征，并把测试 fragment 恢复到原始点顺序。
+
+    ``LasDataset`` 的 ``GridSample(mode="test")`` 不会丢弃体素内的其他点，
+    而是生成多个 fragment，使所有原始点至少出现一次。每个 fragment 保留
+    ``index``，其值是 fragment 点在原始 LAS/LAZ 中的行号。由于点密度不同，
+    某些点可能在不同 fragment 中重复出现，因此不能简单拼接模型输出。
+
+    本 tester 对单张 tile 执行以下流程：
+
+    1. 按 ``batch_size_test_per_gpu`` 将 fragment 分组并批量前向；
+    2. 使用 ``index_add_`` 把每个输出累加到 ``feature_sum[index]``；
+    3. 同时累计 ``feature_count[index]``，检查是否覆盖全部原始点；
+    4. 对重复预测取均值并可选 L2 归一化；
+    5. 按原始点行号保存为同名 Safetensors。
+
+    关键配置：
+
+    - ``feature_output_dir``：Safetensors 输出目录；
+    - ``feature_source``：``projected`` 为 DINO 对齐 1024 维特征，
+      ``backbone`` 为目标层融合后的低维特征；
+    - ``feature_dtype``：磁盘张量类型，支持 float16/float32；
+    - ``normalize_feature``：fragment 合并后是否再次归一化；
+    - ``feature_aggregate_on_gpu``：在 GPU 上执行累加以提高速度，否则使用 CPU；
+    - ``feature_overwrite``：是否覆盖已有同名文件。
+
+    输出 Safetensors 的主张量名为 ``feature``，形状严格为 ``[N,C]``，其中
+    ``N`` 与源点云点数相同。metadata 记录布局、点数、维度、数据类型、特征
+    来源、归一化状态和 distill level，不记录可变路径。
+    """
+
+    def test(self):
+        """运行整个测试集的 fragment 推理、原序聚合和安全写出。"""
+        # default_setup 已把全局 batch_size_test 按 world size 换算为每 GPU
+        # fragment batch；外层 DataLoader 仍保持一次只取一张完整 tile。
+        batch_size_test = self.cfg.batch_size_test_per_gpu
+        auto_cast = _build_autocast(self.cfg)
+        logger = get_root_logger()
+        output_dir = FilePath(self.cfg.feature_output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        overwrite = bool(getattr(self.cfg, "feature_overwrite", False))
+        output_dtype = getattr(self.cfg, "feature_dtype", "float16")
+        feature_source = getattr(self.cfg, "feature_source", "projected")
+        normalize_feature = bool(getattr(self.cfg, "normalize_feature", True))
+        # GPU 聚合速度更快，但 float32 累加器占用约 N*C*4 字节；显存紧张时
+        # 可切换到 CPU，预测结果和索引会在每个 fragment batch 后回传。
+        aggregate_on_gpu = bool(
+            getattr(self.cfg, "feature_aggregate_on_gpu", True)
+        )
+        dtype_map = {"float16": torch.float16, "float32": torch.float32}
+        if output_dtype not in dtype_map:
+            raise ValueError("feature_dtype must be 'float16' or 'float32'")
+        if feature_source not in {"projected", "backbone"}:
+            raise ValueError("feature_source must be 'projected' or 'backbone'")
+
+        logger.info(">>>>>>>>>>>>>>>> Start HPSD Feature Extraction >>>>>>>>>>>>>>>>")
+        logger.info(
+            "Fragment batch size: %d, source: %s, aggregate_on_gpu: %s",
+            batch_size_test,
+            feature_source,
+            aggregate_on_gpu,
+        )
+        self.model.eval()
+        comm.synchronize()
+
+        # test_loader 的 batch_size 固定为 1。data_dict[0] 包含一张 tile 的
+        # fragment_list、原始点级占位 segment 和文件名。
+        for idx, data_dict in enumerate(self.test_loader):
+            start = time.time()
+            data_dict = data_dict[0]
+            fragment_list = data_dict["fragment_list"]
+            data_name = data_dict["name"]
+            # LasDataset 即使没有类别也会生成与原始点数等长的占位 segment，
+            # 因此这里仅借其长度确定最终输出 N，不使用类别值。
+            num_points = int(np.asarray(data_dict["segment"]).shape[0])
+            output_path = output_dir / f"{data_name}.safetensors"
+            if output_path.exists() and not overwrite:
+                logger.info(
+                    "Feature: [%d/%d] %s already exists, skipped",
+                    idx + 1,
+                    len(self.test_loader),
+                    data_name,
+                )
+                continue
+
+            # 延迟到第一次前向后再分配，因为 backbone/projected 两种来源的
+            # 通道数不同，分别可能是 C3 或 Cd=1024。
+            feature_sum = None
+            feature_count = None
+            for start_idx in range(0, len(fragment_list), batch_size_test):
+                end_idx = min(start_idx + batch_size_test, len(fragment_list))
+                input_dict = collate_fn(fragment_list[start_idx:end_idx])
+                for key, value in input_dict.items():
+                    if isinstance(value, torch.Tensor):
+                        input_dict[key] = value.cuda(non_blocking=True)
+                if "index" not in input_dict:
+                    raise KeyError(
+                        "HPSD feature test post_transform must retain 'index'"
+                    )
+                # collate_fn 只拼接同一 tile 的若干 fragment；index 始终引用
+                # 该 tile 的原始行号，不需要添加跨样本 offset。
+                point_index = input_dict["index"].long()
+                if point_index.numel() and (
+                    int(point_index.min()) < 0 or int(point_index.max()) >= num_points
+                ):
+                    raise RuntimeError(
+                        f"Fragment index exceeds source point range for {data_name}"
+                    )
+                # HPSD 的导出路径只运行三维 encoder 和可选 student projector，
+                # 不读取 DINO teacher，也不会构建 token-patch correspondence。
+                with torch.no_grad(), auto_cast():
+                    point_feature = self.model(
+                        input_dict,
+                        return_point_feature=True,
+                        feature_source=feature_source,
+                        normalize_feature=normalize_feature,
+                    )["point_feature"]
+                point_feature = point_feature.detach().float()
+                if point_feature.shape[0] != point_index.shape[0]:
+                    raise RuntimeError(
+                        f"Feature/index length mismatch for {data_name}: "
+                        f"{point_feature.shape[0]} != {point_index.shape[0]}"
+                    )
+
+                if feature_sum is None:
+                    storage_device = point_feature.device if aggregate_on_gpu else "cpu"
+                    feature_sum = torch.zeros(
+                        (num_points, point_feature.shape[1]),
+                        dtype=torch.float32,
+                        device=storage_device,
+                    )
+                    feature_count = torch.zeros(
+                        num_points, dtype=torch.float32, device=storage_device
+                    )
+                if not aggregate_on_gpu:
+                    point_feature = point_feature.cpu()
+                    point_index = point_index.cpu()
+                # index_add_ 同时完成原序写回和重复点累加，避免 Python 逐点循环。
+                feature_sum.index_add_(0, point_index, point_feature)
+                feature_count.index_add_(
+                    0, point_index, torch.ones_like(point_index, dtype=torch.float32)
+                )
+
+            if feature_sum is None:
+                raise RuntimeError(f"No fragments produced for {data_name}")
+            # 理论上 GridSample test fragments 应覆盖每个原始点。保存前强制
+            # 检查，避免静默产生全零特征行或点数看似正确的损坏文件。
+            missing = feature_count == 0
+            if torch.any(missing):
+                raise RuntimeError(
+                    f"Fragments did not cover {int(missing.sum())} points in {data_name}"
+                )
+            # 同一点跨 fragment 的上下文可能不同，采用算术均值融合多次预测。
+            feature = feature_sum / feature_count.unsqueeze(1)
+            if normalize_feature:
+                feature = F.normalize(feature, dim=1, eps=1e-12)
+            feature = feature.to(dtype=dtype_map[output_dtype], device="cpu").contiguous()
+
+            # Safetensors metadata 只接受字符串。保留重建张量语义所需的稳定
+            # 信息，不写 checkpoint、输入或输出路径。
+            metadata = {
+                "format_version": "1",
+                "layout": "NC",
+                "num_points": str(feature.shape[0]),
+                "feature_dim": str(feature.shape[1]),
+                "dtype": output_dtype,
+                "feature_source": feature_source,
+                "normalized": str(normalize_feature).lower(),
+                "distill_level": str(getattr(self.cfg.model, "distill_level", "")),
+            }
+            # 先写同目录临时文件再原子替换，避免中断后留下可被误读的半文件。
+            temporary_path = output_path.with_name(
+                f".{output_path.name}.{uuid4().hex}.tmp"
+            )
+            save_safetensors({"feature": feature}, str(temporary_path), metadata)
+            os.replace(temporary_path, output_path)
+            logger.info(
+                "Feature: [%d/%d] %s, points=%d, dim=%d, fragments=%d, %.3fs",
+                idx + 1,
+                len(self.test_loader),
+                data_name,
+                feature.shape[0],
+                feature.shape[1],
+                len(fragment_list),
+                time.time() - start,
+            )
+            self.cache_cleaner.check_and_clean(
+                time.time() - start,
+                f"HPSD feature iter {idx + 1}/{len(self.test_loader)}",
+            )
+
+        comm.synchronize()
+        logger.info("<<<<<<<<<<<<<<<< End HPSD Feature Extraction <<<<<<<<<<<<<<<<")
+
+    @staticmethod
+    def collate_fn(batch):
+        return batch
 
 
 @TESTERS.register_module()

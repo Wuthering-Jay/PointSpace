@@ -121,11 +121,6 @@ class TrainerBase:
         comm.synchronize()
         for h in self.hooks:
             h.after_train()
-        train_dataset = getattr(getattr(self, "train_loader", None), "dataset", None)
-        if train_dataset is not None and hasattr(train_dataset, "summarize_tile_cache_stats"):
-            train_dataset.summarize_tile_cache_stats(
-                logger=getattr(self, "logger", None),
-            )
         if comm.is_main_process():
             self.writer.close()
 
@@ -152,9 +147,6 @@ class Trainer(TrainerBase):
         self.writer = self.build_writer()
         self.logger.info("=> Building train dataset & dataloader ...")
         self.train_loader = self.build_train_loader()
-        train_dataset = getattr(self.train_loader, "dataset", None)
-        if train_dataset is not None and hasattr(train_dataset, "log_tile_cache_config"):
-            train_dataset.log_tile_cache_config(self.logger)
         self._inject_class_weights()
         self.logger.info("=> Building val dataset & dataloader ...")
         self.val_loader = self.build_val_loader()
@@ -265,21 +257,6 @@ class Trainer(TrainerBase):
     def after_epoch(self):
         for h in self.hooks:
             h.after_epoch()
-        train_dataset = getattr(getattr(self, "train_loader", None), "dataset", None)
-        if (
-            train_dataset is not None
-            and getattr(train_dataset, "enable_tile_cache", False)
-            and hasattr(train_dataset, "get_tile_cache_stats")
-        ):
-            stats = train_dataset.get_tile_cache_stats()
-            total_loads = stats.get("cache_read", 0) + stats.get("las_read", 0)
-            hit_rate = stats.get("cache_read", 0) / total_loads if total_loads > 0 else 0.0
-            self.logger.info(
-                "Tile cache epoch summary: "
-                f"hit_rate={hit_rate:.2%}, "
-                f"cache_read={stats.get('cache_read', 0)}, "
-                f"las_read={stats.get('las_read', 0)}"
-            )
         self.storage.reset_histories()
 
     def build_model(self):

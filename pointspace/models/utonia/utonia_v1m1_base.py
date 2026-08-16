@@ -585,9 +585,15 @@ class Utonia(PointModel):
         point_feat = Point(point_feat)
         return point_feat
 
-    def forward(self, data_dict, return_point=False):
+    def forward(self, data_dict, return_point=False, return_point_source="teacher"):
         if return_point:
-            point = self.teacher.backbone(data_dict)
+            if return_point_source not in ["teacher", "student"]:
+                raise ValueError(
+                    "return_point_source must be either 'teacher' or 'student', "
+                    f"got {return_point_source!r}."
+                )
+            backbone = getattr(self, return_point_source).backbone
+            point = backbone(data_dict)
             for _ in range(self.up_cast_level):
                 assert "pooling_parent" in point.keys()
                 assert "pooling_inverse" in point.keys()

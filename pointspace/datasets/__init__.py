@@ -16,6 +16,7 @@ from .semantic_kitti import SemanticKITTIDataset
 from .nuscenes import NuScenesDataset
 from .waymo import WaymoDataset
 from .las import LasDataset
+from .las_image import LasImageDataset
 
 # object
 from .modelnet import ModelNetDataset

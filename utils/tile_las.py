@@ -834,15 +834,15 @@ class LASTileProcessor:
 if __name__ == "__main__":
     processor = LASTileProcessor(
         # 路径与格式配置
-        input_path=r"E:\data\云南遥感中心\第二批\disk03\val",  # 原始数据路径
-        output_dir=r"E:\data\云南遥感中心\第二批\disk03\tile\val", # 输出路径
+        input_path=r"E:\data\云南\data",  # 原始数据路径
+        output_dir=r"E:\data\云南\data\tile", # 输出路径
         output_format='las',          # 输出格式
 
         # 分块参数
         window_size=(200.0,200.0),   # 分块大小
         overlap=True,                 # 启用重叠
-        overlap_factor=1,             # 重叠因子
-        min_points=1000,              # 最小点数
+        overlap_factor=2,             # 重叠因子
+        min_points=4000,              # 最小点数
         max_points=None,              # 最大点数限制（None=不限制）
         save_orig_idx=True,           # 保存原始点索引
         buffer_size=0,

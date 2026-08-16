@@ -2119,6 +2119,64 @@ class SphereCrop(object):
 
 
 @TRANSFORMS.register_module()
+class CompactDinoPatches(object):
+    """Keep only DINO patches referenced by the current point subset.
+
+    This transform is lossless: feature channels and values are unchanged.
+    It must run after all transforms that may remove points and before
+    ``ToTensor``/``Collect``. ``dino_source_patch_index`` records each compact
+    feature row's original row-major patch index.
+    """
+
+    def __call__(self, data_dict):
+        required = {"dino_feature", "dino_patch_index", "dino_valid"}
+        missing = required.difference(data_dict)
+        if missing:
+            raise KeyError(
+                f"CompactDinoPatches requires fields: {sorted(missing)}"
+            )
+
+        feature = data_dict["dino_feature"]
+        patch_index = data_dict["dino_patch_index"]
+        valid = data_dict["dino_valid"]
+
+        if torch.is_tensor(patch_index):
+            valid_relation = valid.bool() & (patch_index >= 0)
+            used_patch = torch.unique(patch_index[valid_relation].long(), sorted=True)
+            if used_patch.numel() > 0 and int(used_patch[-1]) >= feature.shape[0]:
+                raise ValueError("dino_patch_index exceeds dino_feature length")
+            compact_index = torch.full_like(patch_index, -1, dtype=torch.long)
+            if used_patch.numel() > 0:
+                compact_index[valid_relation] = torch.searchsorted(
+                    used_patch, patch_index[valid_relation].long()
+                )
+            data_dict["dino_feature"] = feature[used_patch].contiguous()
+            data_dict["dino_patch_index"] = compact_index
+            data_dict["dino_valid"] = valid_relation
+            data_dict["dino_source_patch_index"] = used_patch
+            data_dict["dino_offset"] = torch.tensor(
+                [used_patch.numel()], dtype=torch.long, device=used_patch.device
+            )
+        else:
+            patch_index = np.asarray(patch_index)
+            valid_relation = np.asarray(valid, dtype=bool) & (patch_index >= 0)
+            used_patch = np.unique(patch_index[valid_relation]).astype(np.int64)
+            if used_patch.size > 0 and int(used_patch[-1]) >= feature.shape[0]:
+                raise ValueError("dino_patch_index exceeds dino_feature length")
+            compact_index = np.full(patch_index.shape, -1, dtype=np.int64)
+            if used_patch.size > 0:
+                compact_index[valid_relation] = np.searchsorted(
+                    used_patch, patch_index[valid_relation]
+                )
+            data_dict["dino_feature"] = feature[used_patch]
+            data_dict["dino_patch_index"] = compact_index
+            data_dict["dino_valid"] = valid_relation
+            data_dict["dino_source_patch_index"] = used_patch
+            data_dict["dino_offset"] = np.asarray([used_patch.size], dtype=np.int64)
+        return data_dict
+
+
+@TRANSFORMS.register_module()
 class ShufflePoint(object):
     def __call__(self, data_dict):
         assert "coord" in data_dict.keys()

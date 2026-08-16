@@ -134,28 +134,54 @@ def default_setup(cfg):
     cfg.num_worker = cfg.num_worker if cfg.num_worker is not None else mp.cpu_count()
     cfg.num_worker_per_gpu = cfg.num_worker // world_size
 
-    # ---- batch size: support both legacy `batch_size` and new `batch_size_train` ----
-    # 优先使用 batch_size_train；若未设置，则回退到 batch_size（向后兼容）
-    if getattr(cfg, "batch_size_train", None) is not None:
-        _bs_train = cfg.batch_size_train
-    else:
-        _bs_train = cfg.batch_size  # legacy name
-    assert _bs_train % world_size == 0
-    cfg.batch_size_train_per_gpu = _bs_train // world_size
+    # ---- batch size: prefer task-specific names and retain legacy fallback ----
+    # ``batch_size`` is deprecated.  When an old config still uses it, publish
+    # the resolved value as ``batch_size_train`` because Trainer consistently
+    # consumes the task-specific name after setup.
+    batch_size_train = getattr(cfg, "batch_size_train", None)
+    if batch_size_train is None:
+        batch_size_train = getattr(cfg, "batch_size", None)
+    if batch_size_train is None:
+        raise ValueError("Config must define batch_size_train")
+    if batch_size_train <= 0 or batch_size_train % world_size != 0:
+        raise ValueError(
+            "batch_size_train must be positive and divisible by world_size "
+            f"({world_size}), got {batch_size_train}"
+        )
+    cfg.batch_size_train = batch_size_train
+    cfg.batch_size_train_per_gpu = batch_size_train // world_size
 
     # ---- micro-batch: gradient accumulation reduces per-step batch ----
     # batch_size_per_gpu is the ACTUAL DataLoader batch size (micro-batch).
     # Effective batch = micro-batch × gradient_accumulation_steps.
     grad_accum = getattr(cfg, "gradient_accumulation_steps", 1)
+    if grad_accum <= 0:
+        raise ValueError("gradient_accumulation_steps must be positive")
     cfg.batch_size_per_gpu = max(1, cfg.batch_size_train_per_gpu // grad_accum)
 
-    assert cfg.batch_size_val is None or cfg.batch_size_val % world_size == 0
-    assert cfg.batch_size_test is None or cfg.batch_size_test % world_size == 0
+    # Validation and test sizes are optional.  Missing/None means one sample
+    # (or one test fragment for fragment-based testers) per GPU.
+    batch_size_val = getattr(cfg, "batch_size_val", None)
+    batch_size_test = getattr(cfg, "batch_size_test", None)
+    if batch_size_val is not None and (
+        batch_size_val <= 0 or batch_size_val % world_size != 0
+    ):
+        raise ValueError(
+            "batch_size_val must be positive and divisible by world_size "
+            f"({world_size}), got {batch_size_val}"
+        )
+    if batch_size_test is not None and (
+        batch_size_test <= 0 or batch_size_test % world_size != 0
+    ):
+        raise ValueError(
+            "batch_size_test must be positive and divisible by world_size "
+            f"({world_size}), got {batch_size_test}"
+        )
     cfg.batch_size_val_per_gpu = (
-        cfg.batch_size_val // world_size if cfg.batch_size_val is not None else 1
+        batch_size_val // world_size if batch_size_val is not None else 1
     )
     cfg.batch_size_test_per_gpu = (
-        cfg.batch_size_test // world_size if cfg.batch_size_test is not None else 1
+        batch_size_test // world_size if batch_size_test is not None else 1
     )
     # settle random seed
     rank = comm.get_rank()

@@ -39,6 +39,31 @@ def collate_fn(batch):
         result = {}
         for key in batch[0]:
             items = [d[key] for d in batch]
+
+            # Transform bookkeeping is identical for all samples and is not a
+            # point tensor.  Keeping one copy also makes raw-dataset debugging
+            # work when no final Collect transform is configured.
+            if key == "index_valid_keys":
+                result[key] = list(items[0])
+                continue
+
+            # Point-to-patch indices are local inside each sample.  Convert
+            # valid entries to indices of the concatenated [sum(P), C] feature
+            # tensor while preserving -1 for points without image coverage.
+            if key == "dino_patch_index":
+                adjusted = []
+                patch_start = 0
+                for sample, item in zip(batch, items):
+                    item = (
+                        item.clone()
+                        if isinstance(item, torch.Tensor)
+                        else torch.as_tensor(item).clone()
+                    )
+                    item[item >= 0] += patch_start
+                    adjusted.append(item)
+                    patch_start += int(sample["dino_feature"].shape[0])
+                result[key] = collate_fn(adjusted)
+                continue
             
             # Special handling for 'sub' Cluster dict - needs CSR-style merging
             if key == "sub" and isinstance(items[0], dict) and "pointer" in items[0]:

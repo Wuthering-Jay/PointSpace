@@ -165,10 +165,6 @@ data = dict(
         weighted_sampler=True,         # Enable WeightedRandomSampler
         test_mode=False,
         loop=5,
-        enable_tile_cache=True,
-        tile_cache_compression="store", # auto / compressed / store
-        tile_cache_rebuild=False,
-        tile_cache_num_workers=16,
         # Data augmentation
         transform=[
             dict(type="ZPercentileCenterShift", percentile=2.0),
@@ -208,10 +204,6 @@ data = dict(
         ignore_index=ignore_index,
         test_mode=False,
         loop=5,  # Validation doesn't need loop
-        enable_tile_cache=True,
-        tile_cache_compression="store",
-        tile_cache_rebuild=False,
-        tile_cache_num_workers=16,
         # Validation uses minimal transforms (no random augmentation for deterministic eval)
         transform=[
             dict(type="Copy", keys_dict={"segment": "origin_segment"}),
@@ -248,10 +240,6 @@ data = dict(
         remap_class=True,
         ignore_index=ignore_index,
         test_mode=True,
-        enable_tile_cache=True,
-        tile_cache_compression="store",
-        tile_cache_rebuild=False,
-        tile_cache_num_workers=16,
         # Base transform
         transform=[
             dict(type="ZPercentileCenterShift", percentile=2.0),
