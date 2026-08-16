@@ -6,7 +6,7 @@
 # -------------------------------------------------------
 data_root = r"E:\data\湖北\joint_tiles"
 pointcloud_path = r"E:\data\云南\data\tile"
-feature_output_dir = r"E:\data\云南\hpsd_feature\litept_v1m4"
+feature_output_dir = r"E:\data\云南\hpsd_feature\litept_v1m4_multilevel"
 grid_size = 0.5  # 训练体素及测试 fragment 划分使用相同空间分辨率
 feature_keys = ("coord", "intensity", "echo")  # 3 + 1 + 2 = 6 维
 in_channels = 6
@@ -14,8 +14,8 @@ in_channels = 6
 # -------------------------------------------------------
 # 1. Checkpoint 与运行控制
 # -------------------------------------------------------
-save_path = "exp/hubei/hpsd/pretrain-litept-v1m4-native1024"
-weight = "exp/hubei/hpsd/pretrain-litept-v1m4-native1024/model/model_last.pth"
+save_path = "exp/hubei/hpsd/pretrain-litept-v1m4-multilevel-native1024"
+weight = "exp/hubei/hpsd/pretrain-litept-v1m4-multilevel-native1024/model/model_last.pth"
 resume = False
 evaluate = False  # HPSD 预训练没有语义标签验证集，不构建 data.val
 test_only = False
@@ -82,9 +82,10 @@ test = dict(type="HPSDFeatureTester", verbose=True)
 # -------------------------------------------------------
 # 5. HPSD 测试特征导出
 # -------------------------------------------------------
-# projected：导出 student_projector 后、与 DINO 对齐的原生 1024 维特征；
-# backbone：导出 distill_level 及更深层融合后的低维三维特征。
+# projected：导出 feature_level 对应 projector 的 1024 维特征；
+# backbone：导出 feature_level 对应 encoder 层的原生三维特征。
 feature_source = "projected"
+feature_level = 2  # 导出 level 2 的 projector/backbone 特征
 feature_dtype = "float16"  # Safetensors 输出类型，仅支持 float16/float32
 normalize_feature = True  # fragment 合并后再次执行 L2 归一化
 feature_aggregate_on_gpu = False  # GPU index_add 更快，但会占用 N*C*4 字节
@@ -95,8 +96,10 @@ feature_overwrite = False
 # -------------------------------------------------------
 model = dict(
     type="HPSD-v1m1",
-    # Encoder 层级从 0 开始；level 2 在尺度与显存之间取得折中。
-    distill_level=2,
+    # level 2/3/4 分别建立 TokenPatchEdges、聚合 patch 并计算独立 loss。
+    distill_levels=(False, False, True, True, True),
+    # 深层 token 覆盖更多影像 patch，递减权重可减弱粗粒度语义平滑。
+    distill_loss_weights=(0.0, 0.0, 1.0, 0.5, 0.25),
     # 必须与 backbone enc_channels 完全一致，用于检查层级输出并确定融合维数。
     level_channels=(36, 72, 144, 252, 504),
     # 保持 DINOv3 ViT-L 原生通道，不预先使用 PCA 压缩 teacher。
@@ -107,11 +110,7 @@ model = dict(
     sample_balanced=True,
     # correspondence 由离线工具确定性生成；关闭逐步越界检查以减少同步开销。
     validate_mapping=False,
-    # 将 level 3/4 特征 up-cast 到 level 2 后拼接，确保深层 encoder 获得梯度。
-    fuse_deeper_features=True,
-    # LayerNorm + 两层轻量 MLP 比单层 Linear 具有更强的跨模态非线性映射能力；
-    # projector 只作用于聚合后的有效 patch，不会创建逐点 1024 维训练张量。
-    projector_type="mlp",
+    # 每个启用层都有独立 MLP，仅作用于聚合后的有效 patch。
     projector_hidden_channels=1024,
     backbone=dict(
         type="LitePT-v1m4",

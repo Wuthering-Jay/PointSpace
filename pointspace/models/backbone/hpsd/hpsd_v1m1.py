@@ -8,7 +8,7 @@
 ``N``
     当前 batch 的输入点数。
 ``T``
-    ``distill_level`` 层的三维 token 数，通常远小于 ``N``。
+    当前蒸馏层的三维 token 数，通常远小于 ``N``。
 ``P``
     batch 内全部 DINO patch 数，特征 ``dino_feature`` 的形状为 ``[P,Cd]``。
 ``E``
@@ -16,7 +16,7 @@
 ``U``
     当前 batch 中实际获得点云监督的 DINO patch 数，``U <= P``。
 ``C3``
-    目标层及更深层融合后的三维通道数。
+    当前蒸馏层的三维通道数。
 ``Cd``
     DINO teacher 通道数，当前默认保持原生 1024 维。
 
@@ -111,7 +111,7 @@ def aggregate_tokens_to_patches(token_feat, edges, edge_weight="sqrt_count"):
     """在低维三维特征空间内，把多条 token 边聚合到被引用 patch。
 
     Args:
-        token_feat: ``[T,C3]``，目标层融合后的 token 特征。
+        token_feat: ``[T,C3]``，某一 encoder 层的原生 token 特征。
         edges: 去重后的 ``E`` 条 token-patch 边。
         edge_weight: ``uniform`` 为每条边等权；``count`` 按支持点数加权；
             ``sqrt_count`` 按支持点数平方根加权，默认用于减弱高密度区域偏置。
@@ -150,46 +150,19 @@ def aggregate_tokens_to_patches(token_feat, edges, edge_weight="sqrt_count"):
     return patch_feat, used_patch, patch_weight
 
 
-def fuse_hierarchy_features(hierarchy, target_level):
-    """把目标层之后的深层特征 up-cast 到目标层 token 后按通道拼接。
-
-    ``pooling_inverse`` 表示细层 token 属于哪个粗层 token。逐层组合 inverse
-    后，level 3/4 等深层特征可无插值地复制回 level 2 支撑范围。这样保持
-    level 2 的空间尺度，同时保证所有更深 encoder stage 都收到蒸馏梯度。
-    返回形状为 ``[T, sum(level_channels[target_level:])]``。
-    """
-    if target_level < 0 or target_level >= len(hierarchy):
-        raise ValueError(f"Invalid target_level {target_level}")
-    target = hierarchy[target_level].point
-    target_to_level = torch.arange(
-        target.feat.shape[0], device=target.feat.device, dtype=torch.long
-    )
-    features = [target.feat]
-    for level in hierarchy[target_level + 1 :]:
-        child = level.point
-        if "pooling_inverse" not in child.keys():
-            raise RuntimeError(
-                f"Encoder level {level.level} has no pooling_inverse for feature fusion"
-            )
-        target_to_level = child.pooling_inverse.long()[target_to_level]
-        features.append(child.feat[target_to_level])
-    return torch.cat(features, dim=1)
-
-
 @MODELS.register_module("HPSD-v1m1")
 class HierarchicalPatchSetDistiller(nn.Module):
     """将原生 DINO patch teacher 特征蒸馏到 PTV3 或 LitePT。
 
     Args:
         backbone: 支持 ``return_hierarchy=True`` 的 encoder-only 配置。
-        distill_level: 蒸馏层级，0 为输入分辨率，数值越大 token 越稀疏。
+        distill_levels: 各 encoder 层是否独立接受 DINO 蒸馏。
+        distill_loss_weights: 各层蒸馏 loss 权重，未启用层的值被忽略。
         level_channels: 各 encoder level 的通道数，必须与 backbone 一致。
         teacher_channels: DINO teacher 通道数，默认 1024。
         edge_weight: token-patch 聚合权重策略。
         sample_balanced: 是否先在每个样本内平均 patch loss，再对样本平均。
         validate_mapping: 是否在建边时执行同步式范围检查；离线映射可信时可关。
-        fuse_deeper_features: 是否融合目标层之后的全部深层特征。
-        projector_type: student projector 类型，支持 ``mlp`` 和 ``linear``。
         projector_hidden_channels: MLP 中间层通道数。
 
     训练输入除常规 ``coord/grid_coord/feat/offset`` 外，还需要：
@@ -203,113 +176,118 @@ class HierarchicalPatchSetDistiller(nn.Module):
     def __init__(
         self,
         backbone,
-        distill_level=2,
+        distill_levels=(False, False, True, True, True),
+        distill_loss_weights=(0.0, 0.0, 1.0, 0.5, 0.25),
         level_channels=None,
         teacher_channels=1024,
         edge_weight="sqrt_count",
         sample_balanced=True,
         validate_mapping=False,
-        fuse_deeper_features=True,
-        projector_type="mlp",
         projector_hidden_channels=1024,
     ):
         super().__init__()
         self.backbone = build_model(backbone)
-        self.distill_level = int(distill_level)
         self.teacher_channels = int(teacher_channels)
         self.edge_weight = edge_weight
         self.sample_balanced = bool(sample_balanced)
         self.validate_mapping = bool(validate_mapping)
-        self.fuse_deeper_features = bool(fuse_deeper_features)
-        self.projector_type = str(projector_type).lower()
         self.projector_hidden_channels = int(projector_hidden_channels)
 
-        if self.distill_level < 0:
-            raise ValueError("distill_level must be non-negative")
         if level_channels is None:
             raise ValueError("level_channels is required")
         self.level_channels = tuple(int(channel) for channel in level_channels)
-        if self.distill_level >= len(self.level_channels):
+        self.distill_levels = tuple(bool(enabled) for enabled in distill_levels)
+        self.distill_loss_weights = tuple(
+            float(weight) for weight in distill_loss_weights
+        )
+        if len(self.distill_levels) != len(self.level_channels):
             raise ValueError(
-                f"distill_level={self.distill_level} is outside "
-                f"level_channels with {len(self.level_channels)} levels"
+                "distill_levels and level_channels must have the same length"
             )
+        if len(self.distill_loss_weights) != len(self.level_channels):
+            raise ValueError(
+                "distill_loss_weights and level_channels must have the same length"
+            )
+        self.active_levels = tuple(
+            level for level, enabled in enumerate(self.distill_levels) if enabled
+        )
+        if not self.active_levels:
+            raise ValueError("At least one distill level must be enabled")
+        if any(weight < 0 for weight in self.distill_loss_weights):
+            raise ValueError("distill_loss_weights must be non-negative")
+        if any(self.distill_loss_weights[level] <= 0 for level in self.active_levels):
+            raise ValueError("Enabled distill levels must have positive loss weights")
         if self.teacher_channels <= 0:
             raise ValueError("teacher_channels must be positive")
         if edge_weight not in {"uniform", "count", "sqrt_count"}:
             raise ValueError("edge_weight must be one of 'uniform', 'count', or 'sqrt_count'")
-        if self.projector_type not in {"linear", "mlp"}:
-            raise ValueError("projector_type must be either 'linear' or 'mlp'")
         if self.projector_hidden_channels <= 0:
             raise ValueError("projector_hidden_channels must be positive")
 
-        # 先在 C3 空间聚合、后投影到 Cd，可避免在每条边或每个点上创建
-        # 1024 维中间特征；Linear/MLP 均完整保留 DINO 原生输出维度。
-        self.projector_in_channels = (
-            sum(self.level_channels[self.distill_level :])
-            if self.fuse_deeper_features
-            else self.level_channels[self.distill_level]
+        # 每层先在自身 C3 空间聚合到 patch，再独立映射到 Cd，
+        # 避免深层因通道数更多而在 concat 中获得隐式高权重。
+        self.student_projectors = nn.ModuleDict(
+            {
+                str(level): nn.Sequential(
+                    nn.LayerNorm(self.level_channels[level]),
+                    nn.Linear(
+                        self.level_channels[level],
+                        self.projector_hidden_channels,
+                    ),
+                    nn.GELU(),
+                    nn.Linear(
+                        self.projector_hidden_channels, self.teacher_channels
+                    ),
+                )
+                for level in self.active_levels
+            }
         )
-        if self.projector_type == "mlp":
-            # LayerNorm 先统一多层级拼接特征的尺度，再通过一个
-            # 轻量非线性映射头对齐 DINO 空间。projector 只作用于
-            # U 个有效 patch，不会产生逐点 [N,1024] 训练张量。
-            self.student_projector = nn.Sequential(
-                nn.LayerNorm(self.projector_in_channels),
-                nn.Linear(
-                    self.projector_in_channels,
-                    self.projector_hidden_channels,
-                ),
-                nn.GELU(),
-                nn.Linear(self.projector_hidden_channels, self.teacher_channels),
-            )
-        else:
-            self.student_projector = nn.Linear(
-                self.projector_in_channels, self.teacher_channels
-            )
 
     def _encode(self, input_dict):
-        """运行 backbone，并返回目标层以及用于蒸馏的融合 token 特征。"""
+        """运行 backbone，并校验所有已启用蒸馏层。"""
         point, hierarchy = self.backbone(input_dict, return_hierarchy=True)
-        if self.distill_level >= len(hierarchy):
+        if len(hierarchy) != len(self.level_channels):
             raise ValueError(
                 f"Backbone returned {len(hierarchy)} levels, but "
-                f"distill_level={self.distill_level} was requested"
+                f"{len(self.level_channels)} were configured"
             )
-        level = hierarchy[self.distill_level]
-        level_feat = level.point.feat
-        expected_channels = self.level_channels[self.distill_level]
-        if level_feat.ndim != 2 or level_feat.shape[1] != expected_channels:
-            raise ValueError(
-                f"Encoder level {self.distill_level} feature shape "
-                f"{tuple(level_feat.shape)} does not match configured channels "
-                f"{expected_channels}"
-            )
-        distill_feat = (
-            fuse_hierarchy_features(hierarchy, self.distill_level)
-            if self.fuse_deeper_features
-            else level_feat
-        )
-        if distill_feat.shape[1] != self.projector_in_channels:
-            raise ValueError(
-                f"Fused encoder feature has {distill_feat.shape[1]} channels, "
-                f"but projector expects {self.projector_in_channels}"
-            )
-        return point, hierarchy, level, distill_feat
+        for level_index in self.active_levels:
+            level_feat = hierarchy[level_index].point.feat
+            expected_channels = self.level_channels[level_index]
+            if level_feat.ndim != 2 or level_feat.shape[1] != expected_channels:
+                raise ValueError(
+                    f"Encoder level {level_index} feature shape "
+                    f"{tuple(level_feat.shape)} does not match configured channels "
+                    f"{expected_channels}"
+                )
+        return point, hierarchy
 
-    def extract_point_feature(self, input_dict, feature_source="projected", normalize=True):
+    def extract_point_feature(
+        self,
+        input_dict,
+        feature_source="projected",
+        feature_level=2,
+        normalize=True,
+    ):
         """按当前 fragment 的 backbone 输入点顺序返回逐点特征。
 
-        ``projected`` 导出 DINO 对齐的 ``[N,Cd]`` 特征；``backbone`` 导出融合
-        后的 ``[N,C3]`` 特征。投影只在 ``T`` 个 token 上执行，然后通过
-        ``input_to_level`` gather 到点，从而避免重复执行 Linear。这里的 N 是
+        ``projected`` 导出指定层的 DINO 对齐 ``[N,Cd]`` 特征；
+        ``backbone`` 导出该层原生 ``[N,C3]`` 特征。投影只在 ``T``
+        个 token 上执行，然后通过 ``input_to_level`` gather 到点。这里的 N 是
         当前 fragment 点数，整张 tile 的原序合并由 tester 完成。
         """
-        _, _, level, distill_feat = self._encode(input_dict)
+        feature_level = int(feature_level)
+        if feature_level not in self.active_levels:
+            raise ValueError(
+                f"feature_level={feature_level} is not enabled by distill_levels"
+            )
+        _, hierarchy = self._encode(input_dict)
+        level = hierarchy[feature_level]
+        level_feat = level.point.feat
         if feature_source == "projected":
-            token_feature = self.student_projector(distill_feat)
+            token_feature = self.student_projectors[str(feature_level)](level_feat)
         elif feature_source == "backbone":
-            token_feature = distill_feat
+            token_feature = level_feat
         else:
             raise ValueError("feature_source must be 'projected' or 'backbone'")
         point_feature = token_feature[level.input_to_level]
@@ -341,6 +319,7 @@ class HierarchicalPatchSetDistiller(nn.Module):
         return_point=False,
         return_point_feature=False,
         feature_source="projected",
+        feature_level=2,
         normalize_feature=True,
     ):
         """根据 ``return_point_feature`` 在训练蒸馏和测试导出路径间切换。
@@ -354,6 +333,7 @@ class HierarchicalPatchSetDistiller(nn.Module):
                 "point_feature": self.extract_point_feature(
                     input_dict,
                     feature_source=feature_source,
+                    feature_level=feature_level,
                     normalize=normalize_feature,
                 )
             }
@@ -363,8 +343,7 @@ class HierarchicalPatchSetDistiller(nn.Module):
         if missing:
             raise KeyError(f"HPSD input is missing fields: {sorted(missing)}")
 
-        point, hierarchy, level, distill_feat = self._encode(input_dict)
-        level_feat = level.point.feat
+        point, hierarchy = self._encode(input_dict)
         dino_feature = input_dict["dino_feature"]
         if dino_feature.ndim != 2 or dino_feature.shape[1] != self.teacher_channels:
             raise ValueError(
@@ -372,46 +351,66 @@ class HierarchicalPatchSetDistiller(nn.Module):
                 f"{tuple(dino_feature.shape)}"
             )
 
-        # 逐点 correspondence 在目标层被折叠为稀疏 token-patch 图。
-        edges = build_token_patch_edges(
-            input_to_level=level.input_to_level,
-            patch_index=input_dict["dino_patch_index"],
-            valid=input_dict["dino_valid"],
-            num_tokens=level_feat.shape[0],
-            num_patches=dino_feature.shape[0],
-            validate_mapping=self.validate_mapping,
+        # 各层独立建立 token-patch 图、聚合和映射。各层共享同一
+        # teacher，但不共享 projector，因而每层都必须单独学会对齐。
+        teacher = F.normalize(dino_feature.float(), dim=-1)
+        weighted_losses = []
+        result = {}
+        total_weight = sum(
+            self.distill_loss_weights[level] for level in self.active_levels
         )
-        patch_feat, used_patch, _ = aggregate_tokens_to_patches(
-            distill_feat, edges, edge_weight=self.edge_weight
-        )
+        for level_index in self.active_levels:
+            level = hierarchy[level_index]
+            level_feat = level.point.feat
+            edges = build_token_patch_edges(
+                input_to_level=level.input_to_level,
+                patch_index=input_dict["dino_patch_index"],
+                valid=input_dict["dino_valid"],
+                num_tokens=level_feat.shape[0],
+                num_patches=dino_feature.shape[0],
+                validate_mapping=self.validate_mapping,
+            )
+            patch_feat, used_patch, _ = aggregate_tokens_to_patches(
+                level_feat, edges, edge_weight=self.edge_weight
+            )
+            projector = self.student_projectors[str(level_index)]
 
-        if patch_feat.shape[0] == 0:
-            # 零监督 batch 仍让 loss 与 backbone/projector 计算图相连，避免 DDP
-            # 将参数误判为 unused，同时不会产生 NaN。
-            patch_pred = self.student_projector(distill_feat[:0])
-            patch_loss = patch_pred.float().sum() * 0.0
-            loss = patch_loss
-        else:
-            # 只为 U 个 used patch 生成原生 1024 维 prediction。
-            patch_pred = self.student_projector(patch_feat)
-            student = F.normalize(patch_pred.float(), dim=-1)
-            teacher = F.normalize(dino_feature[used_patch].float(), dim=-1)
-            loss_per_patch = 1.0 - torch.sum(student * teacher, dim=-1)
-            if self.sample_balanced:
-                loss = self._sample_balanced_mean(
-                    loss_per_patch, used_patch, input_dict["dino_offset"]
-                )
+            if patch_feat.shape[0] == 0:
+                # 零监督 batch 仍让每层 projector 与对应 backbone stage
+                # 连入计算图，避免 DDP 将其误判为 unused parameter。
+                patch_pred = projector(level_feat[:0])
+                level_loss = patch_pred.float().sum() * 0.0
             else:
-                loss = loss_per_patch.mean()
-            patch_loss = loss
+                patch_pred = projector(patch_feat)
+                student = F.normalize(patch_pred.float(), dim=-1)
+                loss_per_patch = 1.0 - torch.sum(
+                    student * teacher[used_patch], dim=-1
+                )
+                if self.sample_balanced:
+                    level_loss = self._sample_balanced_mean(
+                        loss_per_patch, used_patch, input_dict["dino_offset"]
+                    )
+                else:
+                    level_loss = loss_per_patch.mean()
 
-        result = {
-            "loss": loss,
-            "patch_loss": patch_loss,
-            "hpsd_num_tokens": level_feat.new_tensor(level_feat.shape[0]),
-            "hpsd_num_edges": level_feat.new_tensor(edges.num_edges),
-            "hpsd_num_patches": level_feat.new_tensor(used_patch.shape[0]),
-        }
+            weight = self.distill_loss_weights[level_index]
+            weighted_losses.append(level_loss * weight)
+            # 分层指标用于观察粗细尺度的收敛差异；训练器只使用
+            # result["loss"] 反向，不会重复累加这些日志值。
+            result[f"hpsd_level_{level_index}_loss"] = level_loss.detach()
+            result[f"hpsd_level_{level_index}_tokens"] = level_feat.new_tensor(
+                level_feat.shape[0]
+            )
+            result[f"hpsd_level_{level_index}_edges"] = level_feat.new_tensor(
+                edges.num_edges
+            )
+            result[f"hpsd_level_{level_index}_patches"] = level_feat.new_tensor(
+                used_patch.shape[0]
+            )
+
+        loss = torch.stack(weighted_losses).sum() / total_weight
+        result["loss"] = loss
+        result["patch_loss"] = loss.detach()
         if return_point:
             result["point"] = point
             result["hierarchy"] = hierarchy

@@ -93,50 +93,30 @@ HPSD-v1m1
 - 每条边的支持点计数；
 - `uniform/count/sqrt_count` 三种边权；
 - patch-centric 三维特征聚合；
-- 深层 encoder 特征 up-cast；
-- 原生 1024 维 student projector；
+- 多 encoder 层独立 token-patch 蒸馏；
+- 每层独立的原生 1024 维 student MLP projector；
 - float32 normalized cosine loss；
 - 每个样本等权的 patch loss；
 - 空监督 batch 安全 backward；
 - token、edge、used patch 数量日志。
 
-## 3. 深层特征融合修正
+## 3. Multi-level HPSD
 
-如果只取 level 2 的原始特征计算 loss，那么 level 3 和 level 4 位于 loss
-之后，不会获得梯度，下游所需的深层 encoder 也不会被预训练。因此当前
-实现并非简单执行：
-
-```python
-project(level2.feat)
-```
-
-而是把 level 2 到 bottleneck 的特征逐级映射回 level 2 token：
+旧实现将 level 3/4 up-cast 到 level 2 后按通道 concat。由于深层
+通道数更多，单一 projector 可能隐式依赖最深层特征。当前实现改为
+level 2/3/4 独立建边、聚合、MLP 投影和 cosine loss：
 
 ```python
-fused_level2 = concat(
-    level2.feat,
-    upcast(level3.feat),
-    upcast(level4.feat),
-)
+distill_levels = (False, False, True, True, True)
+distill_loss_weights = (0.0, 0.0, 1.0, 0.5, 0.25)
+loss = (1.0 * loss_l2 + 0.5 * loss_l3 + 0.25 * loss_l4) / 1.75
 ```
 
-随后才执行 patch aggregation 和 student projection。
-
-这样空间监督单位仍然是 level 2 token，但投影输入包含所有深层 encoder
-语义。真实 forward/backward 已确认 PTV3 和 LitePT 的 level 0–4 均获得
-非零有限梯度。
-
-正式配置中 projector 输入维度为：
-
-| Backbone | level 2 后融合通道 | Projector |
-| --- | ---: | ---: |
-| LitePT | `144+252+504=900` | `LN(900) -> Linear(900,1024) -> GELU -> Linear(1024,1024)` |
-| PTV3 | `144+288+576=1008` | `LN(1008) -> Linear(1008,1024) -> GELU -> Linear(1024,1024)` |
-
-默认采用轻量 MLP projector，参数量分别约为 197.4 万和 208.5 万。相较
-单层 Linear 约增加 105 万参数，但 projector 只作用于聚合后的 `U` 个有效
-patch，因此不会重新引入逐点 1024 维激活。`projector_type="linear"` 仍可用于
-旧 checkpoint 兼容和线性映射消融。
+较深 token 覆盖更多影像 patch，因此使用递减权重抑制粗粒度语义
+平滑对局部对齐的干扰。同时 level 4 loss 保证最深 encoder stage
+仍能获得蒸馏梯度。每层 projector 都是
+`LayerNorm(C3) -> Linear(C3,1024) -> GELU -> Linear(1024,1024)`，且仅作用于
+聚合后的有效 patch，不会创建逐点 `[N,1024]` 训练张量。
 
 ## 4. Token-Patch 关系算法
 
@@ -166,7 +146,7 @@ weight = sqrt(point_count)
 三维特征先在低维 backbone channel 空间聚合：
 
 ```python
-patch_feat = weighted_mean(fused_token_feat[edge_token], edge_patch)
+patch_feat = weighted_mean(level_token_feat[edge_token], edge_patch)
 patch_pred = MLP(patch_feat)  # [U, 1024]
 ```
 
@@ -241,10 +221,11 @@ configs/hpsd/pretrain-hpsd-ptv3-v3m4-hubei.py
 - `LasImageDataset`；
 - `coord + intensity + echo`，共 6 维输入；
 - `grid_size=0.5`；
-- `distill_level=2`；
+- `distill_levels=(False,False,True,True,True)`；
+- `distill_loss_weights=(0,0,1.0,0.5,0.25)`；
 - 原生 DINO-1024；
 - `sqrt_count`；
-- deep feature fusion；
+- 分层独立 MLP projector 与 loss；
 - bfloat16 AMP；
 - micro-batch 1；
 - gradient accumulation 4；
@@ -262,7 +243,7 @@ grid 等字段，为后续 relation-aware edge decoder 提供数据基础。
 结果：
 
 ```text
-7 passed
+8 passed
 ```
 
 覆盖：
@@ -272,101 +253,37 @@ grid 等字段，为后续 relation-aware edge decoder 提供数据基础。
 - sqrt-count 聚合和梯度；
 - 空关系；
 - 样本平衡 loss；
-- hierarchy deeper feature fusion；
+- multi-level 独立 projector/loss 与全层梯度；
 - DINO patch compaction；
 - compaction 前后 loss 一致性。
 
-### 8.2 Tiny backbone GPU smoke test
+### 8.2 正式配置构建
 
-PTV3：
+LitePT 和 PTv3 两份完整配置均成功构建为 level 2/3/4 multi-level
+HPSD。三个 projector 的总参数分别为 4,075,272 和 4,186,080。
 
-```text
-levels: 256 -> 249 -> 232
-edges: 217
-used patches: 40
-loss: 0.9973
-peak allocated: 20.25 MiB
-forward/backward: passed
-```
+### 8.3 真实数据 Multi-level GPU 测试
 
-LitePT：
+使用湖北真实 tile、LitePT-v1m4、bfloat16 AMP 进行完整
+forward/backward：
 
 ```text
-levels: 256 -> 254 -> 215
-edges: 219
-used patches: 40
-loss: 1.0014
-peak allocated: 19.24 MiB
-forward/backward: passed
+input points: 94,480
+compacted DINO patches: 7,806
+level 2/3/4 loss: 1.0000 / 1.0095 / 0.9903
+weighted loss: 1.0013
+forward/backward: 2.879 s
+peak allocated delta: 1,155.17 MiB
+level 0-4 gradients: all finite and non-zero
+level 2/3/4 projector gradients: all finite
 ```
 
-### 8.3 真实数据 4096 点完整模型
+显存数据不包含完整 Trainer 中的 AdamW 状态和 DDP bucket，但已证明
+多层独立建边与原生 DINO-1024 可以在当前硬件上完成训练。
 
-LitePT 正式模型：
-
-```text
-points: 4096
-compacted DINO: [359,1024]
-edges: 637
-loss: 0.9991
-projector: [1024,900]
-level 0-4 gradients: all valid
-peak allocated: 141.92 MiB
-```
-
-PTV3 正式模型：
-
-```text
-points: 4096
-compacted DINO: [359,1024]
-edges: 728
-loss: 0.9997
-projector: [1024,1008]
-level 0-4 gradients: all valid
-peak allocated: 459.22 MiB
-```
-
-### 8.4 真实数据 60,000 点原生 1024 维
-
-同一真实 tile、bfloat16 AMP、完整 backbone forward/backward：
-
-| Backbone | 输入点 | 有效点 | Patch | Edge | 峰值 allocated | 单步时间 |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| LitePT-v1m4 | 60,000 | 14,194 | 4,549 | 7,907 | 699 MiB | 9.40 s |
-| PT-v3m4 | 60,000 | 14,194 | 4,549 | 7,907 | 1,446 MiB | 1.91 s |
-
-时间数据来自单次进程内测试，包含首次 kernel/cache 状态，不应用于两种
-backbone 的严格速度排名。显存数据是 PyTorch `max_memory_allocated`，包含
-模型和 forward/backward 激活，但不包含完整 Trainer 下 AdamW 状态、DDP
-bucket 和外部 CUDA reservation。
-
-当前结果表明原生 1024 维 HPSD 本身没有形成明显显存瓶颈，因此暂不启动
-PCA 降维。正式训练初始配置仍保守使用 micro-batch 1；后续可根据完整训练
-时的显存余量逐步提高 micro-batch，而不需要先牺牲教师特征维数。
-
-### 8.5 正式 Trainer 训练闭环
-
-使用 LitePT 正式配置和两个真实 tile，执行一个 epoch、两个 iteration；
-micro-batch 为 1，`gradient_accumulation_steps=2`，因此恰好完成一次 AdamW
-更新。训练继续使用 bfloat16 AMP 和原生 1024 维 DINO 特征。
-
-```text
-samples: 2
-micro-batch: 1
-gradient accumulation: 2
-student projector max parameter update: 1.0058284e-07
-optimizer state entries: 169
-checkpoint epoch: 1
-checkpoint size: 153.12 MiB
-peak allocated CUDA memory: 774.28 MiB
-strict model reload: passed
-```
-
-这里的 774.28 MiB 已包含一次 AdamW 更新后创建的优化器状态，相比仅做
-forward/backward 的 699 MiB 更接近正式训练占用，但仍不包含 DDP bucket。
-测试还确认梯度累计计数在两步后归零、投影层参数确实发生变化、checkpoint
-中保存了非空 optimizer/scheduler/AMP 状态，且模型权重能够 `strict=True`
-完整回载。由此可以确认现阶段保留 DINO-1024 是合理选择。
+PTv3-v3m4 使用 60,000 点、4,521 个 patch 完成同样测试，加权
+loss 为 0.9758，前向反向耗时 3.045 s，峰值 allocated 增量为
+1,362.82 MiB；三个 projector 与 encoder level 0–4 梯度均有限非零。
 
 ## 9. Checkpoint 迁移测试
 
@@ -432,7 +349,7 @@ python tools/test.py --config-file configs/hpsd/pretrain-hpsd-litept-v1m4-hubei.
 推理；每个 fragment 的输出利用 `index` 写回原始点位置，重复出现的点取
 特征均值，最后再次归一化。输出是同名 Safetensors，主张量为
 `feature: [N,C]`。默认 `feature_source="projected"`，因此 `C=1024`；也可
-设置为 `backbone` 导出 level 2 融合后的低维 backbone 特征。
+设置为 `backbone` 导出 `feature_level` 指定层的原生低维 backbone 特征。
 
 真实 tile 测试包含 135,441 个原始点，GridSample 生成 8 个 fragment；使用
 fragment batch 4 后成功恢复并写出 `[135441,1024]`，没有遗漏点。随后通过
