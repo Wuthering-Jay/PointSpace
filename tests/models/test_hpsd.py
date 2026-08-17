@@ -10,38 +10,33 @@ from pointspace.models.backbone.hpsd.hpsd_v1m1 import (
     HierarchicalPatchSetDistiller,
     aggregate_tokens_to_patches,
     build_token_patch_edges,
+    fuse_hierarchy_features,
 )
 
 
-def test_fusion_adapter_and_projector_forward_and_backward(monkeypatch):
+def test_concat_mlp_projector_forward_and_backward(monkeypatch):
     monkeypatch.setattr(hpsd_v1m1, "build_model", lambda config: nn.Identity())
 
     model = HierarchicalPatchSetDistiller(
         backbone={},
-        fusion_levels=(True,),
-        fusion_channels=20,
-        level_weight_init=(1.0,),
-        level_weight_floor=0.0,
+        distill_level=0,
         level_channels=(12,),
         teacher_channels=16,
+        projector_hidden_channels=20,
     )
-    assert model.active_levels == (0,)
-    assert model.fusion_level == 0
-    adapted = model.level_adapters["0"](torch.randn(7, 12, requires_grad=True))
-    prediction = model.student_projector(adapted)
+    assert model.projector_in_channels == 12
+    prediction = model.student_projector(
+        torch.randn(7, 12, requires_grad=True)
+    )
     assert prediction.shape == (7, 16)
     prediction.square().mean().backward()
-    assert all(
-        parameter.grad is not None
-        for parameter in model.level_adapters.parameters()
-    )
     assert all(
         parameter.grad is not None
         for parameter in model.student_projector.parameters()
     )
 
 
-def test_weighted_hierarchy_fusion_has_single_loss_and_full_gradients(monkeypatch):
+def test_hierarchy_concat_has_single_loss_and_full_gradients(monkeypatch):
     class DummyBackbone(nn.Module):
         def __init__(self):
             super().__init__()
@@ -84,12 +79,11 @@ def test_weighted_hierarchy_fusion_has_single_loss_and_full_gradients(monkeypatc
     monkeypatch.setattr(hpsd_v1m1, "build_model", lambda config: config)
     model = HierarchicalPatchSetDistiller(
         backbone=backbone,
-        fusion_levels=(True, True, True),
-        fusion_channels=12,
-        level_weight_init=(1.0, 0.5, 0.25),
-        level_weight_floor=0.05,
+        distill_level=0,
         level_channels=(4, 6, 8),
         teacher_channels=10,
+        fuse_deeper_features=True,
+        projector_hidden_channels=12,
     )
     input_dict = dict(
         dino_feature=torch.randn(3, 10),
@@ -99,19 +93,11 @@ def test_weighted_hierarchy_fusion_has_single_loss_and_full_gradients(monkeypatc
     )
     result = model(input_dict)
     assert torch.isfinite(result["loss"])
-    weights = model.get_level_weights()
-    assert torch.allclose(weights.sum(), torch.tensor(1.0))
-    assert torch.all(weights >= 0.05)
     assert {"loss", "tok", "edge", "patch"}.issubset(result)
     assert "patch_loss" not in result
-    assert all(f"w{level}" in result for level in range(3))
+    assert not any(key.startswith("w") for key in result)
     result["loss"].backward()
     assert all(feature.grad is not None for feature in backbone.features)
-    assert all(
-        parameter.grad is not None
-        for parameter in model.level_adapters.parameters()
-    )
-    assert model.level_weight_logits.grad is not None
     assert all(
         parameter.grad is not None
         for parameter in model.student_projector.parameters()
@@ -121,26 +107,11 @@ def test_weighted_hierarchy_fusion_has_single_loss_and_full_gradients(monkeypatc
     ).shape == (6, 10)
     assert model.extract_point_feature(
         input_dict, feature_source="backbone"
-    ).shape == (6, 12)
+    ).shape == (6, 18)
     with torch.no_grad():
-        _, hierarchy = model._encode(input_dict)
-        reference, fused, _ = model._fuse_hierarchy_features(hierarchy)
-        edges = build_token_patch_edges(
-            reference.input_to_level,
-            input_dict["dino_patch_index"],
-            input_dict["dino_valid"],
-            num_tokens=fused.shape[0],
-            num_patches=input_dict["dino_feature"].shape[0],
-        )
-        fused_patch, _, _ = aggregate_tokens_to_patches(fused, edges)
-        projected_patch, _, _ = aggregate_tokens_to_patches(
-            model.student_projector(fused), edges
-        )
-        # 最终 projector 为线性层，因此训练时先聚合后投影
-        # 与测试时先投影 token 再 gather 保持同一映射语义。
-        assert torch.allclose(
-            model.student_projector(fused_patch), projected_patch, atol=1e-6
-        )
+        _, hierarchy, _, distill_feat = model._encode(input_dict)
+        assert torch.equal(distill_feat, fuse_hierarchy_features(hierarchy, 0))
+        assert distill_feat.shape == (6, 18)
 
     model.zero_grad(set_to_none=True)
     empty_input = dict(input_dict)
@@ -149,11 +120,7 @@ def test_weighted_hierarchy_fusion_has_single_loss_and_full_gradients(monkeypatc
     empty_result = model(empty_input)
     assert empty_result["loss"].item() == 0.0
     empty_result["loss"].backward()
-    assert all(
-        parameter.grad is not None
-        for parameter in model.level_adapters.parameters()
-    )
-    assert model.level_weight_logits.grad is not None
+    assert all(feature.grad is not None for feature in backbone.features)
     assert all(
         parameter.grad is not None
         for parameter in model.student_projector.parameters()

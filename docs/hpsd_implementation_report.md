@@ -93,34 +93,32 @@ HPSD-v1m1
 - 每条边的支持点计数；
 - `uniform/count/sqrt_count` 三种边权；
 - patch-centric 三维特征聚合；
-- 多 encoder 层归一化适配和可学习加权融合；
+- 深层 encoder 特征 up-cast 与通道 concat；
 - 一次 token-patch 建边和原生 1024 维 student projection；
 - float32 normalized cosine loss；
 - 每个样本等权的 patch loss；
 - 空监督 batch 安全 backward；
 - token、edge、used patch 数量日志。
 
-## 3. Hierarchical Weighted Fusion HPSD
+## 3. Hierarchical Concat HPSD
 
-旧实现将 level 3/4 up-cast 到 level 2 后按通道 concat。由于深层
-通道数更多，单一 projector 可能隐式依赖最深层特征。独立
-multi-level loss 又需要为每层保留 1024 维 prediction 和 loss 计算图。
-当前实现改为低维层级融合后只计算一次 DINO loss：
+如果只取 level 2 的原始特征计算 loss，level 3 和 level 4 位于 loss
+之后，无法获得蒸馏梯度。当前实现以 `distill_level=2` 为监督尺度，
+将更深层特征通过 `pooling_inverse` 精确对齐回 level 2 token：
 
 ```python
-fusion_levels = (False, False, True, True, True)
-fusion_channels = 512
-level_weight_init = (0.0, 0.0, 1.0, 0.5, 0.25)
-level_weight_floor = 0.05
+fused_level2 = concat(
+    level2.feat,
+    upcast(level3.feat),
+    upcast(level4.feat),
+)
 ```
 
-`fusion_levels` 的第一个 True 自动作为参考层，因此当前自动推断为
-level 2，不需要独立 `fusion_level`。每层经
-`LayerNorm(C3) -> Linear(C3,512) -> GELU -> L2 normalize`，深层特征
-再根据 `pooling_inverse` 精确复制回 level 2 token。层级 logits 通过
-softmax 和 0.05 权重下限得到归一化权重，加权和再次归一化后形成
-`[T2,512]` 融合特征。该特征只建一次 TokenPatchEdges，聚合后经
-`Linear(512,1024)` 与 DINO teacher 计算一次 cosine loss。
+空间监督单位仍是 level 2 token，但 projector 输入同时包含 level 2/3/4
+语义。LitePT 的 concat 通道数为 `144+252+504=900`，PTv3 为
+`144+288+576=1008`。聚合后的有效 patch 经过
+`LayerNorm -> Linear(C3,1024) -> GELU -> Linear(1024,1024)`，与 DINO
+teacher 计算一次 cosine loss；projector 不作用于逐点特征。
 
 ## 4. Token-Patch 关系算法
 
@@ -225,12 +223,11 @@ configs/hpsd/pretrain-hpsd-ptv3-v3m4-hubei.py
 - `LasImageDataset`；
 - `coord + intensity + echo`，共 6 维输入；
 - `grid_size=0.5`；
-- `fusion_levels=(False,False,True,True,True)`；
-- `fusion_channels=512`；
-- 可学习层级权重与 0.05 下限；
+- `distill_level=2`；
+- level 2/3/4 特征对齐 concat；
 - 原生 DINO-1024；
 - `sqrt_count`；
-- 低维层级融合与单次 DINO-1024 loss；
+- concat 层级表示与单次 DINO-1024 loss；
 - bfloat16 AMP；
 - micro-batch 1；
 - gradient accumulation 4；
@@ -258,42 +255,33 @@ grid 等字段，为后续 relation-aware edge decoder 提供数据基础。
 - sqrt-count 聚合和梯度；
 - 空关系；
 - 样本平衡 loss；
-- 可学习层级融合、单次 loss 与全层梯度；
+- hierarchy concat、单次 loss 与全层梯度；
 - DINO patch compaction；
 - compaction 前后 loss 一致性。
 
 ### 8.2 正式配置构建
 
-LitePT 和 PTv3 两份完整配置均成功构建为 level 2/3/4
-weighted-fusion HPSD。融合 adapter、权重和最终 projector 的总参数
-分别为 989,451 和 1,044,963。
+LitePT 和 PTv3 两份完整配置均使用 level 2/3/4 concat HPSD，projector
+输入维数分别为 900 和 1008，并完整保留 DINO 1024 维输出。
 
-### 8.3 真实数据 Weighted-fusion GPU 测试
+### 8.3 真实数据 Concat GPU 测试
 
 使用湖北真实 tile、LitePT-v1m4、bfloat16 AMP 进行完整
 forward/backward：
 
 ```text
-input points: 94,480
-compacted DINO patches: 7,806
-inferred fusion level: 2
-initial effective weights: 0.5357 / 0.2929 / 0.1714
-single DINO loss: 0.9960
-forward/backward: 4.052 s
-peak allocated delta: 1,026.49 MiB
+points: 60,000
+valid points: 14,194
+patches: 4,549
+edges: 7,907
+LitePT peak allocated: 699 MiB
+PTv3 peak allocated: 1,446 MiB
 level 0-4 gradients: all finite and non-zero
-level adapters / weight logits / projector gradients: all finite
 ```
 
-显存数据不包含完整 Trainer 中的 AdamW 状态和 DDP bucket，但已证明
-加权融合与原生 DINO-1024 可以在当前硬件上完成训练。与同一
-样本的独立 multi-level loss 版本相比，峰值增量从 1,155.17 MiB 降为
-1,026.49 MiB，减少约 11.1%。
-
-PTv3-v3m4 使用 60,000 点、4,521 个 patch 完成同样测试，加权
-loss 为 1.0250，前向反向耗时 2.966 s，峰值 allocated 增量为
-1,298.81 MiB；adapter、层级权重、projector 与 encoder level 0–4 梯度均
-有限非零。
+这些数据来自此前同一 concat 实现的真实数据 forward/backward 验证。
+显存数据不包含完整 Trainer 中的 AdamW 状态和 DDP bucket，但已证明 concat
+与原生 DINO-1024 可以完成训练，并且深层 encoder 能收到有效梯度。
 
 ## 9. Checkpoint 迁移测试
 

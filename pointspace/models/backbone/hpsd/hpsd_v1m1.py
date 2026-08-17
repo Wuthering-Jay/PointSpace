@@ -16,7 +16,7 @@
 ``U``
     当前 batch 中实际获得点云监督的 DINO patch 数，``U <= P``。
 ``C3``
-    当前蒸馏层的三维通道数。
+    目标层及更深层 concat 后的三维通道数。
 ``Cd``
     DINO teacher 通道数，当前默认保持原生 1024 维。
 
@@ -124,7 +124,7 @@ def aggregate_tokens_to_patches(token_feat, edges, edge_weight="sqrt_count"):
     if edges.num_edges == 0:
         return (
             # 保留与 token_feat 的计算图连接，使零监督 batch 也能
-            # 为 backbone 和层级 adapter 生成零梯度。
+            # 为 backbone 和 projector 生成零梯度。
             token_feat[:0],
             edges.patch,
             token_feat.new_empty(0),
@@ -152,21 +152,45 @@ def aggregate_tokens_to_patches(token_feat, edges, edge_weight="sqrt_count"):
     return patch_feat, used_patch, patch_weight
 
 
+def fuse_hierarchy_features(hierarchy, target_level):
+    """把目标层及其后所有深层特征对齐后按通道拼接。
+
+    ``pooling_inverse`` 表示细层 token 所属的下一粗层 token。逐层组合该
+    映射，可将更深层特征无插值地复制回目标层，最终返回形状
+    ``[T, sum(level_channels[target_level:])]`` 的层级表示。
+    """
+    if target_level < 0 or target_level >= len(hierarchy):
+        raise ValueError(f"Invalid target_level {target_level}")
+    target = hierarchy[target_level].point
+    target_to_level = torch.arange(
+        target.feat.shape[0], device=target.feat.device, dtype=torch.long
+    )
+    features = [target.feat]
+    for level in hierarchy[target_level + 1 :]:
+        child = level.point
+        if "pooling_inverse" not in child.keys():
+            raise RuntimeError(
+                f"Encoder level {level.level} has no pooling_inverse for feature fusion"
+            )
+        target_to_level = child.pooling_inverse.long()[target_to_level]
+        features.append(child.feat[target_to_level])
+    return torch.cat(features, dim=1)
+
+
 @MODELS.register_module("HPSD-v1m1")
 class HierarchicalPatchSetDistiller(nn.Module):
     """将原生 DINO patch teacher 特征蒸馏到 PTV3 或 LitePT。
 
     Args:
         backbone: 支持 ``return_hierarchy=True`` 的 encoder-only 配置。
-        fusion_levels: 各 encoder 层是否参与融合，首个 True 自动作为参考层。
-        fusion_channels: 各层适配到的公共通道数。
-        level_weight_init: 可学习层级权重的正数初始值。
-        level_weight_floor: 每个已启用层的最小归一化权重。
+        distill_level: concat 的目标层级，0 为输入分辨率。
         level_channels: 各 encoder level 的通道数，必须与 backbone 一致。
         teacher_channels: DINO teacher 通道数，默认 1024。
         edge_weight: token-patch 聚合权重策略。
         sample_balanced: 是否先在每个样本内平均 patch loss，再对样本平均。
         validate_mapping: 是否在建边时执行同步式范围检查；离线映射可信时可关。
+        fuse_deeper_features: 是否把目标层后的深层特征对齐并 concat。
+        projector_hidden_channels: 轻量 MLP projector 的隐藏通道数。
 
     训练输入除常规 ``coord/grid_coord/feat/offset`` 外，还需要：
 
@@ -179,151 +203,83 @@ class HierarchicalPatchSetDistiller(nn.Module):
     def __init__(
         self,
         backbone,
-        fusion_levels=(False, False, True, True, True),
-        fusion_channels=512,
-        level_weight_init=(0.0, 0.0, 1.0, 0.5, 0.25),
-        level_weight_floor=0.05,
+        distill_level=2,
         level_channels=None,
         teacher_channels=1024,
         edge_weight="sqrt_count",
         sample_balanced=True,
         validate_mapping=False,
+        fuse_deeper_features=True,
+        projector_hidden_channels=1024,
     ):
         super().__init__()
         self.backbone = build_model(backbone)
+        self.distill_level = int(distill_level)
         self.teacher_channels = int(teacher_channels)
         self.edge_weight = edge_weight
         self.sample_balanced = bool(sample_balanced)
         self.validate_mapping = bool(validate_mapping)
-        self.fusion_channels = int(fusion_channels)
-        self.level_weight_floor = float(level_weight_floor)
+        self.fuse_deeper_features = bool(fuse_deeper_features)
+        self.projector_hidden_channels = int(projector_hidden_channels)
 
+        if self.distill_level < 0:
+            raise ValueError("distill_level must be non-negative")
         if level_channels is None:
             raise ValueError("level_channels is required")
         self.level_channels = tuple(int(channel) for channel in level_channels)
-        self.fusion_levels = tuple(bool(enabled) for enabled in fusion_levels)
-        self.level_weight_init = tuple(float(weight) for weight in level_weight_init)
-        if len(self.fusion_levels) != len(self.level_channels):
+        if self.distill_level >= len(self.level_channels):
             raise ValueError(
-                "fusion_levels and level_channels must have the same length"
-            )
-        if len(self.level_weight_init) != len(self.level_channels):
-            raise ValueError(
-                "level_weight_init and level_channels must have the same length"
-            )
-        self.active_levels = tuple(
-            level for level, enabled in enumerate(self.fusion_levels) if enabled
-        )
-        if not self.active_levels:
-            raise ValueError("At least one fusion level must be enabled")
-        self.fusion_level = self.active_levels[0]
-        if any(self.level_weight_init[level] <= 0 for level in self.active_levels):
-            raise ValueError("Enabled fusion levels need positive initial weights")
-        if not 0 <= self.level_weight_floor < 1.0 / len(self.active_levels):
-            raise ValueError(
-                "level_weight_floor must be in [0, 1 / num_active_levels)"
+                f"distill_level={self.distill_level} is outside "
+                f"level_channels with {len(self.level_channels)} levels"
             )
         if self.teacher_channels <= 0:
             raise ValueError("teacher_channels must be positive")
         if edge_weight not in {"uniform", "count", "sqrt_count"}:
             raise ValueError("edge_weight must be one of 'uniform', 'count', or 'sqrt_count'")
-        if self.fusion_channels <= 0:
-            raise ValueError("fusion_channels must be positive")
+        if self.projector_hidden_channels <= 0:
+            raise ValueError("projector_hidden_channels must be positive")
 
-        # 各层只适配到较低的公共维度，然后在参考层 token 空间
-        # 融合。只有融合结果会通过一次 1024 维 student projection。
-        self.level_adapters = nn.ModuleDict(
-            {
-                str(level): nn.Sequential(
-                    nn.LayerNorm(self.level_channels[level]),
-                    nn.Linear(self.level_channels[level], self.fusion_channels),
-                    nn.GELU(),
-                )
-                for level in self.active_levels
-            }
+        self.projector_in_channels = (
+            sum(self.level_channels[self.distill_level :])
+            if self.fuse_deeper_features
+            else self.level_channels[self.distill_level]
         )
-        active_init = torch.tensor(
-            [self.level_weight_init[level] for level in self.active_levels],
-            dtype=torch.float32,
-        )
-        self.level_weight_logits = nn.Parameter(torch.log(active_init))
-        # adapter 已提供非线性，最后的线性层完整保留 DINO-1024。
-        self.student_projector = nn.Linear(
-            self.fusion_channels, self.teacher_channels
+        # 只保留 MLP projector。它仅作用于 U 个有效 patch，而不是全部点。
+        self.student_projector = nn.Sequential(
+            nn.LayerNorm(self.projector_in_channels),
+            nn.Linear(self.projector_in_channels, self.projector_hidden_channels),
+            nn.GELU(),
+            nn.Linear(self.projector_hidden_channels, self.teacher_channels),
         )
 
     def _encode(self, input_dict):
-        """运行 backbone，并校验所有已启用蒸馏层。"""
+        """运行 backbone，并返回目标层及 concat 后的层级特征。"""
         point, hierarchy = self.backbone(input_dict, return_hierarchy=True)
-        if len(hierarchy) != len(self.level_channels):
+        if self.distill_level >= len(hierarchy):
             raise ValueError(
                 f"Backbone returned {len(hierarchy)} levels, but "
-                f"{len(self.level_channels)} were configured"
+                f"distill_level={self.distill_level} was requested"
             )
-        for level_index in self.active_levels:
-            level_feat = hierarchy[level_index].point.feat
-            expected_channels = self.level_channels[level_index]
-            if level_feat.ndim != 2 or level_feat.shape[1] != expected_channels:
-                raise ValueError(
-                    f"Encoder level {level_index} feature shape "
-                    f"{tuple(level_feat.shape)} does not match configured channels "
-                    f"{expected_channels}"
-                )
-        return point, hierarchy
-
-    def get_level_weights(self):
-        """返回按 ``active_levels`` 排列的归一化可学习层级权重。"""
-        probability = torch.softmax(self.level_weight_logits, dim=0)
-        residual = 1.0 - len(self.active_levels) * self.level_weight_floor
-        return self.level_weight_floor + residual * probability
-
-    def _fuse_hierarchy_features(self, hierarchy):
-        """将已启用层适配、归一化并加权融合到首个已启用层。
-
-        ``fusion_levels`` 中第一个 True 是参考层。更深层特征
-        通过逐层 ``pooling_inverse`` 精确映射回参考 token，不做空间
-        插值。返回 ``[T_ref, fusion_channels]`` 和归一化权重。
-        """
-        reference = hierarchy[self.fusion_level]
-        reference_to_level = torch.arange(
-            reference.point.feat.shape[0],
-            device=reference.point.feat.device,
-            dtype=torch.long,
+        level = hierarchy[self.distill_level]
+        level_feat = level.point.feat
+        expected_channels = self.level_channels[self.distill_level]
+        if level_feat.ndim != 2 or level_feat.shape[1] != expected_channels:
+            raise ValueError(
+                f"Encoder level {self.distill_level} feature shape "
+                f"{tuple(level_feat.shape)} does not match configured channels "
+                f"{expected_channels}"
+            )
+        distill_feat = (
+            fuse_hierarchy_features(hierarchy, self.distill_level)
+            if self.fuse_deeper_features
+            else level_feat
         )
-        weights = self.get_level_weights()
-        active_position = {level: pos for pos, level in enumerate(self.active_levels)}
-        fused = None
-
-        for level_index in range(self.fusion_level, self.active_levels[-1] + 1):
-            if level_index > self.fusion_level:
-                child = hierarchy[level_index].point
-                if "pooling_inverse" not in child.keys():
-                    raise RuntimeError(
-                        f"Encoder level {level_index} has no pooling_inverse for fusion"
-                    )
-                reference_to_level = child.pooling_inverse.long()[reference_to_level]
-            if level_index not in active_position:
-                continue
-
-            adapted = self.level_adapters[str(level_index)](
-                hierarchy[level_index].point.feat
+        if distill_feat.shape[1] != self.projector_in_channels:
+            raise ValueError(
+                f"Fused encoder feature has {distill_feat.shape[1]} channels, "
+                f"but projector expects {self.projector_in_channels}"
             )
-            # float32 归一化保证 AMP 稳定，随后转回原 dtype，
-            # 避免在 T_ref 上长期保留 float32 融合激活。
-            adapted = F.normalize(adapted.float(), dim=-1, eps=1e-12).to(
-                adapted.dtype
-            )
-            aligned = (
-                adapted
-                if level_index == self.fusion_level
-                else adapted[reference_to_level]
-            )
-            weight = weights[active_position[level_index]].to(aligned.dtype)
-            contribution = aligned * weight
-            fused = contribution if fused is None else fused + contribution
-
-        fused = F.normalize(fused.float(), dim=-1, eps=1e-12).to(fused.dtype)
-        return reference, fused, weights
+        return point, hierarchy, level, distill_feat
 
     def extract_point_feature(
         self,
@@ -333,20 +289,17 @@ class HierarchicalPatchSetDistiller(nn.Module):
     ):
         """按当前 fragment 的 backbone 输入点顺序返回逐点特征。
 
-        ``projected`` 导出融合后的 DINO 对齐 ``[N,Cd]`` 特征；
-        ``backbone`` 导出 ``[N,fusion_channels]`` 融合特征。投影只在
-        参考层 token 上执行，然后通过 ``input_to_level`` gather 到点。
-        当前 fragment 点数，整张 tile 的原序合并由 tester 完成。
+        ``projected`` 导出 DINO 对齐 ``[N,Cd]`` 特征；``backbone`` 导出
+        concat 后的 ``[N,C3]`` 特征。投影仅在目标层 token 上执行。
         """
-        _, hierarchy = self._encode(input_dict)
-        reference, fused_feat, _ = self._fuse_hierarchy_features(hierarchy)
+        _, _, level, distill_feat = self._encode(input_dict)
         if feature_source == "projected":
-            token_feature = self.student_projector(fused_feat)
+            token_feature = self.student_projector(distill_feat)
         elif feature_source == "backbone":
-            token_feature = fused_feat
+            token_feature = distill_feat
         else:
             raise ValueError("feature_source must be 'projected' or 'backbone'")
-        point_feature = token_feature[reference.input_to_level]
+        point_feature = token_feature[level.input_to_level]
         if normalize:
             point_feature = F.normalize(point_feature.float(), dim=-1, eps=1e-12)
         return point_feature
@@ -379,7 +332,7 @@ class HierarchicalPatchSetDistiller(nn.Module):
     ):
         """根据 ``return_point_feature`` 在训练蒸馏和测试导出路径间切换。
 
-        训练返回 ``loss`` 以及紧凑的 ``tok/edge/patch/w{level}`` 统计项；
+        训练返回 ``loss`` 以及紧凑的 ``tok/edge/patch`` 统计项；
         导出路径只返回 ``point_feature``，因此测试数据不需要携带任何 DINO 字段。
         """
         # 特征导出是独立路径：不建 token-patch 边，也不计算 teacher loss。
@@ -397,7 +350,8 @@ class HierarchicalPatchSetDistiller(nn.Module):
         if missing:
             raise KeyError(f"HPSD input is missing fields: {sorted(missing)}")
 
-        point, hierarchy = self._encode(input_dict)
+        point, hierarchy, level, distill_feat = self._encode(input_dict)
+        level_feat = level.point.feat
         dino_feature = input_dict["dino_feature"]
         if dino_feature.ndim != 2 or dino_feature.shape[1] != self.teacher_channels:
             raise ValueError(
@@ -405,27 +359,22 @@ class HierarchicalPatchSetDistiller(nn.Module):
                 f"{tuple(dino_feature.shape)}"
             )
 
-        # 先在参考层 token 空间融合多层特征，再只建一次边、
-        # 聚合一次 patch 并计算一次 DINO-1024 loss。
+        # 目标层与全部深层特征先对齐 concat，再只建一次边、聚合一次 patch。
         teacher = F.normalize(dino_feature.float(), dim=-1)
-        reference, fused_feat, level_weights = self._fuse_hierarchy_features(
-            hierarchy
-        )
         edges = build_token_patch_edges(
-            input_to_level=reference.input_to_level,
+            input_to_level=level.input_to_level,
             patch_index=input_dict["dino_patch_index"],
             valid=input_dict["dino_valid"],
-            num_tokens=fused_feat.shape[0],
+            num_tokens=level_feat.shape[0],
             num_patches=dino_feature.shape[0],
             validate_mapping=self.validate_mapping,
         )
         patch_feat, used_patch, _ = aggregate_tokens_to_patches(
-            fused_feat, edges, edge_weight=self.edge_weight
+            distill_feat, edges, edge_weight=self.edge_weight
         )
         patch_pred = self.student_projector(patch_feat)
         if patch_feat.shape[0] == 0:
-            # fused_feat 已连接所有 adapter/backbone stage，空 slice 仍能
-            # 为全部参数生成零梯度，保持 DDP find_unused_parameters=False。
+            # distill_feat[:0] 保留 concat backbone 与 projector 的计算图连接。
             loss = patch_pred.float().sum() * 0.0
         else:
             student = F.normalize(patch_pred.float(), dim=-1)
@@ -443,12 +392,10 @@ class HierarchicalPatchSetDistiller(nn.Module):
         # loss 是训练器反向传播所需的唯一损失；不再重复返回 patch_loss。
         result = {
             "loss": loss,
-            "tok": fused_feat.new_tensor(fused_feat.shape[0]),
-            "edge": fused_feat.new_tensor(edges.num_edges),
-            "patch": fused_feat.new_tensor(used_patch.shape[0]),
+            "tok": level_feat.new_tensor(level_feat.shape[0]),
+            "edge": level_feat.new_tensor(edges.num_edges),
+            "patch": level_feat.new_tensor(used_patch.shape[0]),
         }
-        for position, level_index in enumerate(self.active_levels):
-            result[f"w{level_index}"] = level_weights[position].detach()
         if return_point:
             result["point"] = point
             result["hierarchy"] = hierarchy
