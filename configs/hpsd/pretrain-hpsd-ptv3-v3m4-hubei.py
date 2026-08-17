@@ -7,12 +7,12 @@ grid_size = 0.5
 feature_keys = ("coord", "intensity", "echo")
 in_channels = 6
 
-weight = "exp/hubei/hpsd/pretrain-ptv3-v3m4-multilevel-native1024/model/model_last.pth"
+weight = "exp/hubei/hpsd/pretrain-ptv3-v3m4-fusion-native1024/model/model_last.pth"
 resume = False
 evaluate = False
 test_only = False
 seed = None
-save_path = "exp/hubei/hpsd/pretrain-ptv3-v3m4-multilevel-native1024"
+save_path = "exp/hubei/hpsd/pretrain-ptv3-v3m4-fusion-native1024"
 
 num_worker = 4
 batch_size_train = 4
@@ -55,9 +55,8 @@ hooks = [
 train = dict(type="DefaultTrainer")
 test = dict(type="HPSDFeatureTester", verbose=True)
 
-feature_output_dir = rf"{data_root}\hpsd_feature\ptv3_v3m4_multilevel"
+feature_output_dir = rf"{data_root}\hpsd_feature\ptv3_v3m4_fusion"
 feature_source = "projected"
-feature_level = 2
 feature_dtype = "float16"
 normalize_feature = True
 feature_aggregate_on_gpu = True
@@ -65,15 +64,16 @@ feature_overwrite = False
 
 model = dict(
     type="HPSD-v1m1",
-    distill_levels=(False, False, True, True, True),
-    distill_loss_weights=(0.0, 0.0, 1.0, 0.5, 0.25),
+    # 首个 True 自动推断为参考 level 2。
+    fusion_levels=(False, False, True, True, True),
+    fusion_channels=512,
+    level_weight_init=(0.0, 0.0, 1.0, 0.5, 0.25),
+    level_weight_floor=0.05,
     level_channels=(36, 72, 144, 288, 576),
     teacher_channels=1024,
     edge_weight="sqrt_count",
     sample_balanced=True,
     validate_mapping=False,
-    # 各蒸馏层在有效 patch 上使用独立轻量 MLP。
-    projector_hidden_channels=1024,
     backbone=dict(
         type="PT-v3m4",
         in_channels=in_channels,

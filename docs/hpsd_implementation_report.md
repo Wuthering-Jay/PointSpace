@@ -93,30 +93,34 @@ HPSD-v1m1
 - 每条边的支持点计数；
 - `uniform/count/sqrt_count` 三种边权；
 - patch-centric 三维特征聚合；
-- 多 encoder 层独立 token-patch 蒸馏；
-- 每层独立的原生 1024 维 student MLP projector；
+- 多 encoder 层归一化适配和可学习加权融合；
+- 一次 token-patch 建边和原生 1024 维 student projection；
 - float32 normalized cosine loss；
 - 每个样本等权的 patch loss；
 - 空监督 batch 安全 backward；
 - token、edge、used patch 数量日志。
 
-## 3. Multi-level HPSD
+## 3. Hierarchical Weighted Fusion HPSD
 
 旧实现将 level 3/4 up-cast 到 level 2 后按通道 concat。由于深层
-通道数更多，单一 projector 可能隐式依赖最深层特征。当前实现改为
-level 2/3/4 独立建边、聚合、MLP 投影和 cosine loss：
+通道数更多，单一 projector 可能隐式依赖最深层特征。独立
+multi-level loss 又需要为每层保留 1024 维 prediction 和 loss 计算图。
+当前实现改为低维层级融合后只计算一次 DINO loss：
 
 ```python
-distill_levels = (False, False, True, True, True)
-distill_loss_weights = (0.0, 0.0, 1.0, 0.5, 0.25)
-loss = (1.0 * loss_l2 + 0.5 * loss_l3 + 0.25 * loss_l4) / 1.75
+fusion_levels = (False, False, True, True, True)
+fusion_channels = 512
+level_weight_init = (0.0, 0.0, 1.0, 0.5, 0.25)
+level_weight_floor = 0.05
 ```
 
-较深 token 覆盖更多影像 patch，因此使用递减权重抑制粗粒度语义
-平滑对局部对齐的干扰。同时 level 4 loss 保证最深 encoder stage
-仍能获得蒸馏梯度。每层 projector 都是
-`LayerNorm(C3) -> Linear(C3,1024) -> GELU -> Linear(1024,1024)`，且仅作用于
-聚合后的有效 patch，不会创建逐点 `[N,1024]` 训练张量。
+`fusion_levels` 的第一个 True 自动作为参考层，因此当前自动推断为
+level 2，不需要独立 `fusion_level`。每层经
+`LayerNorm(C3) -> Linear(C3,512) -> GELU -> L2 normalize`，深层特征
+再根据 `pooling_inverse` 精确复制回 level 2 token。层级 logits 通过
+softmax 和 0.05 权重下限得到归一化权重，加权和再次归一化后形成
+`[T2,512]` 融合特征。该特征只建一次 TokenPatchEdges，聚合后经
+`Linear(512,1024)` 与 DINO teacher 计算一次 cosine loss。
 
 ## 4. Token-Patch 关系算法
 
@@ -146,8 +150,8 @@ weight = sqrt(point_count)
 三维特征先在低维 backbone channel 空间聚合：
 
 ```python
-patch_feat = weighted_mean(level_token_feat[edge_token], edge_patch)
-patch_pred = MLP(patch_feat)  # [U, 1024]
+patch_feat = weighted_mean(fused_token_feat[edge_token], edge_patch)
+patch_pred = Linear(patch_feat)  # [U, 1024]
 ```
 
 由于 student projection 发生在 patch 聚合之后，当前实现不会分配 `[N,1024]` 或
@@ -221,11 +225,12 @@ configs/hpsd/pretrain-hpsd-ptv3-v3m4-hubei.py
 - `LasImageDataset`；
 - `coord + intensity + echo`，共 6 维输入；
 - `grid_size=0.5`；
-- `distill_levels=(False,False,True,True,True)`；
-- `distill_loss_weights=(0,0,1.0,0.5,0.25)`；
+- `fusion_levels=(False,False,True,True,True)`；
+- `fusion_channels=512`；
+- 可学习层级权重与 0.05 下限；
 - 原生 DINO-1024；
 - `sqrt_count`；
-- 分层独立 MLP projector 与 loss；
+- 低维层级融合与单次 DINO-1024 loss；
 - bfloat16 AMP；
 - micro-batch 1；
 - gradient accumulation 4；
@@ -253,16 +258,17 @@ grid 等字段，为后续 relation-aware edge decoder 提供数据基础。
 - sqrt-count 聚合和梯度；
 - 空关系；
 - 样本平衡 loss；
-- multi-level 独立 projector/loss 与全层梯度；
+- 可学习层级融合、单次 loss 与全层梯度；
 - DINO patch compaction；
 - compaction 前后 loss 一致性。
 
 ### 8.2 正式配置构建
 
-LitePT 和 PTv3 两份完整配置均成功构建为 level 2/3/4 multi-level
-HPSD。三个 projector 的总参数分别为 4,075,272 和 4,186,080。
+LitePT 和 PTv3 两份完整配置均成功构建为 level 2/3/4
+weighted-fusion HPSD。融合 adapter、权重和最终 projector 的总参数
+分别为 989,451 和 1,044,963。
 
-### 8.3 真实数据 Multi-level GPU 测试
+### 8.3 真实数据 Weighted-fusion GPU 测试
 
 使用湖北真实 tile、LitePT-v1m4、bfloat16 AMP 进行完整
 forward/backward：
@@ -270,20 +276,24 @@ forward/backward：
 ```text
 input points: 94,480
 compacted DINO patches: 7,806
-level 2/3/4 loss: 1.0000 / 1.0095 / 0.9903
-weighted loss: 1.0013
-forward/backward: 2.879 s
-peak allocated delta: 1,155.17 MiB
+inferred fusion level: 2
+initial effective weights: 0.5357 / 0.2929 / 0.1714
+single DINO loss: 0.9960
+forward/backward: 4.052 s
+peak allocated delta: 1,026.49 MiB
 level 0-4 gradients: all finite and non-zero
-level 2/3/4 projector gradients: all finite
+level adapters / weight logits / projector gradients: all finite
 ```
 
 显存数据不包含完整 Trainer 中的 AdamW 状态和 DDP bucket，但已证明
-多层独立建边与原生 DINO-1024 可以在当前硬件上完成训练。
+加权融合与原生 DINO-1024 可以在当前硬件上完成训练。与同一
+样本的独立 multi-level loss 版本相比，峰值增量从 1,155.17 MiB 降为
+1,026.49 MiB，减少约 11.1%。
 
 PTv3-v3m4 使用 60,000 点、4,521 个 patch 完成同样测试，加权
-loss 为 0.9758，前向反向耗时 3.045 s，峰值 allocated 增量为
-1,362.82 MiB；三个 projector 与 encoder level 0–4 梯度均有限非零。
+loss 为 1.0250，前向反向耗时 2.966 s，峰值 allocated 增量为
+1,298.81 MiB；adapter、层级权重、projector 与 encoder level 0–4 梯度均
+有限非零。
 
 ## 9. Checkpoint 迁移测试
 
@@ -349,7 +359,7 @@ python tools/test.py --config-file configs/hpsd/pretrain-hpsd-litept-v1m4-hubei.
 推理；每个 fragment 的输出利用 `index` 写回原始点位置，重复出现的点取
 特征均值，最后再次归一化。输出是同名 Safetensors，主张量为
 `feature: [N,C]`。默认 `feature_source="projected"`，因此 `C=1024`；也可
-设置为 `backbone` 导出 `feature_level` 指定层的原生低维 backbone 特征。
+设置为 `backbone` 导出投影前的 512 维层级融合特征。
 
 真实 tile 测试包含 135,441 个原始点，GridSample 生成 8 个 fragment；使用
 fragment batch 4 后成功恢复并写出 `[135441,1024]`，没有遗漏点。随后通过

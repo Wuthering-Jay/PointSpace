@@ -13,32 +13,35 @@ from pointspace.models.backbone.hpsd.hpsd_v1m1 import (
 )
 
 
-def test_student_projector_mlp_forward_and_backward(monkeypatch):
+def test_fusion_adapter_and_projector_forward_and_backward(monkeypatch):
     monkeypatch.setattr(hpsd_v1m1, "build_model", lambda config: nn.Identity())
 
-    mlp = HierarchicalPatchSetDistiller(
+    model = HierarchicalPatchSetDistiller(
         backbone={},
-        distill_levels=(True,),
-        distill_loss_weights=(1.0,),
+        fusion_levels=(True,),
+        fusion_channels=20,
+        level_weight_init=(1.0,),
+        level_weight_floor=0.0,
         level_channels=(12,),
         teacher_channels=16,
-        projector_hidden_channels=20,
     )
-    assert mlp.active_levels == (0,)
-    assert isinstance(mlp.student_projectors["0"], nn.Sequential)
-    prediction = mlp.student_projectors["0"](
-        torch.randn(7, 12, requires_grad=True)
-    )
+    assert model.active_levels == (0,)
+    assert model.fusion_level == 0
+    adapted = model.level_adapters["0"](torch.randn(7, 12, requires_grad=True))
+    prediction = model.student_projector(adapted)
     assert prediction.shape == (7, 16)
     prediction.square().mean().backward()
     assert all(
         parameter.grad is not None
-        for parameter in mlp.student_projectors.parameters()
+        for parameter in model.level_adapters.parameters()
     )
-    assert mlp.student_projectors["0"](torch.empty(0, 12)).shape == (0, 16)
+    assert all(
+        parameter.grad is not None
+        for parameter in model.student_projector.parameters()
+    )
 
 
-def test_multi_level_hpsd_has_independent_losses_and_gradients(monkeypatch):
+def test_weighted_hierarchy_fusion_has_single_loss_and_full_gradients(monkeypatch):
     class DummyBackbone(nn.Module):
         def __init__(self):
             super().__init__()
@@ -52,31 +55,41 @@ def test_multi_level_hpsd_has_independent_losses_and_gradients(monkeypatch):
             self.mappings = (
                 torch.arange(6),
                 torch.tensor([0, 0, 1, 1, 2, 2]),
-                torch.tensor([0, 0, 0, 1, 1, 1]),
+                torch.tensor([0, 0, 0, 0, 1, 1]),
+            )
+            self.pooling_inverse = (
+                None,
+                torch.tensor([0, 0, 1, 1, 2, 2]),
+                torch.tensor([0, 0, 1]),
             )
 
         def forward(self, input_dict, return_hierarchy=False):
-            hierarchy = tuple(
-                SimpleNamespace(
-                    level=level,
-                    point=Dict(feat=feature),
-                    input_to_level=mapping,
+            hierarchy = []
+            for level, (feature, mapping) in enumerate(
+                zip(self.features, self.mappings)
+            ):
+                point = Dict(feat=feature)
+                if self.pooling_inverse[level] is not None:
+                    point.pooling_inverse = self.pooling_inverse[level]
+                hierarchy.append(
+                    SimpleNamespace(
+                        level=level,
+                        point=point,
+                        input_to_level=mapping,
+                    )
                 )
-                for level, (feature, mapping) in enumerate(
-                    zip(self.features, self.mappings)
-                )
-            )
-            return Dict(), hierarchy
+            return Dict(), tuple(hierarchy)
 
     backbone = DummyBackbone()
     monkeypatch.setattr(hpsd_v1m1, "build_model", lambda config: config)
     model = HierarchicalPatchSetDistiller(
         backbone=backbone,
-        distill_levels=(True, True, True),
-        distill_loss_weights=(1.0, 0.5, 0.25),
+        fusion_levels=(True, True, True),
+        fusion_channels=12,
+        level_weight_init=(1.0, 0.5, 0.25),
+        level_weight_floor=0.05,
         level_channels=(4, 6, 8),
         teacher_channels=10,
-        projector_hidden_channels=12,
     )
     input_dict = dict(
         dino_feature=torch.randn(3, 10),
@@ -86,19 +99,48 @@ def test_multi_level_hpsd_has_independent_losses_and_gradients(monkeypatch):
     )
     result = model(input_dict)
     assert torch.isfinite(result["loss"])
-    assert all(f"hpsd_level_{level}_loss" in result for level in range(3))
+    weights = model.get_level_weights()
+    assert torch.allclose(weights.sum(), torch.tensor(1.0))
+    assert torch.all(weights >= 0.05)
+    assert {"loss", "tok", "edge", "patch"}.issubset(result)
+    assert "patch_loss" not in result
+    assert all(f"w{level}" in result for level in range(3))
     result["loss"].backward()
     assert all(feature.grad is not None for feature in backbone.features)
     assert all(
         parameter.grad is not None
-        for parameter in model.student_projectors.parameters()
+        for parameter in model.level_adapters.parameters()
+    )
+    assert model.level_weight_logits.grad is not None
+    assert all(
+        parameter.grad is not None
+        for parameter in model.student_projector.parameters()
     )
     assert model.extract_point_feature(
-        input_dict, feature_source="projected", feature_level=1
+        input_dict, feature_source="projected"
     ).shape == (6, 10)
     assert model.extract_point_feature(
-        input_dict, feature_source="backbone", feature_level=1
-    ).shape == (6, 6)
+        input_dict, feature_source="backbone"
+    ).shape == (6, 12)
+    with torch.no_grad():
+        _, hierarchy = model._encode(input_dict)
+        reference, fused, _ = model._fuse_hierarchy_features(hierarchy)
+        edges = build_token_patch_edges(
+            reference.input_to_level,
+            input_dict["dino_patch_index"],
+            input_dict["dino_valid"],
+            num_tokens=fused.shape[0],
+            num_patches=input_dict["dino_feature"].shape[0],
+        )
+        fused_patch, _, _ = aggregate_tokens_to_patches(fused, edges)
+        projected_patch, _, _ = aggregate_tokens_to_patches(
+            model.student_projector(fused), edges
+        )
+        # 最终 projector 为线性层，因此训练时先聚合后投影
+        # 与测试时先投影 token 再 gather 保持同一映射语义。
+        assert torch.allclose(
+            model.student_projector(fused_patch), projected_patch, atol=1e-6
+        )
 
     model.zero_grad(set_to_none=True)
     empty_input = dict(input_dict)
@@ -109,7 +151,12 @@ def test_multi_level_hpsd_has_independent_losses_and_gradients(monkeypatch):
     empty_result["loss"].backward()
     assert all(
         parameter.grad is not None
-        for parameter in model.student_projectors.parameters()
+        for parameter in model.level_adapters.parameters()
+    )
+    assert model.level_weight_logits.grad is not None
+    assert all(
+        parameter.grad is not None
+        for parameter in model.student_projector.parameters()
     )
 
 

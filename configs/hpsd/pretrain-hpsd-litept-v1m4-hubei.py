@@ -6,7 +6,7 @@
 # -------------------------------------------------------
 data_root = r"E:\data\湖北\joint_tiles"
 pointcloud_path = r"E:\data\云南\data\tile"
-feature_output_dir = r"E:\data\云南\hpsd_feature\litept_v1m4_multilevel"
+feature_output_dir = r"E:\data\云南\hpsd_feature\litept_v1m4_fusion"
 grid_size = 0.5  # 训练体素及测试 fragment 划分使用相同空间分辨率
 feature_keys = ("coord", "intensity", "echo")  # 3 + 1 + 2 = 6 维
 in_channels = 6
@@ -14,8 +14,8 @@ in_channels = 6
 # -------------------------------------------------------
 # 1. Checkpoint 与运行控制
 # -------------------------------------------------------
-save_path = "exp/hubei/hpsd/pretrain-litept-v1m4-multilevel-native1024"
-weight = "exp/hubei/hpsd/pretrain-litept-v1m4-multilevel-native1024/model/model_last.pth"
+save_path = "exp/hubei/hpsd/pretrain-litept-v1m4-fusion-native1024"
+weight = "exp/hubei/hpsd/pretrain-litept-v1m4-fusion-native1024/model/model_last.pth"
 resume = False
 evaluate = False  # HPSD 预训练没有语义标签验证集，不构建 data.val
 test_only = False
@@ -82,10 +82,9 @@ test = dict(type="HPSDFeatureTester", verbose=True)
 # -------------------------------------------------------
 # 5. HPSD 测试特征导出
 # -------------------------------------------------------
-# projected：导出 feature_level 对应 projector 的 1024 维特征；
-# backbone：导出 feature_level 对应 encoder 层的原生三维特征。
+# projected：导出层级融合后的 DINO 对齐 1024 维特征；
+# backbone：导出投影前的 fusion_channels 维融合特征。
 feature_source = "projected"
-feature_level = 2  # 导出 level 2 的 projector/backbone 特征
 feature_dtype = "float16"  # Safetensors 输出类型，仅支持 float16/float32
 normalize_feature = True  # fragment 合并后再次执行 L2 归一化
 feature_aggregate_on_gpu = False  # GPU index_add 更快，但会占用 N*C*4 字节
@@ -96,10 +95,14 @@ feature_overwrite = False
 # -------------------------------------------------------
 model = dict(
     type="HPSD-v1m1",
-    # level 2/3/4 分别建立 TokenPatchEdges、聚合 patch 并计算独立 loss。
-    distill_levels=(False, False, True, True, True),
-    # 深层 token 覆盖更多影像 patch，递减权重可减弱粗粒度语义平滑。
-    distill_loss_weights=(0.0, 0.0, 1.0, 0.5, 0.25),
+    # 第一个 True（level 2）自动作为融合参考层，无需额外 fusion_level。
+    fusion_levels=(False, False, True, True, True),
+    # 各层先适配到相同维度，然后在 level 2 token 空间加权融合。
+    fusion_channels=512,
+    # 仅为可学习 softmax 权重提供初值，未启用层的值被忽略。
+    level_weight_init=(0.0, 0.0, 1.0, 1.0, 1.0),
+    # 防止权重完全塌缩到单层，保证每个启用层仍有梯度。
+    level_weight_floor=0.05,
     # 必须与 backbone enc_channels 完全一致，用于检查层级输出并确定融合维数。
     level_channels=(36, 72, 144, 252, 504),
     # 保持 DINOv3 ViT-L 原生通道，不预先使用 PCA 压缩 teacher。
@@ -110,8 +113,6 @@ model = dict(
     sample_balanced=True,
     # correspondence 由离线工具确定性生成；关闭逐步越界检查以减少同步开销。
     validate_mapping=False,
-    # 每个启用层都有独立 MLP，仅作用于聚合后的有效 patch。
-    projector_hidden_channels=1024,
     backbone=dict(
         type="LitePT-v1m4",
         in_channels=in_channels,

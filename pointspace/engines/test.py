@@ -222,8 +222,7 @@ class HPSDFeatureTester(TesterBase):
 
     - ``feature_output_dir``：Safetensors 输出目录；
     - ``feature_source``：``projected`` 为 DINO 对齐 1024 维特征，
-      ``backbone`` 为指定 encoder 层的原生低维特征；
-    - ``feature_level``：多层 HPSD 中用于导出的 encoder 层级；
+      ``backbone`` 为投影前的层级融合特征；
     - ``feature_dtype``：磁盘张量类型，支持 float16/float32；
     - ``normalize_feature``：fragment 合并后是否再次归一化；
     - ``feature_aggregate_on_gpu``：在 GPU 上执行累加以提高速度，否则使用 CPU；
@@ -246,8 +245,14 @@ class HPSDFeatureTester(TesterBase):
         overwrite = bool(getattr(self.cfg, "feature_overwrite", False))
         output_dtype = getattr(self.cfg, "feature_dtype", "float16")
         feature_source = getattr(self.cfg, "feature_source", "projected")
-        feature_level = int(getattr(self.cfg, "feature_level", 2))
         normalize_feature = bool(getattr(self.cfg, "normalize_feature", True))
+        fusion_levels = tuple(getattr(self.cfg.model, "fusion_levels", ()))
+        active_levels = tuple(
+            level for level, enabled in enumerate(fusion_levels) if enabled
+        )
+        if not active_levels:
+            raise ValueError("model.fusion_levels must enable at least one level")
+        fusion_level = active_levels[0]
         # GPU 聚合速度更快，但 float32 累加器占用约 N*C*4 字节；显存紧张时
         # 可切换到 CPU，预测结果和索引会在每个 fragment batch 后回传。
         aggregate_on_gpu = bool(
@@ -261,13 +266,20 @@ class HPSDFeatureTester(TesterBase):
 
         logger.info(">>>>>>>>>>>>>>>> Start HPSD Feature Extraction >>>>>>>>>>>>>>>>")
         logger.info(
-            "Fragment batch size: %d, source: %s, level: %d, aggregate_on_gpu: %s",
+            "Fragment batch size: %d, source: %s, fusion_level: %d, aggregate_on_gpu: %s",
             batch_size_test,
             feature_source,
-            feature_level,
+            fusion_level,
             aggregate_on_gpu,
         )
         self.model.eval()
+        hpsd_model = self.model.module if hasattr(self.model, "module") else self.model
+        level_weights = [
+            float(weight)
+            for weight in hpsd_model.get_level_weights().detach().cpu()
+        ]
+        fusion_channels = int(getattr(self.cfg.model, "fusion_channels", 0))
+        logger.info("Learned hierarchy weights: %s", level_weights)
         comm.synchronize()
 
         # test_loader 的 batch_size 固定为 1。data_dict[0] 包含一张 tile 的
@@ -320,7 +332,6 @@ class HPSDFeatureTester(TesterBase):
                         input_dict,
                         return_point_feature=True,
                         feature_source=feature_source,
-                        feature_level=feature_level,
                         normalize_feature=normalize_feature,
                     )["point_feature"]
                 point_feature = point_feature.detach().float()
@@ -367,17 +378,17 @@ class HPSDFeatureTester(TesterBase):
             # Safetensors metadata 只接受字符串。保留重建张量语义所需的稳定
             # 信息，不写 checkpoint、输入或输出路径。
             metadata = {
-                "format_version": "2",
+                "format_version": "3",
                 "layout": "NC",
                 "num_points": str(feature.shape[0]),
                 "feature_dim": str(feature.shape[1]),
                 "dtype": output_dtype,
                 "feature_source": feature_source,
-                "feature_level": str(feature_level),
+                "fusion_level": str(fusion_level),
+                "fusion_channels": str(fusion_channels),
+                "level_weights": json.dumps(level_weights),
                 "normalized": str(normalize_feature).lower(),
-                "distill_levels": str(
-                    tuple(getattr(self.cfg.model, "distill_levels", ()))
-                ),
+                "fusion_levels": str(fusion_levels),
             }
             # 先写同目录临时文件再原子替换，避免中断后留下可被误读的半文件。
             temporary_path = output_path.with_name(
