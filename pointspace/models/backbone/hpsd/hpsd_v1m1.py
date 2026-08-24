@@ -60,6 +60,22 @@ class TokenPatchEdges:
         return int(self.token.numel())
 
 
+@dataclass(frozen=True)
+class HPSDTrainContext:
+    """HPSD 训练前向中供附加监督分支只读复用的中间结果。
+
+    该对象只保存现有 tensor 的引用，不复制逐点、逐 token 或 DINO 特征。
+    常规 ``HPSD-v1m1`` 前向不会返回该对象，因此不会改变训练日志和推理接口。
+    """
+
+    point: object
+    hierarchy: tuple
+    level: object
+    distill_feat: torch.Tensor
+    edges: TokenPatchEdges
+    teacher: torch.Tensor
+
+
 def build_token_patch_edges(
     input_to_level,
     patch_index,
@@ -345,6 +361,16 @@ class HierarchicalPatchSetDistiller(nn.Module):
                 )
             }
 
+        return self.forward_train(input_dict, return_point=return_point)
+
+    def forward_train(self, input_dict, return_point=False, return_context=False):
+        """执行原有 HPSD 训练路径，并可选择返回只读训练上下文。
+
+        ``return_context=False`` 是原模型的默认行为，返回值和计算顺序保持不变。
+        新的训练期附加分支可设置 ``return_context=True``，此时返回
+        ``(result, HPSDTrainContext)``，从而复用同一次 backbone 前向和稀疏边。
+        """
+
         required = {"dino_feature", "dino_patch_index", "dino_valid", "dino_offset"}
         missing = required.difference(input_dict)
         if missing:
@@ -399,4 +425,14 @@ class HierarchicalPatchSetDistiller(nn.Module):
         if return_point:
             result["point"] = point
             result["hierarchy"] = hierarchy
-        return result
+        if not return_context:
+            return result
+        context = HPSDTrainContext(
+            point=point,
+            hierarchy=hierarchy,
+            level=level,
+            distill_feat=distill_feat,
+            edges=edges,
+            teacher=teacher,
+        )
+        return result, context
