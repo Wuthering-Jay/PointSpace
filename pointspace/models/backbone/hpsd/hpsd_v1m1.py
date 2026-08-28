@@ -20,7 +20,7 @@
 ``Cd``
     DINO teacher 通道数，当前默认保持原生 1024 维。
 
-训练路径首先通过 ``input_to_level: [N]`` 和 ``dino_patch_index: [N]`` 构造
+训练路径首先通过 ``input_to_level: [N]`` 和 ``image_patch_index: [N]`` 构造
 ``E`` 条稀疏关系，再在低维 ``C3`` 空间聚合为 ``[U,C3]``，最后只为这
 ``U`` 个 patch 生成 ``[U,Cd]`` student prediction。这样不会创建显存开销
 很大的逐点 ``[N,1024]`` 训练张量。
@@ -36,9 +36,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch_scatter
+from torch.utils.checkpoint import checkpoint
 
 from pointspace.models.builder import MODELS, build_model
 from pointspace.models.utils.misc import offset2batch
+
 
 
 @dataclass(frozen=True)
@@ -58,22 +60,6 @@ class TokenPatchEdges:
     @property
     def num_edges(self):
         return int(self.token.numel())
-
-
-@dataclass(frozen=True)
-class HPSDTrainContext:
-    """HPSD 训练前向中供附加监督分支只读复用的中间结果。
-
-    该对象只保存现有 tensor 的引用，不复制逐点、逐 token 或 DINO 特征。
-    常规 ``HPSD-v1m1`` 前向不会返回该对象，因此不会改变训练日志和推理接口。
-    """
-
-    point: object
-    hierarchy: tuple
-    level: object
-    distill_feat: torch.Tensor
-    edges: TokenPatchEdges
-    teacher: torch.Tensor
 
 
 def build_token_patch_edges(
@@ -123,7 +109,11 @@ def build_token_patch_edges(
     )
 
 
-def aggregate_tokens_to_patches(token_feat, edges, edge_weight="sqrt_count"):
+def aggregate_tokens_to_patches(
+    token_feat,
+    edges,
+    edge_weight="sqrt_count",
+):
     """在低维三维特征空间内，把多条 token 边聚合到被引用 patch。
 
     Args:
@@ -207,12 +197,14 @@ class HierarchicalPatchSetDistiller(nn.Module):
         validate_mapping: 是否在建边时执行同步式范围检查；离线映射可信时可关。
         fuse_deeper_features: 是否把目标层后的深层特征对齐并 concat。
         projector_hidden_channels: 轻量 MLP projector 的隐藏通道数。
+        projector_checkpoint: 训练时是否在 backward 重算 projector 与 cosine，
+            以减少 1024 维中间激活；不改变参数结构和推理路径。
 
     训练输入除常规 ``coord/grid_coord/feat/offset`` 外，还需要：
 
     - ``dino_feature: [P,Cd]``；
-    - ``dino_patch_index: [N]``，有效值为 batch 全局 patch 行号；
-    - ``dino_valid: [N]``；
+    - ``image_patch_index: [N]``，有效值为 batch 全局 patch 行号；
+    - ``image_valid: [N]``；
     - ``dino_offset: [B]``，每个样本 patch 数的累计边界。
     """
 
@@ -227,6 +219,7 @@ class HierarchicalPatchSetDistiller(nn.Module):
         validate_mapping=False,
         fuse_deeper_features=True,
         projector_hidden_channels=1024,
+        projector_checkpoint=False,
     ):
         super().__init__()
         self.backbone = build_model(backbone)
@@ -237,6 +230,7 @@ class HierarchicalPatchSetDistiller(nn.Module):
         self.validate_mapping = bool(validate_mapping)
         self.fuse_deeper_features = bool(fuse_deeper_features)
         self.projector_hidden_channels = int(projector_hidden_channels)
+        self.projector_checkpoint = bool(projector_checkpoint)
 
         if self.distill_level < 0:
             raise ValueError("distill_level must be non-negative")
@@ -267,6 +261,24 @@ class HierarchicalPatchSetDistiller(nn.Module):
             nn.GELU(),
             nn.Linear(self.projector_hidden_channels, self.teacher_channels),
         )
+
+    def _projector_cosine_loss(self, projector, feature, target):
+        """计算逐行 cosine loss，并可在反向时重算 projector 激活。"""
+
+        def compute(input_feature, target_feature):
+            prediction = projector(input_feature)
+            student = F.normalize(prediction.float(), dim=-1, eps=1e-12)
+            return 1.0 - torch.sum(student * target_feature, dim=-1)
+
+        if self.projector_checkpoint and self.training and torch.is_grad_enabled():
+            return checkpoint(
+                compute,
+                feature,
+                target,
+                use_reentrant=False,
+                preserve_rng_state=False,
+            )
+        return compute(feature, target)
 
     def _encode(self, input_dict):
         """运行 backbone，并返回目标层及 concat 后的层级特征。"""
@@ -363,15 +375,10 @@ class HierarchicalPatchSetDistiller(nn.Module):
 
         return self.forward_train(input_dict, return_point=return_point)
 
-    def forward_train(self, input_dict, return_point=False, return_context=False):
-        """执行原有 HPSD 训练路径，并可选择返回只读训练上下文。
+    def forward_train(self, input_dict, return_point=False):
+        """执行 HPSD 训练路径。"""
 
-        ``return_context=False`` 是原模型的默认行为，返回值和计算顺序保持不变。
-        新的训练期附加分支可设置 ``return_context=True``，此时返回
-        ``(result, HPSDTrainContext)``，从而复用同一次 backbone 前向和稀疏边。
-        """
-
-        required = {"dino_feature", "dino_patch_index", "dino_valid", "dino_offset"}
+        required = {"dino_feature", "image_patch_index", "image_valid", "dino_offset"}
         missing = required.difference(input_dict)
         if missing:
             raise KeyError(f"HPSD input is missing fields: {sorted(missing)}")
@@ -389,23 +396,26 @@ class HierarchicalPatchSetDistiller(nn.Module):
         teacher = F.normalize(dino_feature.float(), dim=-1)
         edges = build_token_patch_edges(
             input_to_level=level.input_to_level,
-            patch_index=input_dict["dino_patch_index"],
-            valid=input_dict["dino_valid"],
+            patch_index=input_dict["image_patch_index"],
+            valid=input_dict["image_valid"],
             num_tokens=level_feat.shape[0],
             num_patches=dino_feature.shape[0],
             validate_mapping=self.validate_mapping,
         )
         patch_feat, used_patch, _ = aggregate_tokens_to_patches(
-            distill_feat, edges, edge_weight=self.edge_weight
+            distill_feat,
+            edges,
+            edge_weight=self.edge_weight,
         )
-        patch_pred = self.student_projector(patch_feat)
         if patch_feat.shape[0] == 0:
             # distill_feat[:0] 保留 concat backbone 与 projector 的计算图连接。
+            patch_pred = self.student_projector(patch_feat)
             loss = patch_pred.float().sum() * 0.0
         else:
-            student = F.normalize(patch_pred.float(), dim=-1)
-            loss_per_patch = 1.0 - torch.sum(
-                student * teacher[used_patch], dim=-1
+            loss_per_patch = self._projector_cosine_loss(
+                self.student_projector,
+                patch_feat,
+                teacher[used_patch],
             )
             if self.sample_balanced:
                 loss = self._sample_balanced_mean(
@@ -425,14 +435,4 @@ class HierarchicalPatchSetDistiller(nn.Module):
         if return_point:
             result["point"] = point
             result["hierarchy"] = hierarchy
-        if not return_context:
-            return result
-        context = HPSDTrainContext(
-            point=point,
-            hierarchy=hierarchy,
-            level=level,
-            distill_feat=distill_feat,
-            edges=edges,
-            teacher=teacher,
-        )
-        return result, context
+        return result

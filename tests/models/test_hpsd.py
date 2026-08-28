@@ -1,17 +1,57 @@
+import copy
 from types import SimpleNamespace
 
 import torch
 import torch.nn as nn
 from addict import Dict
 
-from pointspace.datasets.transform import CompactDinoPatches
+from pointspace.datasets.transform import CompactImagePatches
 from pointspace.models.backbone.hpsd import hpsd_v1m1
+from pointspace.models.backbone.hpsd.analysis_ops import (
+    aggregate_patch_teacher_to_tokens,
+    compute_token_visibility,
+)
 from pointspace.models.backbone.hpsd.hpsd_v1m1 import (
     HierarchicalPatchSetDistiller,
+    TokenPatchEdges,
     aggregate_tokens_to_patches,
     build_token_patch_edges,
     fuse_hierarchy_features,
 )
+from pointspace.models.backbone.litept_v1.litept_v1m3_utonia import Block
+from pointspace.models.modules import PointSequential
+from pointspace.models.utils.structure import Point
+
+
+class _FakeSparseTensor:
+    def __init__(self, feature):
+        self.features = feature
+
+    def replace_feature(self, feature):
+        return _FakeSparseTensor(feature)
+
+
+def test_token_visibility_and_teacher_aggregation():
+    mapping = torch.tensor([0, 0, 1, 1, 2, 2])
+    valid = torch.tensor([True, False, True, True, False, False])
+    visibility, valid_count, total_count = compute_token_visibility(mapping, valid, 3)
+    assert torch.equal(valid_count, torch.tensor([1.0, 2.0, 0.0]))
+    assert torch.equal(total_count, torch.tensor([2.0, 2.0, 2.0]))
+    assert torch.allclose(visibility, torch.tensor([0.5, 1.0, 0.0]))
+
+    teacher = torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 0.0]])
+    edges = TokenPatchEdges(
+        token=torch.tensor([0, 0, 1]),
+        patch=torch.tensor([0, 1, 2]),
+        point_count=torch.tensor([1, 1, 4]),
+    )
+    stats = aggregate_patch_teacher_to_tokens(teacher, edges)
+    assert stats.token.tolist() == [0, 1]
+    assert stats.feature.shape == (2, 2)
+    assert stats.point_count.tolist() == [2.0, 4.0]
+    assert stats.patch_count.tolist() == [2.0, 1.0]
+    assert stats.purity[1].item() == 1.0
+    assert 0.7 < stats.purity[0].item() < 0.8
 
 
 def test_concat_mlp_projector_forward_and_backward(monkeypatch):
@@ -34,6 +74,86 @@ def test_concat_mlp_projector_forward_and_backward(monkeypatch):
         parameter.grad is not None
         for parameter in model.student_projector.parameters()
     )
+
+
+def test_projector_checkpoint_preserves_loss_and_gradients(monkeypatch):
+    monkeypatch.setattr(hpsd_v1m1, "build_model", lambda config: nn.Identity())
+    torch.manual_seed(23)
+    baseline = HierarchicalPatchSetDistiller(
+        backbone={},
+        distill_level=0,
+        level_channels=(12,),
+        teacher_channels=16,
+        projector_hidden_channels=20,
+        projector_checkpoint=False,
+    )
+    optimized = copy.deepcopy(baseline)
+    optimized.projector_checkpoint = True
+    feature_baseline = torch.randn(9, 12, requires_grad=True)
+    feature_optimized = feature_baseline.detach().clone().requires_grad_(True)
+    target = torch.nn.functional.normalize(torch.randn(9, 16), dim=-1)
+
+    loss_baseline = baseline._projector_cosine_loss(
+        baseline.student_projector, feature_baseline, target
+    ).mean()
+    loss_optimized = optimized._projector_cosine_loss(
+        optimized.student_projector, feature_optimized, target
+    ).mean()
+    assert torch.equal(loss_baseline, loss_optimized)
+    loss_baseline.backward()
+    loss_optimized.backward()
+    assert torch.allclose(feature_baseline.grad, feature_optimized.grad, atol=1e-7)
+    for parameter_baseline, parameter_optimized in zip(
+        baseline.student_projector.parameters(),
+        optimized.student_projector.parameters(),
+    ):
+        assert torch.allclose(
+            parameter_baseline.grad, parameter_optimized.grad, atol=1e-7
+        )
+
+
+def test_litept_mlp_checkpoint_preserves_block_output_and_gradients():
+    torch.manual_seed(29)
+    baseline = Block(
+        channels=8,
+        num_heads=2,
+        mlp_ratio=2,
+        drop_path=0.0,
+        enable_conv=False,
+        enable_attn=True,
+        enable_flash=True,
+        checkpoint_mlp=False,
+    )
+    # Attention 的显存策略与本测试无关，用纯 tensor 线性映射替代，以便只验证
+    # LayerNorm-MLP-DropPath checkpoint 分支及其 Point 状态更新。
+    baseline.attn = PointSequential(nn.Linear(8, 8))
+    optimized = copy.deepcopy(baseline)
+    optimized.checkpoint_mlp = True
+    feature_baseline = torch.randn(17, 8, requires_grad=True)
+    feature_optimized = feature_baseline.detach().clone().requires_grad_(True)
+    point_baseline = Point(
+        feat=feature_baseline,
+        sparse_conv_feat=_FakeSparseTensor(feature_baseline),
+    )
+    point_optimized = Point(
+        feat=feature_optimized,
+        sparse_conv_feat=_FakeSparseTensor(feature_optimized),
+    )
+
+    output_baseline = baseline(point_baseline).feat
+    output_optimized = optimized(point_optimized).feat
+    assert torch.equal(output_baseline, output_optimized)
+    output_baseline.square().mean().backward()
+    output_optimized.square().mean().backward()
+    assert torch.allclose(feature_baseline.grad, feature_optimized.grad, atol=1e-7)
+    for parameter_baseline, parameter_optimized in zip(
+        baseline.parameters(), optimized.parameters()
+    ):
+        assert (parameter_baseline.grad is None) == (parameter_optimized.grad is None)
+        if parameter_baseline.grad is not None:
+            assert torch.allclose(
+                parameter_baseline.grad, parameter_optimized.grad, atol=1e-7
+            )
 
 
 def test_hierarchy_concat_has_single_loss_and_full_gradients(monkeypatch):
@@ -87,8 +207,8 @@ def test_hierarchy_concat_has_single_loss_and_full_gradients(monkeypatch):
     )
     input_dict = dict(
         dino_feature=torch.randn(3, 10),
-        dino_patch_index=torch.tensor([0, 0, 1, 1, 2, 2]),
-        dino_valid=torch.ones(6, dtype=torch.bool),
+        image_patch_index=torch.tensor([0, 0, 1, 1, 2, 2]),
+        image_valid=torch.ones(6, dtype=torch.bool),
         dino_offset=torch.tensor([3]),
     )
     result = model(input_dict)
@@ -115,8 +235,8 @@ def test_hierarchy_concat_has_single_loss_and_full_gradients(monkeypatch):
 
     model.zero_grad(set_to_none=True)
     empty_input = dict(input_dict)
-    empty_input["dino_patch_index"] = torch.full((6,), -1, dtype=torch.long)
-    empty_input["dino_valid"] = torch.zeros(6, dtype=torch.bool)
+    empty_input["image_patch_index"] = torch.full((6,), -1, dtype=torch.long)
+    empty_input["image_valid"] = torch.zeros(6, dtype=torch.bool)
     empty_result = model(empty_input)
     assert empty_result["loss"].item() == 0.0
     empty_result["loss"].backward()
@@ -195,22 +315,22 @@ def test_sample_balanced_loss():
     assert torch.allclose(loss, torch.tensor(2.0))
 
 
-def test_compact_dino_patches_is_lossless():
+def test_compact_image_patches_is_lossless():
     feature = torch.arange(6 * 4, dtype=torch.float32).reshape(6, 4)
     patch_index = torch.tensor([4, 1, -1, 4, 3])
     valid = torch.tensor([True, True, False, True, True])
     expected_teacher = feature[patch_index[valid]]
-    data = CompactDinoPatches()(
+    data = CompactImagePatches()(
         dict(
             dino_feature=feature,
-            dino_patch_index=patch_index,
-            dino_valid=valid,
+            image_patch_index=patch_index,
+            image_valid=valid,
         )
     )
-    compact_teacher = data["dino_feature"][data["dino_patch_index"][valid]]
+    compact_teacher = data["dino_feature"][data["image_patch_index"][valid]]
     assert torch.equal(compact_teacher, expected_teacher)
     assert data["dino_feature"].shape == (3, 4)
-    assert data["dino_source_patch_index"].tolist() == [1, 3, 4]
+    assert data["image_source_patch_index"].tolist() == [1, 3, 4]
     assert data["dino_offset"].tolist() == [3]
 
 
@@ -233,17 +353,17 @@ def test_compaction_preserves_patch_distillation_loss():
         dim=-1,
     ).mean()
 
-    compact = CompactDinoPatches()(
+    compact = CompactImagePatches()(
         dict(
             dino_feature=teacher,
-            dino_patch_index=patch_index,
-            dino_valid=valid,
+            image_patch_index=patch_index,
+            image_valid=valid,
         )
     )
     compact_edges = build_token_patch_edges(
         input_to_level,
-        compact["dino_patch_index"],
-        compact["dino_valid"],
+        compact["image_patch_index"],
+        compact["image_valid"],
         num_tokens=3,
         num_patches=compact["dino_feature"].shape[0],
     )

@@ -117,6 +117,8 @@ def _update_correspondence_safetensors(
 ) -> str:
     """根据 DINO 元数据生成线性 patch 索引并原子化保存。"""
     tensors = load_safetensors(source_path)
+    with safe_open(source_path, framework='numpy') as source_file:
+        source_metadata = dict(source_file.metadata() or {})
     required = ('pixel_coord', 'valid')
     missing = [name for name in required if name not in tensors]
     if missing:
@@ -150,33 +152,60 @@ def _update_correspondence_safetensors(
     patch_rows = np.floor(
         pixel_rows.astype(np.float64) / patch_size
     ).astype(np.int64)
-    valid &= (
+    patch_inside = (
         (pixel_columns >= 0) & (pixel_columns < original_size[0])
         & (pixel_rows >= 0) & (pixel_rows < original_size[1])
         & (patch_columns >= 0) & (patch_columns < grid_width)
         & (patch_rows >= 0) & (patch_rows < grid_height)
     )
+    valid &= patch_inside
     patch_index = patch_rows * grid_width + patch_columns
     patch_index = patch_index.astype(np.int32, copy=False)
     patch_index[~valid] = -1
+
+    # 保留 tile 阶段写入的 observability 及未来扩展 tensor。DINO 更新只
+    # 负责修正 patch_index/valid，不应把其他逐点信息静默删除。
+    output_tensors = {
+        name: np.ascontiguousarray(value)
+        for name, value in tensors.items()
+    }
+    output_tensors.update(
+        pixel_coord=np.ascontiguousarray(pixel_coord, dtype=np.int32),
+        patch_index=np.ascontiguousarray(patch_index),
+        valid=np.ascontiguousarray(valid),
+    )
+    if 'observability' in output_tensors:
+        observability = np.asarray(output_tensors['observability']).reshape(-1)
+        if len(observability) != len(valid):
+            raise ValueError(
+                f'observability and valid length mismatch: {source_path}'
+            )
+        if not np.all(np.isfinite(observability)):
+            raise ValueError(f'observability contains non-finite values: {source_path}')
+        observability = np.clip(observability, 0.0, 1.0)
+        # image_valid 还可能因为正射表面过滤而为 False；这些点的低 q 对
+        # 可观测性分层分析仍有意义。这里只清零确实落在 DINO 网格外的点。
+        observability[~patch_inside] = 0.0
+        output_tensors['observability'] = np.ascontiguousarray(
+            observability, dtype=np.float16
+        )
+
+    output_metadata = dict(source_metadata)
+    output_metadata.update({
+        'schema': 'pointspace_image_mapping_v3',
+        'coordinate_order': 'row_col',
+        'feature_grid_size': json.dumps([grid_width, grid_height]),
+        'patch_size': str(patch_size),
+        'original_size': json.dumps(list(original_size)),
+    })
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = output_path.with_name(f'.{output_path.name}.{os.getpid()}.tmp')
     try:
         save_safetensors(
-            {
-                'pixel_coord': np.ascontiguousarray(pixel_coord, dtype=np.int32),
-                'patch_index': np.ascontiguousarray(patch_index),
-                'valid': np.ascontiguousarray(valid),
-            },
+            output_tensors,
             temporary_path,
-            metadata={
-                'schema': 'pointspace_dino_mapping_v1',
-                'coordinate_order': 'row_col',
-                'feature_grid_size': json.dumps([grid_width, grid_height]),
-                'patch_size': str(patch_size),
-                'original_size': json.dumps(list(original_size)),
-            },
+            metadata=output_metadata,
         )
         os.replace(temporary_path, output_path)
     finally:
@@ -1032,7 +1061,7 @@ if __name__ == '__main__':
         amp_dtype='float16',
 
         save_pca=True,
-        pca_output_dir='E:\data\湖北\joint_tiles\dino_pca',
+        pca_output_dir=r'E:\data\湖北\joint_tiles\dino_pca',
         pca_format='jpg',
         pca_max_samples=100000,
         

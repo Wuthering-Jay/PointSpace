@@ -1,50 +1,50 @@
-# HPSD LitePT-v1m4：训练与点特征提取完整配置。
-# tools/train.py 和 tools/test.py 均直接读取本文件，不依赖 base 配置。
+# OC-HPSD-v1m2 LitePT-v1m4：观测条件 HPSD + 结构化输入 masking + CSC。
+# 本配置完整独立，不依赖 base；最终方法在一个连续训练 run 中完成。
 
 # -------------------------------------------------------
 # 0. 数据路径与点输入特征
 # -------------------------------------------------------
 data_root = r"E:\data\湖北\joint_tiles"
 pointcloud_path = r"E:\data\云南\data\tile"
-feature_output_dir = r"E:\data\云南\hpsd_feature\litept_v1m4_concat"
-grid_size = 0.5  # 训练体素及测试 fragment 划分使用相同空间分辨率
-feature_keys = ("coord", "intensity", "echo")  # 3 + 1 + 2 = 6 维
+feature_output_dir = r"E:\data\云南\hpsd_feature\oc_hpsd_litept_v1m4"
+grid_size = 0.5
+feature_keys = ("coord", "intensity", "echo")
 in_channels = 6
+# 只有连续点-影像可观测度 q 不低于该值的点才可成为结构化 masking 候选。
+min_observability = 0.60
 
 # -------------------------------------------------------
 # 1. Checkpoint 与运行控制
 # -------------------------------------------------------
-save_path = "exp/hubei/hpsd/pretrain-litept-v1m4-concat-native1024"
-weight = "exp/hubei/hpsd/pretrain-litept-v1m4-concat-native1024/model/model_last.pth"
-resume = True
-evaluate = False  # HPSD 预训练没有语义标签验证集，不构建 data.val
+save_path = "exp/hubei/hpsd/pretrain-oc-hpsd-v1m2-litept-v1m4-native1024"
+weight = (
+    "exp/hubei/hpsd/pretrain-oc-hpsd-v1m2-litept-v1m4-native1024/"
+    "model/model_last.pth"
+)
+resume = False
+evaluate = False
 test_only = False
 seed = 42
 
 # -------------------------------------------------------
-# 2. Batch 与数据加载
+# 2. Batch、训练循环与精度
 # -------------------------------------------------------
 num_worker = 8
-batch_size_train = 20  # 全部 GPU 上期望的有效训练 batch
-batch_size_test = 1  # 全部 GPU 配置值；每 GPU fragment batch = 4 // world_size
-gradient_accumulation_steps = 4  # 单卡时 micro-batch=1，累计 4 步更新
-
-# -------------------------------------------------------
-# 3. 训练循环与数值精度
-# -------------------------------------------------------
+batch_size_train = 20
+batch_size_test = 1
+gradient_accumulation_steps = 4
 epoch = 10
 clip_grad = 3.0
-
 sync_bn = False
 enable_amp = True
 amp_dtype = "bfloat16"
 find_unused_parameters = False
 
 # -------------------------------------------------------
-# 4. 日志与优化器
+# 3. 日志、优化器与 hook
 # -------------------------------------------------------
 enable_wandb = False
-wandb_project = "pointspace-hpsd"
+wandb_project = "pointspace-oc-hpsd"
 wandb_key = None
 mix_prob = 0.0
 
@@ -58,18 +58,14 @@ scheduler = dict(
     div_factor=10.0,
     final_div_factor=1000.0,
 )
-
-# optimizer = dict(type="AdamW", lr=1e-3, weight_decay=2e-3)
-# scheduler = dict(
-#     type="CosineAnnealingLR",
-#     total_steps=epoch,
-# )
-param_dicts = [dict(keyword="block", lr=1e-4)] # example: [dict(keyword="block", lr_scale=0.1)]
+param_dicts = [dict(keyword="block", lr=1e-4)]
 
 hooks = [
     dict(type="CheckpointLoader"),
     dict(type="RuntimeInfoHook"),
     dict(type="ModelHook"),
+    # 按全局 step 更新 mask rate 与 CSC 权重；断点恢复无需保存临时阶段状态。
+    dict(type="ObservationCurriculumHook"),
     dict(type="IterationTimer", warmup_iter=2),
     dict(type="InformationWriter", interval=10),
     dict(type="CacheCleaner", time_multiplier=2.5, step_clean_interval=100),
@@ -80,39 +76,50 @@ train = dict(type="DefaultTrainer")
 test = dict(type="HPSDFeatureTester", verbose=True)
 
 # -------------------------------------------------------
-# 5. HPSD 测试特征导出
+# 4. 测试特征导出
 # -------------------------------------------------------
-# projected：导出 concat 层级表示投影后的 DINO 对齐 1024 维特征；
-# backbone：导出投影前的 concat 层级表示。
 feature_source = "projected"
-feature_dtype = "float16"  # Safetensors 输出类型，仅支持 float16/float32
-normalize_feature = True  # fragment 合并后再次执行 L2 归一化
-feature_aggregate_on_gpu = False  # GPU index_add 更快，但会占用 N*C*4 字节
+feature_dtype = "float16"
+normalize_feature = True
+feature_aggregate_on_gpu = False
 feature_overwrite = False
 
 # -------------------------------------------------------
-# 6. HPSD 蒸馏模型
+# 5. OC-HPSD 模型
 # -------------------------------------------------------
 model = dict(
-    type="HPSD-v1m1",
-    # 以 level 2 的 token 尺度建立 token-patch 对应关系。
+    type="OC-HPSD-v1m2",
     distill_level=2,
-    # 必须与 backbone enc_channels 完全一致，用于检查层级输出并确定融合维数。
     level_channels=(36, 72, 144, 252, 504),
-    # 保持 DINOv3 ViT-L 原生通道，不预先使用 PCA 压缩 teacher。
     teacher_channels=1024,
-    # 一个 token-patch edge 可能由多个点支持，sqrt_count 可抑制密度偏置。
     edge_weight="sqrt_count",
-    # 每个 tile 先独立平均 patch loss，再在 batch 内对 tile 等权平均。
     sample_balanced=True,
-    # correspondence 由离线工具确定性生成；关闭逐步越界检查以减少同步开销。
     validate_mapping=False,
-    # 将 level 3/4 通过 pooling_inverse 对齐到 level 2 后按通道 concat。
     fuse_deeper_features=True,
-    # concat 后只对有效 patch 使用轻量 MLP 映射到 DINO 原生 1024 维。
     projector_hidden_channels=1024,
-    # 仅反向重算 projector 与 cosine，不改变前向数值或 checkpoint 参数键。
     projector_checkpoint=True,
+    # CSC 只读取 level 2 之后的 F3/F4，上采样后映射到原生 1024D DINO。
+    completion_hidden_channels=1024,
+    completion_min_points=1,
+    completion_min_mask_fraction=0.1,
+    # mask_fraction 达到 0.5 后取满权重；更低覆盖率按比例平滑降权。
+    completion_full_weight_fraction=0.5,
+    # 同一训练 run：前 10% 纯 HPSD，之后 10% 线性打开 mask 与 CSC。
+    mask_rate=0.30,
+    lambda_csc=0.20,
+    curriculum_start=0.10,
+    curriculum_warmup=0.10,
+    masking=dict(
+        block_size=4.0,
+        min_observability=min_observability,
+        min_vertical_span=1.0,
+        min_anchor_points=64,
+        min_anchor_ratio=0.65,
+        max_mask_points=12288,
+        fallback_random_block=True,
+        # 完整 block 超出剩余预算时，仅在最后一个边界 block 内补足预算。
+        fill_partial_block=True,
+    ),
     backbone=dict(
         type="LitePT-v1m4",
         in_channels=in_channels,
@@ -134,16 +141,16 @@ model = dict(
         pre_norm=True,
         shuffle_orders=True,
         enable_flash=True,
-        traceable=True,  # 保留 pooling_parent/inverse，构造输入点到层级 token 映射
-        # 仅重算深层 LayerNorm-MLP-DropPath；不重算 pooling/attention/spconv。
+        traceable=True,
         checkpoint_mlp=True,
-        mask_token=False,
-        enc_mode=True,  # HPSD 只预训练 encoder，不构建语义分割 decoder
+        # simulated-missing 点在 embedding 后由 learned token 替换输入属性。
+        mask_token=True,
+        enc_mode=True,
     ),
 )
 
 # -------------------------------------------------------
-# 7. 训练数据：点云 + DINO patch + 点到 patch 关系
+# 6. 数据
 # -------------------------------------------------------
 data = dict(
     train=dict(
@@ -167,7 +174,6 @@ data = dict(
                 mode="train",
                 return_grid_coord=True,
             ),
-            # 裁剪后仅保留被当前点引用的 patch；不改变 DINO 值和 1024 维通道。
             dict(type="CompactImagePatches"),
         ],
         post_transform=[
@@ -181,6 +187,7 @@ data = dict(
                     "image_pixel_coord",
                     "image_patch_index",
                     "image_valid",
+                    "image_observability",
                     "dino_offset",
                     "image_source_patch_index",
                     "image_original_size",
@@ -192,7 +199,7 @@ data = dict(
             ),
         ],
     ),
-    # 测试仅需要点云。HPSDFeatureTester 不重新读取影像、DINO 或 correspondence。
+    # 导出阶段只读取点云，不生成 mask，也不需要 DINO/correspondence。
     test=dict(
         type="LasDataset",
         split="test",
@@ -206,7 +213,7 @@ data = dict(
                 type="GridSample",
                 grid_size=grid_size,
                 hash_type="fnv",
-                mode="test",  # 返回覆盖全部原始点的 fragment 列表
+                mode="test",
                 return_grid_coord=True,
                 return_inverse=True,
             ),
@@ -215,7 +222,6 @@ data = dict(
             dict(type="ToTensor"),
             dict(
                 type="Collect",
-                # index 用于把多个 fragment 的预测累加回原始点顺序。
                 keys=("coord", "grid_coord", "index"),
                 feat_keys=feature_keys,
             ),

@@ -16,7 +16,10 @@ from functools import partial
 from packaging import version
 
 import pointspace.utils.comm as comm
-from pointspace.utils.misc import intersection_and_union_gpu
+from pointspace.utils.misc import (
+    intersection_and_union_gpu,
+    semantic_segmentation_metrics,
+)
 
 from .default import HookBase
 from .builder import HOOKS
@@ -106,19 +109,26 @@ class ClsEvaluator(HookBase):
         intersection = self.trainer.storage.history("val_intersection").total
         union = self.trainer.storage.history("val_union").total
         target = self.trainer.storage.history("val_target").total
-        iou_class = intersection / (union + 1e-10)
-        acc_class = intersection / (target + 1e-10)
-        m_iou = np.mean(iou_class)
-        m_acc = np.mean(acc_class)
-        all_acc = sum(intersection) / (sum(target) + 1e-10)
+        metrics = semantic_segmentation_metrics(intersection, union, target)
+        iou_class = metrics["iou_class"]
+        acc_class = metrics["recall_class"]
+        precision_class = metrics["precision_class"]
+        f1_class = metrics["f1_class"]
+        m_iou = metrics["mIoU"]
+        m_acc = metrics["mAcc"]
+        all_acc = metrics["allAcc"]
         self.trainer.logger.info(
-            "Val result:  mIoU {:.4f}  mAcc {:.4f}  OA {:.4f}".format(
-                m_iou, m_acc, all_acc
+            "Val result: mIoU {:.4f}  mAcc {:.4f}  OA {:.4f}  "
+            "mF1 {:.4f}  fwIoU {:.4f}  Kappa {:.4f}".format(
+                m_iou,
+                m_acc,
+                all_acc,
+                metrics["mF1"],
+                metrics["fwIoU"],
+                metrics["kappa"],
             )
         )
         names = self.trainer.cfg.data.names
-        precision_class = intersection / (intersection + np.maximum(union - target, 0) + 1e-10)
-        f1_class = 2 * precision_class * acc_class / (precision_class + acc_class + 1e-10)
         max_name_len = max(len(n) for n in names)
         for i in range(self.trainer.cfg.data.num_classes):
             self.trainer.logger.info(
@@ -133,6 +143,9 @@ class ClsEvaluator(HookBase):
             self.trainer.writer.add_scalar("val/mIoU", m_iou, current_epoch)
             self.trainer.writer.add_scalar("val/mAcc", m_acc, current_epoch)
             self.trainer.writer.add_scalar("val/allAcc", all_acc, current_epoch)
+            self.trainer.writer.add_scalar("val/mF1", metrics["mF1"], current_epoch)
+            self.trainer.writer.add_scalar("val/fwIoU", metrics["fwIoU"], current_epoch)
+            self.trainer.writer.add_scalar("val/kappa", metrics["kappa"], current_epoch)
             if self.trainer.cfg.enable_wandb:
                 wandb.log(
                     {
@@ -141,6 +154,9 @@ class ClsEvaluator(HookBase):
                         "val/mIoU": m_iou,
                         "val/mAcc": m_acc,
                         "val/allAcc": all_acc,
+                        "val/mF1": metrics["mF1"],
+                        "val/fwIoU": metrics["fwIoU"],
+                        "val/kappa": metrics["kappa"],
                     },
                     step=wandb.run.step,
                 )
@@ -248,19 +264,26 @@ class SemSegEvaluator(HookBase):
         intersection = self.trainer.storage.history("val_intersection").total
         union = self.trainer.storage.history("val_union").total
         target = self.trainer.storage.history("val_target").total
-        iou_class = intersection / (union + 1e-10)
-        acc_class = intersection / (target + 1e-10)
-        m_iou = np.mean(iou_class)
-        m_acc = np.mean(acc_class)
-        all_acc = sum(intersection) / (sum(target) + 1e-10)
+        metrics = semantic_segmentation_metrics(intersection, union, target)
+        iou_class = metrics["iou_class"]
+        acc_class = metrics["recall_class"]
+        precision_class = metrics["precision_class"]
+        f1_class = metrics["f1_class"]
+        m_iou = metrics["mIoU"]
+        m_acc = metrics["mAcc"]
+        all_acc = metrics["allAcc"]
         self.trainer.logger.info(
-            "Val result:  mIoU {:.4f}  mAcc {:.4f}  OA {:.4f}".format(
-                m_iou, m_acc, all_acc
+            "Val result: mIoU {:.4f}  mAcc {:.4f}  OA {:.4f}  "
+            "mF1 {:.4f}  fwIoU {:.4f}  Kappa {:.4f}".format(
+                m_iou,
+                m_acc,
+                all_acc,
+                metrics["mF1"],
+                metrics["fwIoU"],
+                metrics["kappa"],
             )
         )
         names = self.trainer.cfg.data.names
-        precision_class = intersection / (intersection + np.maximum(union - target, 0) + 1e-10)
-        f1_class = 2 * precision_class * acc_class / (precision_class + acc_class + 1e-10)
         max_name_len = max(len(n) for n in names)
         for i in range(self.trainer.cfg.data.num_classes):
             self.trainer.logger.info(
@@ -275,6 +298,9 @@ class SemSegEvaluator(HookBase):
             self.trainer.writer.add_scalar("val/mIoU", m_iou, current_epoch)
             self.trainer.writer.add_scalar("val/mAcc", m_acc, current_epoch)
             self.trainer.writer.add_scalar("val/allAcc", all_acc, current_epoch)
+            self.trainer.writer.add_scalar("val/mF1", metrics["mF1"], current_epoch)
+            self.trainer.writer.add_scalar("val/fwIoU", metrics["fwIoU"], current_epoch)
+            self.trainer.writer.add_scalar("val/kappa", metrics["kappa"], current_epoch)
             if self.trainer.cfg.enable_wandb:
                 wandb.log(
                     {
@@ -283,6 +309,9 @@ class SemSegEvaluator(HookBase):
                         "val/mIoU": m_iou,
                         "val/mAcc": m_acc,
                         "val/allAcc": all_acc,
+                        "val/mF1": metrics["mF1"],
+                        "val/fwIoU": metrics["fwIoU"],
+                        "val/kappa": metrics["kappa"],
                     },
                     step=wandb.run.step,
                 )

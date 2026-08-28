@@ -6,7 +6,7 @@ LAS/LAZ and GeoTIFF Tile Processor
 - 复用 tile_las.py 的滑动窗口、最小点数合并和最大点数递归切分逻辑
 - GeoTIFF 按窗口读取，不会将整幅大影像载入内存
 - 多幅相交影像自动拼接，无影像覆盖区域填充为黑色（像素值 0）
-- 使用 Safetensors 保存逐点像素坐标和影像覆盖有效标记
+- 使用 Safetensors 保存逐点像素坐标、影像覆盖有效标记和连续可观测度
 """
 
 import copy
@@ -14,6 +14,7 @@ import json
 import logging
 import multiprocessing
 import os
+import shutil
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
@@ -21,6 +22,8 @@ from typing import Dict, List, Optional, Tuple, Union
 import laspy
 import numpy as np
 import rasterio
+from safetensors import safe_open
+from safetensors.numpy import load_file as load_safetensors
 from safetensors.numpy import save_file as save_safetensors
 from rasterio.enums import Resampling
 from rasterio.transform import Affine
@@ -65,6 +68,8 @@ class LASImageTileProcessor:
         surface_radius: 点的水平遮挡作用半径；None 或 'auto' 表示采用一个
             surface_cell_size，设为 0 则不向相邻栅格扩展
         surface_z_tolerance: 点与局部最高表面的允许高差
+        echo_decay: 连续可观测度随回波序号增加的指数衰减系数。第一回波
+            权重为 1，第 r 回波权重为 exp(-echo_decay * (r - 1))
 
     Notes:
         输入影像必须具有相同的 CRS、波段数、数据类型、分辨率和无旋转
@@ -88,6 +93,7 @@ class LASImageTileProcessor:
         surface_cell_size: Optional[Union[float, str]] = None,
         surface_radius: Optional[Union[float, str]] = None,
         surface_z_tolerance: float = 0.15,
+        echo_decay: float = 0.7,
     ):
         self.pointcloud_path = Path(pointcloud_path)
         self.image_path = Path(image_path)
@@ -103,6 +109,7 @@ class LASImageTileProcessor:
         self.surface_cell_size = surface_cell_size
         self.surface_radius = surface_radius
         self.surface_z_tolerance = float(surface_z_tolerance)
+        self.echo_decay = float(echo_decay)
 
         self.logger = get_root_logger()
         self._validate_parameters()
@@ -152,6 +159,8 @@ class LASImageTileProcessor:
         )
         if self.surface_z_tolerance < 0:
             raise ValueError('surface_z_tolerance must be non-negative')
+        if self.echo_decay < 0:
+            raise ValueError('echo_decay must be non-negative')
 
     @staticmethod
     def _validate_auto_or_nonnegative(value, name: str, allow_zero: bool):
@@ -211,6 +220,10 @@ class LASImageTileProcessor:
                     'dtype': dataset.dtypes[0],
                     'nodata': dataset.nodata,
                     'profile': dataset.profile.copy(),
+                    'mask_all_valid': all(
+                        any(flag.name == 'all_valid' for flag in flags)
+                        for flags in dataset.mask_flag_enums
+                    ),
                 })
 
         reference = catalog[0]
@@ -262,7 +275,8 @@ class LASImageTileProcessor:
                 '  Surface-only valid: enabled '
                 f'(cell_size={cell_size_text}, '
                 f'radius={radius_text}, '
-                f'z_tolerance={self.surface_z_tolerance})'
+                f'z_tolerance={self.surface_z_tolerance}, '
+                f'echo_decay={self.echo_decay})'
             )
 
         total_tiles = 0
@@ -309,9 +323,20 @@ class LASImageTileProcessor:
         self.logger.info(f'  Read {len(points):,} points')
 
         surface_visible = None
+        surface_observability = None
         if self.surface_only_valid:
             surface_start = time.time()
-            surface_visible = self._compute_surface_visibility(points)
+            surface_visible, surface_observability = self._compute_surface_state(
+                points
+            )
+            if 'return_number' in las_data.point_format.dimension_names:
+                return_number = np.asarray(las_data.return_number, dtype=np.float32)
+                echo_depth = np.maximum(return_number - 1.0, 0.0)
+                surface_observability *= np.exp(-self.echo_decay * echo_depth)
+            else:
+                self.logger.warning(
+                    f'  {las_file.name} has no return_number; echo weighting skipped'
+                )
             visible_count = int(np.count_nonzero(surface_visible))
             self.logger.info(
                 f'  Surface visibility: {visible_count:,}/{len(points):,} points '
@@ -327,7 +352,12 @@ class LASImageTileProcessor:
             self.logger.info(f'  Generated {len(segments)} tiles')
 
         saved_count = self._save_tiles(
-            las_file, las_data, points, segments, surface_visible
+            las_file,
+            las_data,
+            points,
+            segments,
+            surface_visible,
+            surface_observability,
         )
         self.logger.info(
             f'  Completed {saved_count} tiles in {time.time() - file_start:.2f}s'
@@ -423,15 +453,26 @@ class LASImageTileProcessor:
         return float(np.median(local_spacing))
 
     def _compute_surface_visibility(self, points: np.ndarray) -> np.ndarray:
+        """兼容旧调用，只返回正射表面硬可见标记。"""
+        visible, _ = self._compute_surface_state(points)
+        return visible
+
+    def _compute_surface_state(
+        self,
+        points: np.ndarray,
+        log_parameters: bool = True,
+    ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        使用正射 Z-buffer 判断可见表面点。
+        使用正射 Z-buffer 计算硬可见标记和连续表面可观测度。
 
         每个 DSM 单元先记录其中的最高 Z，然后用二维最大滤波将最高表面
         扩展到 surface_radius 邻域。点高度距邻域最高表面不超过
-        surface_z_tolerance 时视为正射可见。
+        surface_z_tolerance 时视为正射可见。连续可观测度采用高差的高斯
+        衰减；它只描述表面接近程度，影像覆盖会在写 correspondence 时
+        继续作为硬门控。
         """
         if len(points) == 0:
-            return np.empty(0, dtype=bool)
+            return np.empty(0, dtype=bool), np.empty(0, dtype=np.float32)
 
         cell_size, radius, width, height = self._resolve_surface_parameters(points)
         xy_min = np.min(points[:, :2], axis=0)
@@ -458,14 +499,23 @@ class LASImageTileProcessor:
             surface_dsm = dsm
 
         surface_z = surface_dsm[rows, columns]
-        visible = points[:, 2] >= (
-            surface_z.astype(np.float64) - self.surface_z_tolerance
+        height_gap = np.maximum(
+            surface_z.astype(np.float64) - points[:, 2],
+            0.0,
         )
-        self.logger.info(
-            f'  Surface DSM: cell={cell_size:.3f}, radius={radius:.3f}, '
-            f'grid={width}x{height}'
-        )
-        return visible
+        visible = height_gap <= self.surface_z_tolerance
+        if self.surface_z_tolerance > 0:
+            normalized_gap = height_gap / self.surface_z_tolerance
+            observability = np.exp(-0.5 * normalized_gap ** 2)
+        else:
+            observability = (height_gap <= 1e-9).astype(np.float64)
+        observability = np.clip(observability, 0.0, 1.0).astype(np.float32)
+        if log_parameters:
+            self.logger.info(
+                f'  Surface DSM: cell={cell_size:.3f}, radius={radius:.3f}, '
+                f'grid={width}x{height}'
+            )
+        return visible, observability
 
     def _segment_point_cloud(
         self,
@@ -589,6 +639,7 @@ class LASImageTileProcessor:
         points: np.ndarray,
         segments: List[np.ndarray],
         surface_visible: Optional[np.ndarray] = None,
+        surface_observability: Optional[np.ndarray] = None,
     ) -> int:
         """保存点云、影像和点像素对应关系。"""
         saved_count = 0
@@ -625,6 +676,11 @@ class LASImageTileProcessor:
                 surface_visible=(
                     surface_visible[indices]
                     if surface_visible is not None
+                    else None
+                ),
+                surface_observability=(
+                    surface_observability[indices]
+                    if surface_observability is not None
                     else None
                 ),
             )
@@ -849,8 +905,9 @@ class LASImageTileProcessor:
         coverage: np.ndarray,
         output_path: Path,
         surface_visible: Optional[np.ndarray] = None,
+        surface_observability: Optional[np.ndarray] = None,
     ):
-        """保存点在输出影像中的像素坐标及有效覆盖标记 Safetensors。"""
+        """保存逐点像素坐标、硬有效标记和连续可观测度。"""
         inverse = ~transform
         columns_float = inverse.a * xy[:, 0] + inverse.b * xy[:, 1] + inverse.c
         rows_float = inverse.d * xy[:, 0] + inverse.e * xy[:, 1] + inverse.f
@@ -861,12 +918,26 @@ class LASImageTileProcessor:
             (columns >= 0) & (columns < width)
             & (rows >= 0) & (rows < height)
         )
-        valid = np.zeros(len(xy), dtype=np.uint8)
-        valid[inside] = coverage[rows[inside], columns[inside]].astype(np.uint8)
+        covered = np.zeros(len(xy), dtype=bool)
+        covered[inside] = coverage[rows[inside], columns[inside]]
+        valid = covered.astype(np.uint8)
         if surface_visible is not None:
             if len(surface_visible) != len(xy):
                 raise ValueError('surface_visible and xy must have the same length')
             valid &= surface_visible.astype(np.uint8)
+        if surface_observability is None:
+            observability = covered.astype(np.float32)
+        else:
+            if len(surface_observability) != len(xy):
+                raise ValueError(
+                    'surface_observability and xy must have the same length'
+                )
+            observability = np.clip(
+                np.asarray(surface_observability, dtype=np.float32),
+                0.0,
+                1.0,
+            )
+            observability *= covered.astype(np.float32)
         pixel_coord = np.empty((len(xy), 2), dtype=np.int32)
         pixel_coord[:, 0] = rows
         pixel_coord[:, 1] = columns
@@ -878,17 +949,238 @@ class LASImageTileProcessor:
                 {
                     'pixel_coord': pixel_coord,
                     'valid': valid.astype(bool, copy=False),
+                    'observability': observability.astype(np.float16),
                 },
                 temporary_path,
                 metadata={
-                    'schema': 'pointspace_image_mapping_v1',
+                    'schema': 'pointspace_image_mapping_v2',
                     'coordinate_order': 'row_col',
+                    'observability': (
+                        'coverage_x_surface_gaussian_x_echo_decay'
+                        if surface_observability is not None
+                        else 'coverage_only'
+                    ),
+                    'surface_z_tolerance': str(self.surface_z_tolerance),
+                    'echo_weighting': (
+                        'exp_decay_by_return_number'
+                        if surface_observability is not None
+                        else 'none'
+                    ),
+                    'echo_decay': str(self.echo_decay),
                 },
             )
             os.replace(temporary_path, output_path)
         finally:
             if temporary_path.exists():
                 temporary_path.unlink()
+
+    def _point_image_coverage(self, xy: np.ndarray) -> np.ndarray:
+        """按原始正射影像范围与 mask 判断每个点是否具有像素覆盖。"""
+        covered = np.zeros(len(xy), dtype=bool)
+        if len(xy) == 0:
+            return covered
+        xmin, ymin = np.min(xy, axis=0)
+        xmax, ymax = np.max(xy, axis=0)
+        for raster in self.raster_catalog:
+            left, bottom, right, top = raster['bounds']
+            if right <= xmin or left > xmax or top <= ymin or bottom > ymax:
+                continue
+            inside = (
+                (xy[:, 0] >= left) & (xy[:, 0] < right)
+                & (xy[:, 1] >= bottom) & (xy[:, 1] < top)
+                & ~covered
+            )
+            indices = np.flatnonzero(inside)
+            if len(indices) == 0:
+                continue
+            if raster['mask_all_valid']:
+                covered[indices] = True
+                continue
+            with rasterio.open(raster['path']) as dataset:
+                samples = np.ma.asarray(list(dataset.sample(xy[indices], masked=True)))
+            sample_mask = np.ma.getmaskarray(samples)
+            if sample_mask.ndim == 1:
+                sample_valid = ~sample_mask
+            else:
+                sample_valid = ~np.any(sample_mask, axis=1)
+            covered[indices[sample_valid]] = True
+        return covered
+
+    def update_correspondence_observability(
+        self,
+        correspondence_path: Union[str, Path],
+        backup_dir: Optional[Union[str, Path]] = None,
+        raise_on_error: bool = True,
+    ) -> List[Dict]:
+        """
+        用同名 LAS/LAZ、原始正射覆盖、DSM 和回波序号原地更新映射。
+
+        更新只改写 ``valid``、``observability`` 及相关元数据，保留已有
+        ``pixel_coord``、``patch_index`` 和未来扩展 tensor。若给出
+        ``backup_dir``，每个源文件会在首次改写前复制一份可恢复备份。
+        """
+        correspondence_files = self._find_files(
+            Path(correspondence_path), ('.safetensors',), 'correspondence'
+        )
+        correspondence_by_stem = {path.stem: path for path in correspondence_files}
+        if len(correspondence_by_stem) != len(correspondence_files):
+            raise ValueError('Duplicate correspondence stems are not supported')
+
+        backup_path = Path(backup_dir) if backup_dir is not None else None
+        if backup_path is not None:
+            source_path = Path(correspondence_path).resolve()
+            if backup_path.resolve() == source_path:
+                raise ValueError('backup_dir must differ from correspondence_path')
+            backup_path.mkdir(parents=True, exist_ok=True)
+
+        results = []
+        for las_file in tqdm(self.las_files, desc='Update observability'):
+            mapping_path = correspondence_by_stem.get(las_file.stem)
+            if mapping_path is None:
+                message = f'No same-stem correspondence for {las_file.name}'
+                if raise_on_error:
+                    raise FileNotFoundError(message)
+                results.append({'file': las_file.name, 'status': 'skipped', 'reason': message})
+                continue
+            try:
+                with laspy.open(las_file) as reader:
+                    las_data = reader.read()
+                points = np.column_stack((las_data.x, las_data.y, las_data.z))
+                tensors = load_safetensors(mapping_path)
+                with safe_open(mapping_path, framework='numpy') as source_file:
+                    metadata = dict(source_file.metadata() or {})
+
+                required = {'pixel_coord', 'patch_index', 'valid'}
+                missing = required.difference(tensors)
+                if missing:
+                    raise ValueError(f'missing tensors: {sorted(missing)}')
+                if len(tensors['valid']) != len(points):
+                    raise ValueError(
+                        f'point/mapping length mismatch: {len(points)} != '
+                        f'{len(tensors["valid"])}'
+                    )
+
+                covered = self._point_image_coverage(points[:, :2])
+                surface_visible, observability = self._compute_surface_state(
+                    points, log_parameters=False
+                )
+                if 'return_number' in las_data.point_format.dimension_names:
+                    return_number = np.asarray(
+                        las_data.return_number, dtype=np.float32
+                    )
+                    echo_depth = np.maximum(return_number - 1.0, 0.0)
+                    observability *= np.exp(-self.echo_decay * echo_depth)
+                pixel_coord = np.asarray(tensors['pixel_coord'])
+                try:
+                    original_width, original_height = json.loads(
+                        metadata['original_size']
+                    )
+                    grid_width, grid_height = json.loads(
+                        metadata['feature_grid_size']
+                    )
+                    patch_size = int(metadata['patch_size'])
+                except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+                    raise ValueError(
+                        'mapping metadata must contain original_size, '
+                        'feature_grid_size and patch_size'
+                    ) from error
+                pixel_rows = pixel_coord[:, 0]
+                pixel_columns = pixel_coord[:, 1]
+                patch_rows = np.floor_divide(pixel_rows, patch_size)
+                patch_columns = np.floor_divide(pixel_columns, patch_size)
+                patch_inside = (
+                    (pixel_columns >= 0) & (pixel_columns < original_width)
+                    & (pixel_rows >= 0) & (pixel_rows < original_height)
+                    & (patch_columns >= 0) & (patch_columns < grid_width)
+                    & (patch_rows >= 0) & (patch_rows < grid_height)
+                )
+                valid = covered & surface_visible & patch_inside
+                observability *= covered.astype(np.float32)
+                observability *= patch_inside.astype(np.float32)
+                patch_index = patch_rows * grid_width + patch_columns
+                patch_index = patch_index.astype(np.int32, copy=False)
+                patch_index[~valid] = -1
+
+                output_tensors = {
+                    name: np.ascontiguousarray(value)
+                    for name, value in tensors.items()
+                }
+                output_tensors['valid'] = np.ascontiguousarray(valid)
+                output_tensors['patch_index'] = np.ascontiguousarray(patch_index)
+                output_tensors['observability'] = np.ascontiguousarray(
+                    np.clip(observability, 0.0, 1.0), dtype=np.float16
+                )
+                metadata.update({
+                    'schema': 'pointspace_image_mapping_v3',
+                    'observability': 'coverage_x_surface_gaussian_x_echo_decay',
+                    'surface_z_tolerance': str(self.surface_z_tolerance),
+                    'echo_weighting': 'exp_decay_by_return_number',
+                    'echo_decay': str(self.echo_decay),
+                })
+
+                if backup_path is not None:
+                    backup_file = backup_path / mapping_path.name
+                    if not backup_file.exists():
+                        shutil.copy2(mapping_path, backup_file)
+                temporary_path = mapping_path.with_name(
+                    f'.{mapping_path.name}.{os.getpid()}.tmp'
+                )
+                try:
+                    save_safetensors(output_tensors, temporary_path, metadata=metadata)
+                    os.replace(temporary_path, mapping_path)
+                finally:
+                    if temporary_path.exists():
+                        temporary_path.unlink()
+                results.append({
+                    'file': mapping_path.name,
+                    'status': 'updated',
+                    'valid': int(np.count_nonzero(valid)),
+                    'points': len(points),
+                })
+            except Exception as error:
+                if raise_on_error:
+                    raise
+                results.append({
+                    'file': mapping_path.name,
+                    'status': 'failed',
+                    'reason': str(error),
+                })
+        return results
+
+
+def update_correspondence_observability(
+    pointcloud_path: Union[str, Path],
+    image_path: Union[str, Path],
+    correspondence_path: Union[str, Path],
+    backup_dir: Optional[Union[str, Path]] = None,
+    surface_cell_size: Optional[Union[float, str]] = None,
+    surface_radius: Optional[Union[float, str]] = None,
+    surface_z_tolerance: float = 0.15,
+    echo_decay: float = 0.7,
+    raise_on_error: bool = True,
+) -> List[Dict]:
+    """更新已有 correspondence 的硬有效标记与连续可观测度。"""
+    correspondence_path = Path(correspondence_path)
+    output_dir = (
+        correspondence_path.parent
+        if correspondence_path.is_file()
+        else correspondence_path.parent
+    )
+    processor = LASImageTileProcessor(
+        pointcloud_path=pointcloud_path,
+        image_path=image_path,
+        output_dir=output_dir,
+        surface_only_valid=True,
+        surface_cell_size=surface_cell_size,
+        surface_radius=surface_radius,
+        surface_z_tolerance=surface_z_tolerance,
+        echo_decay=echo_decay,
+    )
+    return processor.update_correspondence_observability(
+        correspondence_path=correspondence_path,
+        backup_dir=backup_dir,
+        raise_on_error=raise_on_error,
+    )
 
 
 def tile_las_image(
@@ -906,6 +1198,7 @@ def tile_las_image(
     surface_cell_size: Optional[Union[float, str]] = None,
     surface_radius: Optional[Union[float, str]] = None,
     surface_z_tolerance: float = 0.15,
+    echo_decay: float = 0.7,
 ):
     """创建处理器并联合分块全部点云和 GeoTIFF。"""
     processor = LASImageTileProcessor(
@@ -923,6 +1216,7 @@ def tile_las_image(
         surface_cell_size=surface_cell_size,
         surface_radius=surface_radius,
         surface_z_tolerance=surface_z_tolerance,
+        echo_decay=echo_decay,
     )
     return processor.process_all_files()
 
@@ -944,4 +1238,5 @@ if __name__ == '__main__':
         surface_cell_size='auto',
         surface_radius='auto',
         surface_z_tolerance=0.15,
+        echo_decay=0.7,
     )

@@ -50,7 +50,7 @@ def collate_fn(batch):
             # Point-to-patch indices are local inside each sample.  Convert
             # valid entries to indices of the concatenated [sum(P), C] feature
             # tensor while preserving -1 for points without image coverage.
-            if key == "dino_patch_index":
+            if key == "image_patch_index":
                 adjusted = []
                 patch_start = 0
                 for sample, item in zip(batch, items):

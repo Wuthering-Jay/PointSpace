@@ -35,6 +35,7 @@ from pointspace.utils.misc import (
     AverageMeter,
     intersection_and_union,
     intersection_and_union_gpu,
+    semantic_segmentation_metrics,
     make_dirs,
 )
 
@@ -550,20 +551,24 @@ class SemSegTester(TesterBase):
                     intersection=intersection, union=union, target=target
                 )
 
-            iou_class = intersection / (union + 1e-10)
-            accuracy_class = intersection / (target + 1e-10)
-            mIoU = np.mean(iou_class)
-            mAcc = np.mean(accuracy_class)
-            allAcc = sum(intersection) / (sum(target) + 1e-10)
+            metrics = semantic_segmentation_metrics(intersection, union, target)
+            iou_class = metrics["iou_class"]
+            accuracy_class = metrics["recall_class"]
+            precision_class = metrics["precision_class"]
+            f1_class = metrics["f1_class"]
 
             logger.info(
-                "Test result:  mIoU {:.4f}  mAcc {:.4f}  OA {:.4f}".format(
-                    mIoU, mAcc, allAcc
+                "Test result: mIoU {:.4f}  mAcc {:.4f}  OA {:.4f}  "
+                "mF1 {:.4f}  fwIoU {:.4f}  Kappa {:.4f}".format(
+                    metrics["mIoU"],
+                    metrics["mAcc"],
+                    metrics["allAcc"],
+                    metrics["mF1"],
+                    metrics["fwIoU"],
+                    metrics["kappa"],
                 )
             )
             names = self.cfg.data.names
-            precision_class = intersection / (intersection + np.maximum(union - target, 0) + 1e-10)
-            f1_class = 2 * precision_class * accuracy_class / (precision_class + accuracy_class + 1e-10)
             max_name_len = max(len(n) for n in names)
             for i in range(self.cfg.data.num_classes):
                 logger.info(

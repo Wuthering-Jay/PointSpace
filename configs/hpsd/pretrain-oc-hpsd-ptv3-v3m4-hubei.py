@@ -1,15 +1,19 @@
-# HPSD-VRSR PT-v3m4：DINO 蒸馏与不可视 token 监督传播完整配置。
-# 本文件不依赖 base；可直接由 tools/train.py 和 tools/test.py 调用。
+# OC-HPSD PT-v3m4：完整独立配置，不依赖 base。
 
 data_root = r"E:\data\湖北\joint_tiles"
 pointcloud_path = rf"{data_root}\pointcloud"
-feature_output_dir = rf"{data_root}\hpsd_feature\ptv3_v3m4_vrsr"
+feature_output_dir = rf"{data_root}\hpsd_feature\oc_hpsd_ptv3_v3m4"
 grid_size = 0.5
 feature_keys = ("coord", "intensity", "echo")
 in_channels = 6
+# 只有连续点-影像可观测度 q 不低于该值的点才可成为结构化 masking 候选。
+min_observability = 0.60
 
-save_path = "exp/hubei/hpsd/pretrain-ptv3-v3m4-vrsr"
-weight = "exp/hubei/hpsd/pretrain-ptv3-v3m4-concat-native1024/model/model_last.pth"
+save_path = "exp/hubei/hpsd/pretrain-oc-hpsd-ptv3-v3m4-native1024"
+weight = (
+    "exp/hubei/hpsd/pretrain-oc-hpsd-ptv3-v3m4-native1024/"
+    "model/model_last.pth"
+)
 resume = False
 evaluate = False
 test_only = False
@@ -20,15 +24,14 @@ batch_size_train = 4
 batch_size_test = 4
 gradient_accumulation_steps = 4
 epoch = 100
-eval_epoch = 100
 clip_grad = 3.0
-
 sync_bn = False
 enable_amp = True
 amp_dtype = "bfloat16"
 find_unused_parameters = False
+
 enable_wandb = False
-wandb_project = "pointspace-hpsd-vrsr"
+wandb_project = "pointspace-oc-hpsd"
 wandb_key = None
 mix_prob = 0.0
 param_dicts = None
@@ -48,6 +51,7 @@ hooks = [
     dict(type="CheckpointLoader"),
     dict(type="RuntimeInfoHook"),
     dict(type="ModelHook"),
+    dict(type="ObservationCurriculumHook"),
     dict(type="IterationTimer", warmup_iter=2),
     dict(type="InformationWriter", interval=10),
     dict(type="CacheCleaner", time_multiplier=5, step_clean_interval=200),
@@ -63,7 +67,7 @@ feature_aggregate_on_gpu = True
 feature_overwrite = False
 
 model = dict(
-    type="HPSD-VRSR-v1m1",
+    type="OC-HPSD-v1m1",
     distill_level=2,
     level_channels=(36, 72, 144, 288, 576),
     teacher_channels=1024,
@@ -72,24 +76,22 @@ model = dict(
     validate_mapping=False,
     fuse_deeper_features=True,
     projector_hidden_channels=1024,
-    vrsr=dict(
-        # 默认先执行 P2；P3 加载校准 checkpoint 后设 local。
-        mode="calibrate",
-        propagation_channels=128,
-        hidden_channels=256,
-        projection_seed=3407,
-        source_q=0.6,
-        target_q=0.0,
-        min_source_points=4,
-        min_source_patches=1,
-        source_purity=0.90,
-        topk=8,
-        temperature=0.1,
-        max_sources=512,
-        max_targets=1024,
-        query_chunk_size=256,
-        lambda_cal=0.05,
-        lambda_local=0.02,
+    projector_checkpoint=True,
+    completion_hidden_channels=1024,
+    completion_min_points=1,
+    completion_min_mask_fraction=0.5,
+    mask_rate=0.30,
+    lambda_csc=0.20,
+    curriculum_start=0.10,
+    curriculum_warmup=0.10,
+    masking=dict(
+        block_size=4.0,
+        min_observability=min_observability,
+        min_vertical_span=1.0,
+        min_anchor_points=64,
+        min_anchor_ratio=0.65,
+        max_mask_points=8192,
+        fallback_random_block=True,
     ),
     backbone=dict(
         type="PT-v3m4",
@@ -113,7 +115,7 @@ model = dict(
         upcast_attention=False,
         upcast_softmax=False,
         traceable=True,
-        mask_token=False,
+        mask_token=True,
         enc_mode=True,
     ),
 )
@@ -136,7 +138,7 @@ data = dict(
                 return_grid_coord=True,
             ),
             dict(type="SphereCrop", point_max=60000, mode="random"),
-            dict(type="CompactDinoPatches"),
+            dict(type="CompactImagePatches"),
         ],
         post_transform=[
             dict(type="ToTensor"),
@@ -146,15 +148,16 @@ data = dict(
                     "coord",
                     "grid_coord",
                     "dino_feature",
-                    "dino_pixel_coord",
-                    "dino_patch_index",
-                    "dino_valid",
+                    "image_pixel_coord",
+                    "image_patch_index",
+                    "image_valid",
+                    "image_observability",
                     "dino_offset",
-                    "dino_source_patch_index",
-                    "dino_original_size",
-                    "dino_padded_size",
-                    "dino_feature_size",
-                    "dino_patch_size",
+                    "image_source_patch_index",
+                    "image_original_size",
+                    "image_padded_size",
+                    "image_feature_size",
+                    "image_patch_size",
                 ),
                 feat_keys=feature_keys,
             ),

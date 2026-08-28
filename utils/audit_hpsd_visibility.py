@@ -23,11 +23,11 @@ if str(project_root) not in sys.path:
 
 from pointspace.datasets import build_dataset, point_collate_fn
 from pointspace.models import build_model
-from pointspace.models.backbone.hpsd.hpsd_v1m1 import build_token_patch_edges
-from pointspace.models.backbone.vrsr.ops import (
+from pointspace.models.backbone.hpsd.analysis_ops import (
     aggregate_patch_teacher_to_tokens,
     compute_token_visibility,
 )
+from pointspace.models.backbone.hpsd.hpsd_v1m1 import build_token_patch_edges
 from pointspace.models.utils.misc import offset2batch
 from pointspace.utils.config import Config
 from pointspace.utils.logger import get_root_logger
@@ -172,13 +172,13 @@ class VisibilityAuditor:
                 num_tokens = int(level.point.feat.shape[0])
                 visibility, valid_count, point_count = compute_token_visibility(
                     level.input_to_level,
-                    batch["dino_valid"],
+                    batch["image_valid"],
                     num_tokens,
                 )
                 edges = build_token_patch_edges(
                     level.input_to_level,
-                    batch["dino_patch_index"],
-                    batch["dino_valid"],
+                    batch["image_patch_index"],
+                    batch["image_valid"],
                     num_tokens=num_tokens,
                     num_patches=batch["dino_feature"].shape[0],
                     validate_mapping=False,
@@ -207,7 +207,7 @@ class VisibilityAuditor:
                     token_mask = token_batch == sample
                     point_num = int(point_mask.sum())
                     token_num = int(token_mask.sum())
-                    valid_num = int(batch["dino_valid"][point_mask].sum())
+                    valid_num = int(batch["image_valid"][point_mask].sum())
                     q = visibility[token_mask]
                     target_num = int((q == 0).sum())
                     source_num = int((token_batch[source_token] == sample).sum())

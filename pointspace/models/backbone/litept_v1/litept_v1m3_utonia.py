@@ -12,6 +12,7 @@ import torch.nn as nn
 import spconv.pytorch as spconv
 from timm.layers import DropPath
 from torch.nn.init import trunc_normal_
+from torch.utils.checkpoint import checkpoint
 
 try:
     import flash_attn
@@ -269,12 +270,14 @@ class Block(PointModule):
         shift_coords=None,
         jitter_coords=None,
         rescale_coords=None,
+        checkpoint_mlp=False,
     ):
         super().__init__()
         self.channels = channels
         self.pre_norm = pre_norm
         self.enable_conv = enable_conv
         self.enable_attn = enable_attn
+        self.checkpoint_mlp = bool(checkpoint_mlp)
 
         if self.enable_conv:
             self.conv = PointSequential(
@@ -340,12 +343,32 @@ class Block(PointModule):
                 point = self.norm1(point)
 
             shortcut = point.feat
-            if self.pre_norm:
-                point = self.norm2(point)
-            point = self.drop_path(self.mlp(point))
-            point.feat = shortcut + point.feat
-            if not self.pre_norm:
-                point = self.norm2(point)
+            if (
+                self.checkpoint_mlp
+                and self.pre_norm
+                and self.training
+                and torch.is_grad_enabled()
+            ):
+                # 该分支只接收和返回 feat tensor，不在重计算期间修改 Point。
+                # DropPath 的随机状态由 checkpoint 保存，前向语义保持不变。
+                def mlp_branch(feature):
+                    feature = self.norm2[0](feature)
+                    feature = self.mlp[0](feature)
+                    return self.drop_path[0](feature)
+
+                point.feat = shortcut + checkpoint(
+                    mlp_branch,
+                    point.feat,
+                    use_reentrant=False,
+                    preserve_rng_state=True,
+                )
+            else:
+                if self.pre_norm:
+                    point = self.norm2(point)
+                point = self.drop_path(self.mlp(point))
+                point.feat = shortcut + point.feat
+                if not self.pre_norm:
+                    point = self.norm2(point)
 
         point.sparse_conv_feat = point.sparse_conv_feat.replace_feature(point.feat)
         return point
@@ -389,6 +412,7 @@ class LitePT(PointModule):
         shift_coords=None,
         jitter_coords=None,
         rescale_coords=None,
+        checkpoint_mlp=False,
     ):
         super().__init__()
         self.num_stages = len(enc_depths)
@@ -470,6 +494,7 @@ class LitePT(PointModule):
                         shift_coords=shift_coords,
                         jitter_coords=jitter_coords,
                         rescale_coords=rescale_coords,
+                        checkpoint_mlp=checkpoint_mlp,
                     ),
                     name=f"block{i}",
                 )

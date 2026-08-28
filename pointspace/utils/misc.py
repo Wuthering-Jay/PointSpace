@@ -65,6 +65,47 @@ def intersection_and_union_gpu(output, target, k, ignore_index=-1):
     return area_intersection, area_union, area_target
 
 
+def semantic_segmentation_metrics(intersection, union, target, eps=1e-10):
+    """由逐类 intersection/union/target 计算常用语义分割指标。"""
+    intersection = np.asarray(intersection, dtype=np.float64)
+    union = np.asarray(union, dtype=np.float64)
+    target = np.asarray(target, dtype=np.float64)
+    if not (intersection.shape == union.shape == target.shape):
+        raise ValueError("intersection, union and target must have the same shape")
+    if intersection.ndim != 1:
+        raise ValueError("semantic segmentation statistics must be one-dimensional")
+    if np.any(intersection < 0) or np.any(union < 0) or np.any(target < 0):
+        raise ValueError("semantic segmentation statistics must be non-negative")
+
+    prediction = union - target + intersection
+    precision = intersection / (prediction + eps)
+    recall = intersection / (target + eps)
+    iou = intersection / (union + eps)
+    f1 = 2 * precision * recall / (precision + recall + eps)
+
+    total = float(target.sum())
+    frequency = target / (total + eps)
+    oa = float(intersection.sum() / (total + eps))
+    expected_agreement = float(
+        np.sum(target * prediction) / (total * total + eps)
+    )
+    kappa = float(
+        (oa - expected_agreement) / (1.0 - expected_agreement + eps)
+    )
+    return dict(
+        iou_class=iou,
+        precision_class=precision,
+        recall_class=recall,
+        f1_class=f1,
+        mIoU=float(np.mean(iou)),
+        mAcc=float(np.mean(recall)),
+        allAcc=oa,
+        mF1=float(np.mean(f1)),
+        fwIoU=float(np.sum(frequency * iou)),
+        kappa=kappa,
+    )
+
+
 def make_dirs(dir_name):
     if not os.path.exists(dir_name):
         os.makedirs(dir_name, exist_ok=True)

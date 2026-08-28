@@ -10,17 +10,21 @@
 
 点级字段（点采样、裁剪和体素下采样时与点云同步变化）：
 
-    dino_pixel_coord: (N, 2), int64
+    image_pixel_coord: (N, 2), int64
         每个点在原始正射影像中的像素坐标 ``(pixel_row, pixel_col)``。
         无影像覆盖时坐标可能超出影像范围，因此使用前还应检查
-        ``dino_valid``。
-    dino_patch_index: (N,), int64
+        ``image_valid``。
+    image_patch_index: (N,), int64
         每个点对应的一维 patch 索引，单样本内为
         ``patch_row * Wf + patch_col``。无效点为 -1；合批时有效索引会自动
         加上前序样本的 patch 数，可直接执行 ``dino_feature[index]``。
-    dino_valid: (N,), bool
+    image_valid: (N,), bool
         点是否具有有效的影像 patch 对应关系；开启表面点过滤生成映射时，
         该字段还同时反映点是否为正射视角下可见的表面点。
+    image_observability: (N,), float32
+        点的连续跨模态可观测度，范围为 ``[0, 1]``。新 correspondence
+        由表面 DSM 高差生成；旧文件缺少该 tensor 时自动回退为
+        ``image_valid.float()``。
 
 样本级字段（点采样时保持不变）：
 
@@ -29,18 +33,18 @@
     dino_offset: (1,), int64
         当前样本的 patch 数 P；合批后为各样本 patch 数的累积和，语义与
         点云 ``offset`` 一致。
-    dino_original_size: (1, 2), int64
+    image_original_size: (1, 2), int64
         原始影像尺寸 ``(height, width)``。
-    dino_padded_size: (1, 2), int64
+    image_padded_size: (1, 2), int64
         为适配 patch 或推理 tile 而补边后的尺寸 ``(height, width)``。
-    dino_feature_size: (1, 2), int64
+    image_feature_size: (1, 2), int64
         有效 DINO 特征网格尺寸 ``(Hf, Wf)``。
-    dino_patch_size: (1,), int64
+    image_patch_size: (1,), int64
         DINO 模型单个 patch 在原始影像上对应的像素边长。
 
 经过 ``point_collate_fn`` 合批后，点级字段沿点维拼接，``dino_feature``
 直接拼成 ``(sum(P), C)``，``dino_offset`` 变为累积边界。样本级尺寸字段
-变为 ``(B, ...)``，二维网格宽高仍可由 ``dino_feature_size`` 获取。
+变为 ``(B, ...)``，二维网格宽高仍可由 ``image_feature_size`` 获取。
 
 特意不使用项目已有的 ``correspondence`` 字段名，因为该字段在其他数据集
 中表示形状为 ``(N, num_images, 2)`` 的多视角像素关系，二者语义和形状不同。
@@ -52,6 +56,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import torch
 from safetensors import safe_open
 
 from pointspace.utils.logger import get_root_logger
@@ -67,10 +72,10 @@ class LasImageDataset(LasDataset):
     The three inputs are paired by file stem.  This dataset deliberately does
     not use the generic ``correspondence`` key: that key already means a
     multi-view ``[num_points, num_images, 2]`` pixel tensor in PointSpace.
-    DINO-related point coordinates use ``(row, col)`` order so they can index
+    Point-to-image coordinates use ``(row, col)`` order so they can index
     image or feature tensors directly.  The main output fields are
-    ``dino_feature`` (PC), ``dino_pixel_coord`` (N x 2),
-    ``dino_patch_index`` (N), and ``dino_valid`` (N).  All ``dino_*_size``
+    ``dino_feature`` (PC), ``image_pixel_coord`` (N x 2),
+    ``image_patch_index`` (N), and ``image_valid`` (N).  All ``image_*_size``
     fields likewise use ``(height, width)`` order.
 
     When explicit paths are omitted, the expected layout is::
@@ -84,10 +89,11 @@ class LasImageDataset(LasDataset):
     assets are read directly for every sample.
     """
 
-    DINO_POINT_KEYS = (
-        "dino_pixel_coord",
-        "dino_patch_index",
-        "dino_valid",
+    IMAGE_POINT_KEYS = (
+        "image_pixel_coord",
+        "image_patch_index",
+        "image_valid",
+        "image_observability",
     )
 
     def __init__(
@@ -272,6 +278,11 @@ class LasImageDataset(LasDataset):
                 pixel_coord = file.get_tensor("pixel_coord")
                 patch_index = file.get_tensor("patch_index")
                 valid = file.get_tensor("valid")
+                observability = (
+                    file.get_tensor("observability")
+                    if "observability" in file.keys()
+                    else None
+                )
                 mapping_metadata = file.metadata() or {}
         except Exception as error:
             raise ValueError(f"Failed to read mapping {path}: {error}") from error
@@ -282,16 +293,37 @@ class LasImageDataset(LasDataset):
             )
         if patch_index.shape != (num_points,) or valid.shape != (num_points,):
             raise ValueError(f"patch_index/valid length mismatch for {path}")
-        return pixel_coord.long(), patch_index.long(), valid.bool(), mapping_metadata
+        valid = valid.bool()
+        if observability is None:
+            observability = valid.float()
+        else:
+            if observability.shape != (num_points,):
+                raise ValueError(f"observability length mismatch for {path}")
+            observability = observability.float()
+            if not torch.isfinite(observability).all():
+                raise ValueError(f"observability contains non-finite values: {path}")
+            if torch.any((observability < 0) | (observability > 1)):
+                raise ValueError(f"observability must be within [0, 1]: {path}")
+        return (
+            pixel_coord.long(),
+            patch_index.long(),
+            valid,
+            observability,
+            mapping_metadata,
+        )
 
     def get_data(self, idx):
         data_dict = super().get_data(idx)
         name = data_dict["name"]
         feature_path, mapping_path = self._dino_assets[name]
         feature, metadata = self._load_dino_feature(feature_path)
-        pixel_coord, patch_index, valid, mapping_metadata = self._load_mapping(
-            mapping_path, data_dict["coord"].shape[0]
-        )
+        (
+            pixel_coord,
+            patch_index,
+            valid,
+            observability,
+            mapping_metadata,
+        ) = self._load_mapping(mapping_path, data_dict["coord"].shape[0])
 
         original_width, original_height = self._metadata_pair(
             metadata, "original_size"
@@ -328,24 +360,25 @@ class LasImageDataset(LasDataset):
         # collator can therefore concatenate them into [batch, ...].
         data_dict.update(
             dino_feature=feature,
-            dino_pixel_coord=pixel_coord,
-            dino_patch_index=patch_index,
-            dino_valid=valid,
+            image_pixel_coord=pixel_coord,
+            image_patch_index=patch_index,
+            image_valid=valid,
+            image_observability=observability,
             dino_offset=np.asarray([feature.shape[0]], dtype=np.int64),
-            dino_original_size=np.asarray(
+            image_original_size=np.asarray(
                 [[original_height, original_width]], dtype=np.int64
             ),
-            dino_padded_size=np.asarray(
+            image_padded_size=np.asarray(
                 [[padded_height, padded_width]], dtype=np.int64
             ),
-            dino_feature_size=np.asarray(
+            image_feature_size=np.asarray(
                 [[grid_height, grid_width]], dtype=np.int64
             ),
-            dino_patch_size=np.asarray([patch_size], dtype=np.int64),
+            image_patch_size=np.asarray([patch_size], dtype=np.int64),
         )
 
         point_keys = list(data_dict.get("index_valid_keys", []))
-        for key in self.DINO_POINT_KEYS:
+        for key in self.IMAGE_POINT_KEYS:
             if key not in point_keys:
                 point_keys.append(key)
         data_dict["index_valid_keys"] = point_keys
