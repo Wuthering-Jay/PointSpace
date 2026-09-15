@@ -33,16 +33,23 @@ try:
             ctx.save_for_backward(positions)
             ctx.saved_base = base
             ctx.saved_F0 = F0
-            # tokens = tokens.clone() # uncomment this if inplace doesn't work
+            if tokens.is_cuda:
+                return _kernels.pointrope_bhnd(tokens, positions, base, F0)
+            tokens = tokens.transpose(1, 2).contiguous()
             _kernels.pointrope(tokens, positions, base, F0)
-            ctx.mark_dirty(tokens)
-            return tokens
+            return tokens.transpose(1, 2).contiguous()
 
         @staticmethod
         def backward(ctx, grad_res):
             positions, base, F0 = ctx.saved_tensors[0], ctx.saved_base, ctx.saved_F0
-            _kernels.pointrope(grad_res, positions, base, -F0)
-            ctx.mark_dirty(grad_res)
+            if grad_res.is_cuda:
+                grad_res = _kernels.pointrope_bhnd(
+                    grad_res, positions, base, -F0
+                )
+            else:
+                grad_res = grad_res.transpose(1, 2).contiguous()
+                _kernels.pointrope(grad_res, positions, base, -F0)
+                grad_res = grad_res.transpose(1, 2).contiguous()
             return grad_res, None, None, None
 
     class PointROPE(torch.nn.Module):
@@ -52,10 +59,9 @@ try:
             self.F0 = F0
 
         def forward(self, tokens, positions):
-            tokens = tokens.transpose(1, 2).contiguous()
             positions = positions.contiguous()
             tokens = PointROPE_func.apply(tokens, positions, self.base, self.F0)
-            return tokens.transpose(1, 2).contiguous()
+            return tokens
 
 except Exception as e:
     print(
@@ -232,13 +238,13 @@ class PointROPEAttention(PointModule):
         pos = point.grid_coord[order]  # [N, 3]
         pos = pos.reshape(-1, 3).unsqueeze(0)
 
-        q, k, v = qkv.half().chunk(3, dim=-1)
+        # Preserve the dtype selected by the surrounding autocast context.
+        q, k, v = qkv.chunk(3, dim=-1)
         q = q.reshape(-1, H, C // H).transpose(0, 1)[None]  # [1, H, N, head_dim]
         k = k.reshape(-1, H, C // H).transpose(0, 1)[None]  # [1, H, N, head_dim]
 
-        # workround to make pointrope cuda float32 happy
-        q = self.rope(q.float(), pos).to(q.dtype)  # [1, H, N, head_dim]
-        k = self.rope(k.float(), pos).to(k.dtype)  # [1, H, N, head_dim]
+        q = self.rope(q, pos)  # [1, H, N, head_dim]
+        k = self.rope(k, pos)  # [1, H, N, head_dim]
 
         # assemble input for flash attention
         qkv_rotated = torch.stack(

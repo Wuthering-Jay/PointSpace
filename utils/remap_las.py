@@ -3,6 +3,11 @@ import numpy as np
 import laspy
 from pathlib import Path
 
+try:
+    from .las_io import write_standard_las
+except ImportError:
+    from las_io import write_standard_las
+
 def process_single_las(input_file: Path, output_file: Path, mapping_rule: dict, default_class: int = None):
     """
     处理单个 LAS/LAZ 文件，进行类别映射
@@ -37,7 +42,7 @@ def process_single_las(input_file: Path, output_file: Path, mapping_rule: dict, 
     las.classification = new_classes
     
     # 写出到目标路径（保持原有所有结构不变）
-    las.write(output_file)
+    write_standard_las(las, output_file)
     print(f"已保存至: {output_file}")
 
 

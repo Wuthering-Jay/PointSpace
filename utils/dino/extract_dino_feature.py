@@ -1044,9 +1044,9 @@ def extract_dino_features(
 
 if __name__ == '__main__':
     extract_dino_features(
-        image_path=r'E:\data\湖北\joint_tiles\image',
-        output_dir=r'E:\data\湖北\joint_tiles\dino_feature',
-        correspondence_path=r'E:\data\湖北\joint_tiles\correspondence',
+        image_path=r'G:\data\swiss\joint_tiles_100\image',
+        output_dir=r'G:\data\swiss\joint_tiles_100\dino_feature',
+        correspondence_path=r'G:\data\swiss\joint_tiles_100\correspondence',
         correspondence_output_dir=None,
         checkpoint_dir=DEFAULT_CHECKPOINT_DIR,
 
@@ -1061,7 +1061,7 @@ if __name__ == '__main__':
         amp_dtype='float16',
 
         save_pca=True,
-        pca_output_dir=r'E:\data\湖北\joint_tiles\dino_pca',
+        pca_output_dir=r'G:\data\swiss\joint_tiles_100\dino_pca',
         pca_format='jpg',
         pca_max_samples=100000,
         

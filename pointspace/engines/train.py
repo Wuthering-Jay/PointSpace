@@ -36,6 +36,11 @@ from pointspace.utils.optimizer import build_optimizer
 from pointspace.utils.scheduler import build_scheduler
 from pointspace.utils.events import EventStorage, ExceptionWriter
 from pointspace.utils.registry import Registry
+from .pcgrad import (
+    accumulate_gradient_tuple,
+    project_conflicting_gradient_group,
+    subtract_gradient_tuples,
+)
 
 
 TRAINERS = Registry("trainers")
@@ -133,6 +138,8 @@ class Trainer(TrainerBase):
         self.start_epoch = 0
         self.max_epoch = cfg.epoch
         self.best_metric_value = -torch.inf
+        self.best_metric_name = None
+        self.best_metric_mode = "max"
         self.logger = get_root_logger(
             log_file=os.path.join(cfg.save_path, "train.log"),
             file_mode="a" if cfg.resume else "w",
@@ -343,17 +350,27 @@ class Trainer(TrainerBase):
             else None
         )
 
+        loader_workers = self.cfg.num_worker_per_gpu
+        loader_kwargs = {}
+        if loader_workers > 0:
+            loader_kwargs["prefetch_factor"] = int(
+                getattr(self.cfg, "prefetch_factor", 2)
+            )
         train_loader = torch.utils.data.DataLoader(
             train_data,
             batch_size=self.cfg.batch_size_per_gpu,
             shuffle=(train_sampler is None),
-            num_workers=self.cfg.num_worker_per_gpu,
+            num_workers=loader_workers,
             sampler=train_sampler,
             collate_fn=partial(point_collate_fn, mix_prob=self.cfg.mix_prob),
             pin_memory=True,
             worker_init_fn=init_fn,
             drop_last=len(train_data) > self.cfg.batch_size_train,
-            persistent_workers=self.cfg.num_worker_per_gpu > 0,
+            persistent_workers=(
+                loader_workers > 0
+                and bool(getattr(self.cfg, "persistent_workers", True))
+            ),
+            **loader_kwargs,
         )
 
         # Log batch-size breakdown
@@ -433,14 +450,21 @@ class Trainer(TrainerBase):
                 val_sampler = torch.utils.data.distributed.DistributedSampler(val_data)
             else:
                 val_sampler = None
+            loader_workers = self.cfg.num_worker_per_gpu
+            loader_kwargs = {}
+            if loader_workers > 0:
+                loader_kwargs["prefetch_factor"] = int(
+                    getattr(self.cfg, "val_prefetch_factor", 2)
+                )
             val_loader = torch.utils.data.DataLoader(
                 val_data,
                 batch_size=self.cfg.batch_size_val_per_gpu,
                 shuffle=False,
-                num_workers=self.cfg.num_worker_per_gpu,
+                num_workers=loader_workers,
                 pin_memory=True,
                 sampler=val_sampler,
                 collate_fn=collate_fn,
+                **loader_kwargs,
             )
         return val_loader
 
@@ -465,6 +489,280 @@ class Trainer(TrainerBase):
             grad_scaler = torch.cuda.amp.GradScaler
         scaler = grad_scaler() if self.cfg.enable_amp else None
         return scaler
+
+
+@TRAINERS.register_module("CVRLPCGradTrainer")
+class CVRLPCGradTrainer(Trainer):
+    """DefaultTrainer with exact optimizer-step CVRL gradient surgery.
+
+    Every micro-batch contributes its weighted VPSD gradient to a private
+    accumulator while ordinary backward accumulates the combined gradient.
+    Only when ``gradient_accumulation_steps`` is reached is RRCL recovered by
+    subtraction and the accumulated task gradients projected stage by stage.
+    Task-private gradients, AMP unscaling and clipping remain unchanged.
+
+    In distributed training, the VPSD gradient is averaged before subtraction,
+    matching DDP's averaged combined gradient. All ranks therefore project the
+    same global task gradients and remain synchronized.
+    """
+
+    def __init__(self, cfg):
+        super().__init__(cfg)
+        model = self.model.module if hasattr(self.model, "module") else self.model
+        required = {
+            "pcgrad_parameter_groups",
+            "pcgrad_is_active",
+            "pcgrad_should_log",
+        }
+        missing = [name for name in required if not hasattr(model, name)]
+        if missing:
+            raise TypeError(
+                "CVRLPCGradTrainer requires a PCGrad-aware CVRL model; "
+                f"missing methods: {missing}"
+            )
+        groups = model.pcgrad_parameter_groups()
+        self._pcgrad_group_names = tuple(groups)
+        self._pcgrad_parameters = []
+        self._pcgrad_slices = {}
+        parameter_ids = set()
+        for name, parameters in groups.items():
+            start = len(self._pcgrad_parameters)
+            for parameter in parameters:
+                if id(parameter) in parameter_ids:
+                    raise RuntimeError(
+                        f"PCGrad parameter appears in more than one stage: {name}"
+                    )
+                parameter_ids.add(id(parameter))
+                self._pcgrad_parameters.append(parameter)
+            self._pcgrad_slices[name] = slice(
+                start, len(self._pcgrad_parameters)
+            )
+        self._pcgrad_parameters = tuple(self._pcgrad_parameters)
+        self._pcgrad_metric_sums = {}
+        self._pcgrad_metric_count = 0
+        self._pcgrad_window_active = False
+        self._pcgrad_visual_accum = None
+        self.logger.info(
+            "CVRL PCGrad: symmetric optimizer-step stages=%s start_ratio=%.3f "
+            "log_interval=%d shared_params=%d",
+            ",".join(self._pcgrad_group_names),
+            model.pcgrad_start_ratio,
+            model.pcgrad_log_interval,
+            sum(parameter.numel() for parameter in self._pcgrad_parameters),
+        )
+
+    def _visual_gradients(self, task_loss):
+        accumulation = self.cfg.gradient_accumulation_steps
+        objective = task_loss / accumulation
+        if self.cfg.enable_amp:
+            objective = self.scaler.scale(objective)
+        return torch.autograd.grad(
+            objective,
+            self._pcgrad_parameters,
+            retain_graph=True,
+            create_graph=False,
+            allow_unused=True,
+        )
+
+    def _project_task_gradients(self, visual_grad, return_grad):
+        projected = [None] * len(self._pcgrad_parameters)
+        metrics = {}
+        for stage in self._pcgrad_group_names:
+            group_slice = self._pcgrad_slices[stage]
+            grad_v = visual_grad[group_slice]
+            grad_r = return_grad[group_slice]
+            model = self.model.module if hasattr(self.model, "module") else self.model
+            projected_v, projected_r, stats = project_conflicting_gradient_group(
+                grad_v,
+                grad_r,
+                eps=model.pcgrad_eps,
+            )
+            for local_index, (original_v, original_r, new_v, new_r) in enumerate(
+                zip(grad_v, grad_r, projected_v, projected_r)
+            ):
+                if original_v is None and original_r is None:
+                    continue
+                combined = new_r if new_v is None else new_v
+                if original_v is not None and original_r is not None:
+                    combined = new_v + new_r
+                projected[group_slice.start + local_index] = combined
+            metrics.update(
+                {f"{stage}_{key}": value for key, value in stats.items()}
+            )
+
+        stage_conflicts = torch.stack(
+            [metrics[f"{stage}_conflict_rate"] for stage in self._pcgrad_group_names]
+        )
+        stage_projection = torch.stack(
+            [metrics[f"{stage}_projection_ratio"] for stage in self._pcgrad_group_names]
+        )
+        metrics["conflict_rate"] = stage_conflicts.mean()
+        metrics["projection_ratio"] = stage_projection.mean()
+        return projected, metrics
+
+    @staticmethod
+    def _distributed_average_gradients(gradients, parameters):
+        world_size = comm.get_world_size()
+        if world_size <= 1:
+            return gradients
+        pieces = [
+            (
+                torch.zeros_like(parameter).reshape(-1)
+                if gradient is None
+                else gradient.reshape(-1)
+            )
+            for gradient, parameter in zip(gradients, parameters)
+        ]
+        flat = torch.cat(pieces)
+        torch.distributed.all_reduce(flat, op=torch.distributed.ReduceOp.SUM)
+        flat.div_(world_size)
+        averaged = []
+        begin = 0
+        for parameter in parameters:
+            length = parameter.numel()
+            averaged.append(flat[begin : begin + length].view_as(parameter))
+            begin += length
+        return tuple(averaged)
+
+    def _combined_accumulated_gradients(self):
+        return tuple(
+            None if parameter.grad is None else parameter.grad.detach().clone()
+            for parameter in self._pcgrad_parameters
+        )
+
+    def _accumulate_pcgrad_metrics(self, metrics, output_dict, force_log=False):
+        scale = self.scaler.get_scale() if self.cfg.enable_amp else 1.0
+        # The task gradients have already been averaged over all micro-batches
+        # by their loss/gradient_accumulation_steps factors.
+        norm_rescale = 1.0 / float(scale)
+        for key, value in metrics.items():
+            value = value.detach().float()
+            if key.endswith("_visual_norm") or key.endswith("_return_norm"):
+                value = value * norm_rescale
+            if key not in self._pcgrad_metric_sums:
+                self._pcgrad_metric_sums[key] = value
+            else:
+                self._pcgrad_metric_sums[key] = (
+                    self._pcgrad_metric_sums[key] + value
+                )
+        self._pcgrad_metric_count += 1
+
+        model = self.model.module if hasattr(self.model, "module") else self.model
+        if not (model.pcgrad_should_log() or force_log):
+            return
+        count = max(self._pcgrad_metric_count, 1)
+        for key, value in self._pcgrad_metric_sums.items():
+            output_dict[f"grad/{key}"] = value / count
+        self._pcgrad_metric_sums.clear()
+        self._pcgrad_metric_count = 0
+
+    def run_step(self):
+        if version.parse(torch.__version__) >= version.parse("2.4"):
+            auto_cast = partial(torch.amp.autocast, device_type="cuda")
+        else:
+            auto_cast = torch.cuda.amp.autocast
+
+        input_dict = self.comm_info["input_dict"]
+        for key in input_dict:
+            if isinstance(input_dict[key], torch.Tensor):
+                input_dict[key] = input_dict[key].cuda(non_blocking=True)
+
+        model = self.model.module if hasattr(self.model, "module") else self.model
+        if self._gradient_accumulation_counter == 0:
+            self.optimizer.zero_grad()
+            self._pcgrad_window_active = model.pcgrad_is_active()
+            self._pcgrad_visual_accum = None
+
+        with auto_cast(
+            enabled=self.cfg.enable_amp, dtype=AMP_DTYPE[self.cfg.amp_dtype]
+        ):
+            output_dict = self.model(input_dict)
+            loss = output_dict["loss"] / self.cfg.gradient_accumulation_steps
+
+        visual_loss = output_dict.pop("_pcgrad_visual_loss", None)
+        return_loss = output_dict.pop("_pcgrad_return_loss", None)
+        output_dict.pop("_pcgrad_log", None)
+        # Activation is fixed at the beginning of an accumulation window so
+        # the 10% boundary cannot create a partially projected optimizer step.
+        pcgrad_active = self._pcgrad_window_active
+        if pcgrad_active and (visual_loss is None or return_loss is None):
+            raise RuntimeError(
+                "Active CVRL PCGrad step did not expose both task losses"
+            )
+
+        criteria = getattr(model, "criteria", None)
+        if criteria is not None and hasattr(criteria, "_last_individual_losses"):
+            for name, raw in criteria._last_individual_losses.items():
+                output_dict[f"loss/{name}"] = raw
+
+        visual_grad = None
+        if pcgrad_active:
+            visual_grad = self._visual_gradients(visual_loss)
+            visual_grad = self._distributed_average_gradients(
+                visual_grad, self._pcgrad_parameters
+            )
+            self._pcgrad_visual_accum = accumulate_gradient_tuple(
+                self._pcgrad_visual_accum, visual_grad
+            )
+
+        if self.cfg.enable_amp:
+            self.scaler.scale(loss).backward()
+        else:
+            loss.backward()
+
+        self._gradient_accumulation_counter += 1
+        if self._gradient_accumulation_counter >= self.cfg.gradient_accumulation_steps:
+            if self._pcgrad_window_active:
+                if self._pcgrad_visual_accum is None:
+                    raise RuntimeError("Active PCGrad window has no Visual gradients")
+                combined_grad = self._combined_accumulated_gradients()
+                return_grad = subtract_gradient_tuples(
+                    combined_grad, self._pcgrad_visual_accum
+                )
+                projected_grad, metrics = self._project_task_gradients(
+                    self._pcgrad_visual_accum, return_grad
+                )
+                with torch.no_grad():
+                    for parameter, projected in zip(
+                        self._pcgrad_parameters, projected_grad
+                    ):
+                        if projected is None:
+                            continue
+                        if parameter.grad is None:
+                            raise RuntimeError(
+                                "PCGrad shared parameter has no accumulated gradient"
+                            )
+                        parameter.grad.copy_(projected.to(parameter.grad.dtype))
+                final_step = (
+                    self.epoch + 1 == self.max_epoch
+                    and self.comm_info["iter"] + 1 == len(self.train_loader)
+                )
+                self._accumulate_pcgrad_metrics(
+                    metrics, output_dict, force_log=final_step
+                )
+            if self.cfg.enable_amp:
+                self.scaler.unscale_(self.optimizer)
+                if self.cfg.clip_grad is not None:
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(), self.cfg.clip_grad
+                    )
+                self.scaler.step(self.optimizer)
+                scale = self.scaler.get_scale()
+                self.scaler.update()
+                if scale <= self.scaler.get_scale():
+                    self.scheduler.step()
+            else:
+                if self.cfg.clip_grad is not None:
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(), self.cfg.clip_grad
+                    )
+                self.optimizer.step()
+                self.scheduler.step()
+            self._gradient_accumulation_counter = 0
+            self._pcgrad_window_active = False
+            self._pcgrad_visual_accum = None
+
+        self.comm_info["model_output_dict"] = output_dict
 
 
 @TRAINERS.register_module("MultiDatasetTrainer")

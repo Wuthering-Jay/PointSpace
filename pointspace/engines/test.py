@@ -203,8 +203,8 @@ class TesterBase:
 
 
 @TESTERS.register_module()
-class HPSDFeatureTester(TesterBase):
-    """提取 HPSD 逐点特征，并把测试 fragment 恢复到原始点顺序。
+class VPSDFeatureTester(TesterBase):
+    """提取 VPSD 逐点特征，并把测试 fragment 恢复到原始点顺序。
 
     ``LasDataset`` 的 ``GridSample(mode="test")`` 不会丢弃体素内的其他点，
     而是生成多个 fragment，使所有原始点至少出现一次。每个 fragment 保留
@@ -234,6 +234,35 @@ class HPSDFeatureTester(TesterBase):
     来源、归一化状态和 distill level，不记录可变路径。
     """
 
+    FEATURE_SOURCES = frozenset({"projected", "backbone"})
+    DEFAULT_FEATURE_SOURCE = "projected"
+    FEATURE_LABEL = "VPSD"
+    DEFAULT_DISTILL_LEVEL = 2
+    SHOW_DISTILL_LEVEL = True
+
+    def _feature_metadata(
+        self,
+        feature,
+        output_dtype,
+        feature_source,
+        normalize_feature,
+        configured_feature_dim,
+    ):
+        return {
+            "format_version": "4",
+            "layout": "NC",
+            "num_points": str(feature.shape[0]),
+            "feature_dim": str(feature.shape[1]),
+            "dtype": output_dtype,
+            "feature_source": feature_source,
+            "distill_level": str(int(getattr(self.cfg.model, "distill_level", 2))),
+            "projector_in_channels": str(configured_feature_dim),
+            "fuse_deeper_features": str(
+                bool(getattr(self.cfg.model, "fuse_deeper_features", True))
+            ).lower(),
+            "normalized": str(normalize_feature).lower(),
+        }
+
     def test(self):
         """运行整个测试集的 fragment 推理、原序聚合和安全写出。"""
         # default_setup 已把全局 batch_size_test 按 world size 换算为每 GPU
@@ -245,9 +274,21 @@ class HPSDFeatureTester(TesterBase):
         output_dir.mkdir(parents=True, exist_ok=True)
         overwrite = bool(getattr(self.cfg, "feature_overwrite", False))
         output_dtype = getattr(self.cfg, "feature_dtype", "float16")
-        feature_source = getattr(self.cfg, "feature_source", "projected")
+        feature_source = getattr(
+            self.cfg, "feature_source", self.DEFAULT_FEATURE_SOURCE
+        )
         normalize_feature = bool(getattr(self.cfg, "normalize_feature", True))
-        distill_level = int(getattr(self.cfg.model, "distill_level", 2))
+        distill_level = (
+            int(
+                getattr(
+                    self.cfg.model,
+                    "distill_level",
+                    self.DEFAULT_DISTILL_LEVEL,
+                )
+            )
+            if self.SHOW_DISTILL_LEVEL
+            else -1
+        )
         # GPU 聚合速度更快，但 float32 累加器占用约 N*C*4 字节；显存紧张时
         # 可切换到 CPU，预测结果和索引会在每个 fragment batch 后回传。
         aggregate_on_gpu = bool(
@@ -256,20 +297,39 @@ class HPSDFeatureTester(TesterBase):
         dtype_map = {"float16": torch.float16, "float32": torch.float32}
         if output_dtype not in dtype_map:
             raise ValueError("feature_dtype must be 'float16' or 'float32'")
-        if feature_source not in {"projected", "backbone"}:
-            raise ValueError("feature_source must be 'projected' or 'backbone'")
+        if feature_source not in self.FEATURE_SOURCES:
+            raise ValueError(
+                f"feature_source must be one of {sorted(self.FEATURE_SOURCES)}"
+            )
 
-        logger.info(">>>>>>>>>>>>>>>> Start HPSD Feature Extraction >>>>>>>>>>>>>>>>")
         logger.info(
-            "Fragment batch size: %d, source: %s, distill_level: %d, aggregate_on_gpu: %s",
-            batch_size_test,
-            feature_source,
-            distill_level,
-            aggregate_on_gpu,
+            ">>>>>>>>>>>>>>>> Start %s Feature Extraction >>>>>>>>>>>>>>>>",
+            self.FEATURE_LABEL,
         )
+        if distill_level >= 0:
+            logger.info(
+                "Fragment batch size: %d, source: %s, distill_level: %d, aggregate_on_gpu: %s",
+                batch_size_test,
+                feature_source,
+                distill_level,
+                aggregate_on_gpu,
+            )
+        else:
+            logger.info(
+                "Fragment batch size: %d, source: %s, aggregate_on_gpu: %s",
+                batch_size_test,
+                feature_source,
+                aggregate_on_gpu,
+            )
         self.model.eval()
-        hpsd_model = self.model.module if hasattr(self.model, "module") else self.model
-        projector_in_channels = int(hpsd_model.projector_in_channels)
+        feature_model = self.model.module if hasattr(self.model, "module") else self.model
+        configured_feature_dim = int(
+            getattr(
+                feature_model,
+                "projector_in_channels",
+                getattr(self.cfg.model, "backbone_out_channels", -1),
+            )
+        )
         comm.synchronize()
 
         # test_loader 的 batch_size 固定为 1。data_dict[0] 包含一张 tile 的
@@ -304,7 +364,7 @@ class HPSDFeatureTester(TesterBase):
                         input_dict[key] = value.cuda(non_blocking=True)
                 if "index" not in input_dict:
                     raise KeyError(
-                        "HPSD feature test post_transform must retain 'index'"
+                        f"{self.FEATURE_LABEL} feature test post_transform must retain 'index'"
                     )
                 # collate_fn 只拼接同一 tile 的若干 fragment；index 始终引用
                 # 该 tile 的原始行号，不需要添加跨样本 offset。
@@ -315,7 +375,7 @@ class HPSDFeatureTester(TesterBase):
                     raise RuntimeError(
                         f"Fragment index exceeds source point range for {data_name}"
                     )
-                # HPSD 的导出路径只运行三维 encoder 和可选 student projector，
+                # VPSD 的导出路径只运行三维 encoder 和可选 student projector，
                 # 不读取 DINO teacher，也不会构建 token-patch correspondence。
                 with torch.no_grad(), auto_cast():
                     point_feature = self.model(
@@ -367,20 +427,13 @@ class HPSDFeatureTester(TesterBase):
 
             # Safetensors metadata 只接受字符串。保留重建张量语义所需的稳定
             # 信息，不写 checkpoint、输入或输出路径。
-            metadata = {
-                "format_version": "4",
-                "layout": "NC",
-                "num_points": str(feature.shape[0]),
-                "feature_dim": str(feature.shape[1]),
-                "dtype": output_dtype,
-                "feature_source": feature_source,
-                "distill_level": str(distill_level),
-                "projector_in_channels": str(projector_in_channels),
-                "fuse_deeper_features": str(
-                    bool(getattr(self.cfg.model, "fuse_deeper_features", True))
-                ).lower(),
-                "normalized": str(normalize_feature).lower(),
-            }
+            metadata = self._feature_metadata(
+                feature=feature,
+                output_dtype=output_dtype,
+                feature_source=feature_source,
+                normalize_feature=normalize_feature,
+                configured_feature_dim=configured_feature_dim,
+            )
             # 先写同目录临时文件再原子替换，避免中断后留下可被误读的半文件。
             temporary_path = output_path.with_name(
                 f".{output_path.name}.{uuid4().hex}.tmp"
@@ -399,15 +452,103 @@ class HPSDFeatureTester(TesterBase):
             )
             self.cache_cleaner.check_and_clean(
                 time.time() - start,
-                f"HPSD feature iter {idx + 1}/{len(self.test_loader)}",
+                f"{self.FEATURE_LABEL} feature iter {idx + 1}/{len(self.test_loader)}",
             )
 
         comm.synchronize()
-        logger.info("<<<<<<<<<<<<<<<< End HPSD Feature Extraction <<<<<<<<<<<<<<<<")
+        logger.info(
+            "<<<<<<<<<<<<<<<< End %s Feature Extraction <<<<<<<<<<<<<<<<",
+            self.FEATURE_LABEL,
+        )
 
     @staticmethod
     def collate_fn(batch):
         return batch
+
+
+@TESTERS.register_module()
+class RRCLFeatureTester(VPSDFeatureTester):
+    """Export aggregated RRCL backbone features in original LAS order."""
+
+    FEATURE_SOURCES = frozenset({"backbone"})
+    DEFAULT_FEATURE_SOURCE = "backbone"
+    FEATURE_LABEL = "RRCL"
+    DEFAULT_DISTILL_LEVEL = -1
+    SHOW_DISTILL_LEVEL = False
+
+    def _feature_metadata(
+        self,
+        feature,
+        output_dtype,
+        feature_source,
+        normalize_feature,
+        configured_feature_dim,
+    ):
+        return {
+            "format_version": "1",
+            "layout": "NC",
+            "num_points": str(feature.shape[0]),
+            "feature_dim": str(feature.shape[1]),
+            "configured_feature_dim": str(configured_feature_dim),
+            "dtype": output_dtype,
+            "feature_source": feature_source,
+            "model_family": "RRCL",
+            "normalized": str(normalize_feature).lower(),
+        }
+
+
+@TESTERS.register_module()
+class CVRLFeatureTester(RRCLFeatureTester):
+    """Export CVRL point features and describe dual-branch feature layouts."""
+
+    FEATURE_SOURCES = frozenset({"backbone", "full", "visual", "return"})
+    FEATURE_LABEL = "CVRL"
+
+    def _feature_metadata(
+        self,
+        feature,
+        output_dtype,
+        feature_source,
+        normalize_feature,
+        configured_feature_dim,
+    ):
+        metadata = super()._feature_metadata(
+            feature,
+            output_dtype,
+            feature_source,
+            normalize_feature,
+            configured_feature_dim,
+        )
+        metadata["model_family"] = "CVRL"
+        return_backbone_cfg = getattr(
+            getattr(self.cfg.model, "backbone", {}),
+            "return_backbone",
+            {},
+        )
+        metadata["backbone_family"] = str(
+            getattr(return_backbone_cfg, "type", "unknown")
+        )
+        metadata["feature_mode"] = (
+            "full" if feature_source == "backbone" else feature_source
+        )
+        visual_channels = int(getattr(self.cfg.model, "visual_channels", -1))
+        return_channels = int(getattr(self.cfg.model, "return_channels", -1))
+        if visual_channels > 0 and return_channels > 0:
+            metadata["format_version"] = "2"
+            metadata["architecture"] = str(
+                getattr(self.cfg.model, "type", "CVRL-v1m1")
+            )
+            metadata["visual_channels"] = str(visual_channels)
+            metadata["return_channels"] = str(return_channels)
+            if feature_source in {"backbone", "full"}:
+                metadata["feature_layout"] = "visual|return"
+                metadata["visual_slice"] = f"0:{visual_channels}"
+                metadata["return_slice"] = (
+                    f"{visual_channels}:{visual_channels + return_channels}"
+                )
+            else:
+                metadata["feature_layout"] = feature_source
+        return metadata
 
 
 @TESTERS.register_module()

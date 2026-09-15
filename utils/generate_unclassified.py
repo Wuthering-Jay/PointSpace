@@ -6,6 +6,11 @@ from scipy.spatial import cKDTree
 import laspy
 from tqdm import tqdm
 
+try:
+    from .las_io import write_standard_las
+except ImportError:
+    from las_io import write_standard_las
+
 # ==========================================
 # ⚙️ 配置区域 (请根据你的数据集修改类别 ID)
 # ==========================================
@@ -113,7 +118,7 @@ def process_file(input_path, output_path):
     
     # 写回新标签并保存
     las.classification = new_labels
-    las.write(output_path)
+    write_standard_las(las, output_path)
     print(f"Saved: {output_path}")
 
 def process_path(input_path, output_dir=None):

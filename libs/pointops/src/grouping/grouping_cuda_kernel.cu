@@ -1,40 +1,65 @@
 #include "../cuda_utils.h"
 #include "grouping_cuda_kernel.h"
 
+#include <ATen/cuda/Atomic.cuh>
+#include <c10/cuda/CUDAException.h>
 
-__global__ void grouping_forward_cuda_kernel(int m, int nsample, int c, const float *__restrict__ input, const int *__restrict__ idx, float *__restrict__ output) {
-    // input: input: (n, c), idx: (m, nsample), output: (m, nsample, c)
+template <typename scalar_t>
+__global__ void grouping_forward_cuda_kernel(
+    int n, int total, int c, const scalar_t *__restrict__ input,
+    const int *__restrict__ idx, scalar_t *__restrict__ output) {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (index >= m * nsample * c) return;
-    const int c_idx = index % c;
-    const int nsample_idx = (index / c) % nsample;
-    const int m_idx = index / nsample / c;
-    const int input_idx = idx[m_idx * nsample + nsample_idx] * c + c_idx;
-    output[index] = input[input_idx];
+    if (index >= total) return;
+    int c_idx = index % c;
+    int edge = index / c;
+    int input_idx = idx[edge];
+    output[index] = input_idx >= 0 && input_idx < n
+        ? input[input_idx * c + c_idx]
+        : static_cast<scalar_t>(0);
 }
 
-__global__ void grouping_backward_cuda_kernel(int m, int nsample, int c, const float *__restrict__ grad_output, const int *__restrict__ idx, float *__restrict__ grad_input) {
-    // input: grad_output: (m, nsample, c), idx: (m, nsample), output: grad_input: (n, c)
+template <typename scalar_t>
+__global__ void grouping_backward_cuda_kernel(
+    int n, int total, int c, const scalar_t *__restrict__ grad_output,
+    const int *__restrict__ idx, scalar_t *__restrict__ grad_input) {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (index >= m * nsample * c) return;
-    const int c_idx = index % c;
-    const int nsample_idx = (index / c) % nsample;
-    const int m_idx = index / nsample / c;
-    const int input_idx = idx[m_idx * nsample + nsample_idx] * c + c_idx;
-    atomicAdd(grad_input + input_idx, grad_output[index]);
+    if (index >= total) return;
+    int c_idx = index % c;
+    int edge = index / c;
+    int input_idx = idx[edge];
+    if (input_idx >= 0 && input_idx < n) {
+        gpuAtomicAdd(grad_input + input_idx * c + c_idx, grad_output[index]);
+    }
 }
 
-void grouping_forward_cuda_launcher(int m, int nsample, int c, const float *input, const int *idx, float *output) {
-    // input: input: (n, c), idx: (m, nsample), output: (m, nsample, c)
-    dim3 blocks(DIVUP(m * nsample * c, THREADS_PER_BLOCK));
+void grouping_forward_cuda_launcher(
+    int n, int m, int nsample, int c, const void *input, const int *idx,
+    void *output, at::ScalarType dtype) {
+    int total = m * nsample * c;
+    dim3 blocks(DIVUP(total, THREADS_PER_BLOCK));
     dim3 threads(THREADS_PER_BLOCK);
-    grouping_forward_cuda_kernel<<<blocks, threads, 0>>>(m, nsample, c, input, idx, output);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        at::kHalf, at::kBFloat16, dtype, "grouping_forward_cuda", ([&] {
+            grouping_forward_cuda_kernel<scalar_t><<<blocks, threads, 0, stream>>>(
+                n, total, c, static_cast<const scalar_t *>(input), idx,
+                static_cast<scalar_t *>(output));
+        }));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-void grouping_backward_cuda_launcher(int m, int nsample, int c, const float *grad_output, const int *idx, float *grad_input)
-{  
-    // input: grad_output: (m, nsample, c), idx: (m, nsample), output: grad_input: (n, c)
-    dim3 blocks(DIVUP(m * nsample * c, THREADS_PER_BLOCK));
+void grouping_backward_cuda_launcher(
+    int n, int m, int nsample, int c, const void *grad_output, const int *idx,
+    void *grad_input, at::ScalarType dtype) {
+    int total = m * nsample * c;
+    dim3 blocks(DIVUP(total, THREADS_PER_BLOCK));
     dim3 threads(THREADS_PER_BLOCK);
-    grouping_backward_cuda_kernel<<<blocks, threads, 0>>>(m, nsample, c, grad_output, idx, grad_input);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        at::kHalf, at::kBFloat16, dtype, "grouping_backward_cuda", ([&] {
+            grouping_backward_cuda_kernel<scalar_t><<<blocks, threads, 0, stream>>>(
+                n, total, c, static_cast<const scalar_t *>(grad_output), idx,
+                static_cast<scalar_t *>(grad_input));
+        }));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

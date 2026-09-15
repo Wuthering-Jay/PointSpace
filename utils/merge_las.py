@@ -10,11 +10,13 @@ LAS/LAZ Tile Merger
   对连续属性可选平均，利用重叠提高精度
 
 性能特性（全 O(n) 向量化，无 O(n log n) 排序）：
-- 利用 orig_idx 为连续整数 0..n-1 的性质，用 np.bincount 代替 np.unique
+- 将 orig_idx 作为原始索引空间中的直接索引，用 np.bincount 代替 np.unique
+- 允许过滤或缺失 tile 造成稀疏 orig_idx；缺失原始点会警告并从输出中跳过
 - 用 np.bincount 编码键代替 np.add.at 完成投票
 - 用直接散射写入代替花式索引
 """
 
+import json
 import re
 import numpy as np
 import laspy
@@ -22,6 +24,11 @@ from pathlib import Path
 from typing import Union, List, Dict, Optional, Set
 from collections import defaultdict
 from tqdm import tqdm
+
+try:
+    from .las_io import write_standard_las
+except ImportError:
+    from las_io import write_standard_las
 
 
 class LASMerger:
@@ -31,7 +38,7 @@ class LASMerger:
     将 tile 后的小块点云合并回原始文件：
     - 复用 tile 头文件（point_format, version, scales, offsets, VLRs）
     - 若存在 orig_idx 字段，利用其作为直接索引（O(n)）恢复原始点序并去重
-    - 重叠检测：通过 np.bincount 统计每个 orig_idx 出现次数
+    - 重叠检测：比较拼接点数与实际存在的唯一 orig_idx 数量
     - 投票融合：对 vote_dims 中的离散属性使用多数投票（如 classification）
     - 均值融合：对 average_dims 中的连续属性取均值
     - 其余属性直接散射写入（坐标、intensity 等不变属性）
@@ -43,6 +50,18 @@ class LASMerger:
     DISCARD_DIMS = {'orig_idx'}
     # 默认使用多数投票的维度
     DEFAULT_VOTE_DIMS = {'classification'}
+
+    @staticmethod
+    def _source_point_count(header) -> Optional[int]:
+        for vlr in header.vlrs:
+            if vlr.user_id == 'PointSpace' and vlr.record_id == 1002:
+                try:
+                    return int(json.loads(vlr.record_data.decode('utf-8'))[
+                        'source_point_count'
+                    ])
+                except (KeyError, TypeError, ValueError, UnicodeDecodeError):
+                    return None
+        return None
     
     def __init__(self, 
                  input_path: Union[str, Path],
@@ -128,9 +147,10 @@ class LASMerger:
         2. orig_idx without overlap: scatter by orig_idx to restore original order
         3. orig_idx with overlap: deduplicate + vote/average via O(n) algorithms
         
-        Key optimization: orig_idx values are contiguous integers 0..n_unique-1
-        (assigned by LASTileProcessor), so they can be used as direct array indices.
-        This eliminates np.unique (O(n log n) sort) in favor of np.bincount (O(n)).
+        Key optimization: orig_idx values are indices in the original point space, so
+        they can be used as direct array indices. Values may be sparse after class
+        filtering or omitted tiles; missing values are warned about and omitted from
+        the merged output while the remaining points retain their original order.
         
         Args:
             original_name: Name of the original file (without extension)
@@ -145,6 +165,7 @@ class LASMerger:
             first_tile = fh.read()
         
         src_header = first_tile.header
+        source_point_count = self._source_point_count(src_header)
         
         # Detect orig_idx and categorize extra dims
         has_orig_idx = False
@@ -193,7 +214,10 @@ class LASMerger:
         # --- 3. Pre-allocate staging arrays and read all tiles ---
         staging = {name: np.empty(total_concat, dtype=dt)
                    for name, dt in dim_dtypes.items()}
-        staging_orig_idx = np.empty(total_concat, dtype=np.uint32) if has_orig_idx else None
+        orig_idx_dtype = np.asarray(first_tile.orig_idx).dtype if has_orig_idx else None
+        staging_orig_idx = (
+            np.empty(total_concat, dtype=orig_idx_dtype) if has_orig_idx else None
+        )
         
         # Fill from first tile (already loaded)
         n = len(first_tile)
@@ -216,11 +240,27 @@ class LASMerger:
             offset += n
             del tile
         
-        # --- 4. Detect overlap via O(1) comparison (no full bincount needed) ---
+        # --- 4. Detect overlap and sparse/missing original indices ---
         if has_orig_idx:
-            # orig_idx values are contiguous 0..n_unique-1, use as direct indices
-            n_output = int(staging_orig_idx.max()) + 1
+            inferred_size = int(staging_orig_idx.max()) + 1 if total_concat else 0
+            if source_point_count is not None and source_point_count < inferred_size:
+                print(
+                    f"  Warning: invalid source point count {source_point_count:,}; "
+                    f"using orig_idx-derived size {inferred_size:,}"
+                )
+                source_point_count = None
+            index_space_size = max(source_point_count or 0, inferred_size)
+            present = np.zeros(index_space_size, dtype=bool)
+            present[staging_orig_idx] = True
+            n_output = int(np.count_nonzero(present))
+            missing_count = index_space_size - n_output
             has_overlap = total_concat > n_output
+
+            if missing_count:
+                print(
+                    f"  Warning: {missing_count:,} orig_idx value(s) are absent; "
+                    "these filtered points or points from omitted tiles will be skipped"
+                )
             
             if has_overlap:
                 avg_overlap = total_concat / n_output
@@ -229,7 +269,9 @@ class LASMerger:
             else:
                 print(f"  No overlap, {n_output:,} unique points")
         else:
+            index_space_size = total_concat
             n_output = total_concat
+            present = None
             has_overlap = False
         
         # --- 5. Build output LAS with aggregated dimensions ---
@@ -248,20 +290,25 @@ class LASMerger:
             elif has_overlap and dim_name in self.vote_dims:
                 # Overlap + vote dim: majority voting O(n)
                 print(f"  Majority voting on '{dim_name}'...")
-                result = self._majority_vote(data, staging_orig_idx, n_output)
+                result = self._majority_vote(data, staging_orig_idx, index_space_size)
             elif has_overlap and dim_name in self.average_dims:
                 # Overlap + average dim: averaging O(n)
                 # Lazy-compute counts once, reused across all average dims
                 if _counts is None:
-                    _counts = np.bincount(staging_orig_idx, minlength=n_output)
+                    _counts = np.bincount(staging_orig_idx, minlength=index_space_size)
                 print(f"  Averaging '{dim_name}'...")
-                result = self._average(data, staging_orig_idx, n_output, counts=_counts)
+                result = self._average(
+                    data, staging_orig_idx, index_space_size, counts=_counts
+                )
             else:
                 # No overlap OR identity dim: direct scatter O(n)
                 # For identical dims (coords, intensity), any occurrence is fine.
                 # For non-overlap case, each orig_idx appears exactly once.
-                result = np.empty(n_output, dtype=data.dtype)
+                result = np.empty(index_space_size, dtype=data.dtype)
                 result[staging_orig_idx] = data
+
+            if has_orig_idx and n_output != index_space_size:
+                result = result[present]
             
             setattr(merged_las, dim_name, result)
         
@@ -273,11 +320,11 @@ class LASMerger:
         # --- 6. Save ---
         output_path = self.output_dir / f"{original_name}.{self.output_format}"
         merged_las.update_header()
-        merged_las.write(output_path)
+        write_standard_las(merged_las, output_path)
         print(f"  Saved merged file ({n_output:,} points) to {output_path}")
     
     @staticmethod
-    def _majority_vote(data: np.ndarray, orig_idx: np.ndarray, n_unique: int) -> np.ndarray:
+    def _majority_vote(data: np.ndarray, orig_idx: np.ndarray, index_space_size: int) -> np.ndarray:
         """
         O(n) majority voting for overlapping tiles using np.bincount on encoded keys.
         
@@ -290,8 +337,8 @@ class LASMerger:
         
         Args:
             data: Concatenated label array (total_concat,), integer-like
-            orig_idx: orig_idx array mapping each concat point to unique point 0..n_unique-1
-            n_unique: Number of unique points
+            orig_idx: Original point indices for all concatenated tile points
+            index_space_size: Original index-space size (max(orig_idx) + 1)
             
         Returns:
             Voted labels array (n_unique,), same dtype as input
@@ -301,24 +348,28 @@ class LASMerger:
         n_classes = int(data_int.max()) + 1
         
         # Estimate memory for dense vote matrix: n_unique * n_classes * 8 bytes (int64 from bincount)
-        estimated_bytes = n_unique * n_classes * 8
+        estimated_bytes = index_space_size * n_classes * 8
         
         if estimated_bytes < 256 * 1024 * 1024:  # < 256 MB (fits in L3 cache region)
             # ---- Fast path: encode (point_id, class) → single key, then bincount ----
             # O(n) single pass, best when vote matrix fits in CPU cache
             keys = orig_idx.astype(np.int64) * n_classes + data_int
-            vote_flat = np.bincount(keys, minlength=n_unique * n_classes)
-            result = vote_flat.reshape(n_unique, n_classes).argmax(axis=1)
+            vote_flat = np.bincount(
+                keys, minlength=index_space_size * n_classes
+            )
+            result = vote_flat.reshape(index_space_size, n_classes).argmax(axis=1)
         else:
             # ---- Memory-efficient fallback: iterate over classes ----
             # Each iteration is vectorized (np.bincount), outer loop is tiny (n_classes)
-            best_count = np.zeros(n_unique, dtype=np.int32)
-            best_label = np.zeros(n_unique, dtype=np.intp)
+            best_count = np.zeros(index_space_size, dtype=np.int32)
+            best_label = np.zeros(index_space_size, dtype=np.intp)
             for cls in range(n_classes):
                 cls_mask = data_int == cls
                 if not np.any(cls_mask):
                     continue
-                cls_count = np.bincount(orig_idx[cls_mask], minlength=n_unique).astype(np.int32)
+                cls_count = np.bincount(
+                    orig_idx[cls_mask], minlength=index_space_size
+                ).astype(np.int32)
                 better = cls_count > best_count
                 best_count[better] = cls_count[better]
                 best_label[better] = cls
@@ -327,15 +378,15 @@ class LASMerger:
         return result.astype(orig_dtype)
     
     @staticmethod
-    def _average(data: np.ndarray, orig_idx: np.ndarray, n_unique: int,
+    def _average(data: np.ndarray, orig_idx: np.ndarray, index_space_size: int,
                  counts: np.ndarray = None) -> np.ndarray:
         """
         O(n) averaging for overlapping tiles using np.bincount with weights.
         
         Args:
             data: Concatenated value array (total_concat,)
-            orig_idx: orig_idx array mapping each concat point to unique point 0..n_unique-1
-            n_unique: Number of unique points
+            orig_idx: Original point indices for all concatenated tile points
+            index_space_size: Original index-space size (max(orig_idx) + 1)
             counts: Pre-computed per-point occurrence counts (optional, avoids redundant bincount)
             
         Returns:
@@ -343,9 +394,11 @@ class LASMerger:
         """
         orig_dtype = data.dtype
         weights = data if data.dtype == np.float64 else data.astype(np.float64)
-        sums = np.bincount(orig_idx, weights=weights, minlength=n_unique)
+        sums = np.bincount(orig_idx, weights=weights, minlength=index_space_size)
         if counts is None:
-            counts_f = np.bincount(orig_idx, minlength=n_unique).astype(np.float64)
+            counts_f = np.bincount(
+                orig_idx, minlength=index_space_size
+            ).astype(np.float64)
         else:
             counts_f = counts.astype(np.float64)
         np.maximum(counts_f, 1.0, out=counts_f)  # avoid division by zero, in-place

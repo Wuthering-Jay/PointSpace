@@ -1,8 +1,12 @@
 import os
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+
 import numpy as np
 import laspy
+import torch
+from safetensors import safe_open
 from copy import deepcopy
 
 from pointspace.utils.logger import get_root_logger
@@ -52,6 +56,7 @@ class LasDataset(DefaultDataset):
         "color",
         "intensity",
         "echo",  # Combined first/last return info (2D: is_first, is_last)
+        "return_role",  # RRCL target: single/first/middle/last -> 0/1/2/3
         "normal",  # Normal vectors (normal_x, normal_y, normal_z extra dims)
         "superpoint",  # Superpoint segment ID
         "segment",
@@ -207,6 +212,29 @@ class LasDataset(DefaultDataset):
             echo[return_number == 1, 0] = 1.0
             echo[return_number == number_of_returns, 1] = 1.0
             data_dict["echo"] = echo
+
+            # Return attributes are supervision only.  They are deliberately
+            # converted to a categorical target instead of being appended to
+            # ``feat``; the config's ``feat_keys`` remains the sole authority
+            # over backbone inputs.
+            return_role = np.full(num_points, self.ignore_index, dtype=np.int64)
+            single = number_of_returns == 1
+            first = (number_of_returns > 1) & (return_number == 1)
+            middle = (
+                (number_of_returns > 1)
+                & (return_number > 1)
+                & (return_number < number_of_returns)
+            )
+            last = (
+                (number_of_returns > 1)
+                & (return_number == number_of_returns)
+            )
+            # Keep this order explicit: a single return also has r == 1 == n.
+            return_role[single] = 0
+            return_role[first] = 1
+            return_role[middle] = 2
+            return_role[last] = 3
+            data_dict["return_role"] = return_role
 
         if {"normal_x", "normal_y", "normal_z"}.issubset(dim_names):
             nx = self._read_extra_dimension(las, "normal_x")
@@ -857,4 +885,458 @@ class LasDataset(DefaultDataset):
 
     def __len__(self):
         return len(self.data_list) * self.loop
+
+
+@DATASETS.register_module()
+class RRCLLasDataset(LasDataset):
+    """LAS dataset whose class statistics are the four return roles.
+
+    Geometry preprocessing is inherited from :class:`LasDataset`.  The only
+    task-specific behavior is class-weight estimation; semantic LAS
+    classification values are intentionally irrelevant to RRCL.
+    """
+
+    NUM_RETURN_ROLES = 4
+
+    def _compute_class_weights(self):
+        logger = get_root_logger()
+        mode = self.class_weight_mode
+        if isinstance(mode, (list, tuple, np.ndarray)):
+            self._set_manual_class_weight(mode)
+            return
+
+        method = "sqrt" if mode in (None, "auto") else mode
+        if isinstance(mode, dict):
+            method = mode.get("method", "sqrt")
+        if method != "sqrt":
+            raise ValueError(
+                "RRCLLasDataset v1 supports class_weight='sqrt' only; "
+                f"got {method!r}."
+            )
+
+        n_samples = len(self.data_list)
+        if isinstance(self.weight_sample, float) and 0 < self.weight_sample <= 1:
+            n_compute = max(1, int(n_samples * self.weight_sample))
+        elif isinstance(self.weight_sample, int) and self.weight_sample > 0:
+            n_compute = min(self.weight_sample, n_samples)
+        else:
+            n_compute = n_samples
+        indices = (
+            np.random.choice(n_samples, n_compute, replace=False)
+            if n_compute < n_samples
+            else range(n_samples)
+        )
+
+        counts = np.zeros(self.NUM_RETURN_ROLES, dtype=np.int64)
+        for idx in indices:
+            try:
+                las = laspy.read(self.data_list[idx])
+                dim_names = set(las.point_format.dimension_names)
+                if not {"return_number", "number_of_returns"}.issubset(dim_names):
+                    logger.warning(
+                        "Skipping %s while estimating RRCL weights: "
+                        "missing return dimensions",
+                        self.data_list[idx],
+                    )
+                    continue
+                r = np.asarray(las.return_number)
+                n = np.asarray(las.number_of_returns)
+                counts[0] += np.count_nonzero(n == 1)
+                counts[1] += np.count_nonzero((n > 1) & (r == 1))
+                counts[2] += np.count_nonzero((n > 1) & (r > 1) & (r < n))
+                counts[3] += np.count_nonzero((n > 1) & (r == n))
+            except Exception as exc:
+                logger.warning("Failed to scan %s: %s", self.data_list[idx], exc)
+
+        total = counts.sum()
+        if total == 0 or np.any(counts == 0):
+            raise ValueError(
+                "Cannot compute finite RRCL sqrt weights: role counts are "
+                f"{counts.tolist()}. Supply a representative weight_sample or "
+                "manual four-element class_weight."
+            )
+        frequencies = counts.astype(np.float64) / total
+        weights = 1.0 / np.sqrt(frequencies)
+        weights = (weights / weights.sum() * self.NUM_RETURN_ROLES).astype(np.float32)
+        self.class_weight = weights
+        logger.info(
+            "RRCL role counts S/F/M/L=%s; normalized sqrt weights=%s",
+            counts.tolist(),
+            weights.tolist(),
+        )
+
+    def _set_manual_class_weight(self, class_weight):
+        weights = np.asarray(class_weight, dtype=np.float32).reshape(-1)
+        if weights.size != self.NUM_RETURN_ROLES:
+            raise ValueError(
+                "RRCL class_weight must contain exactly four values "
+                "for S/F/M/L."
+            )
+        self.class_weight = weights
+
+
+@DATASETS.register_module()
+class LasImageDataset(LasDataset):
+    """Read paired LAS/LAZ, DINO and point-to-patch Safetensors files.
+
+    Files are paired by stem. Point-level image fields are registered in
+    ``index_valid_keys`` so crop, sampling and voxel transforms keep them
+    aligned with the LAS points. DINO features remain sample-level tensors.
+
+    When explicit paths are omitted, the expected layout is::
+
+        data_root/
+            pointcloud/*.las|*.laz
+            dino_feature/*.safetensors
+            correspondence/*.safetensors
+    """
+
+    IMAGE_POINT_KEYS = (
+        "image_pixel_coord",
+        "image_patch_index",
+        "image_valid",
+        "image_observability",
+    )
+
+    def __init__(
+        self,
+        split="train",
+        data_root="data/dataset",
+        data_path=None,
+        data_list=None,
+        dino_feature_path=None,
+        correspondence_path=None,
+        transform=None,
+        post_transform=None,
+        aug_transform=None,
+        test_mode=False,
+        ignore_index=-1,
+        loop=1,
+        required_class=None,
+        remap_class=False,
+        class_weight=None,
+        weight_sample=0.2,
+        weighted_sampler=False,
+        target_key=None,
+        require_observability=False,
+    ):
+        root = Path(data_root)
+        if data_path is None and data_list is None:
+            default_pointcloud_path = root / "pointcloud"
+            if default_pointcloud_path.is_dir():
+                data_path = str(default_pointcloud_path)
+
+        self.dino_feature_path = Path(
+            dino_feature_path
+            if dino_feature_path is not None
+            else root / "dino_feature"
+        )
+        self.correspondence_path = Path(
+            correspondence_path
+            if correspondence_path is not None
+            else root / "correspondence"
+        )
+        self._dino_assets = {}
+        self.require_observability = bool(require_observability)
+
+        super().__init__(
+            split=split,
+            data_root=data_root,
+            data_path=data_path,
+            data_list=data_list,
+            transform=transform,
+            post_transform=post_transform,
+            aug_transform=aug_transform,
+            test_mode=test_mode,
+            ignore_index=ignore_index,
+            loop=loop,
+            required_class=required_class,
+            remap_class=remap_class,
+            class_weight=class_weight,
+            weight_sample=weight_sample,
+            weighted_sampler=weighted_sampler,
+            target_key=target_key,
+        )
+
+    @staticmethod
+    def _index_assets(path, suffix, description):
+        path = Path(path)
+        if path.is_file():
+            files = [path]
+        elif path.is_dir():
+            files = sorted(
+                file
+                for file in path.iterdir()
+                if file.is_file() and file.suffix.lower() == suffix
+            )
+        else:
+            raise FileNotFoundError(f"{description} path does not exist: {path}")
+
+        wrong_suffix = [file for file in files if file.suffix.lower() != suffix]
+        if wrong_suffix:
+            raise ValueError(f"Expected {suffix} {description}: {wrong_suffix[0]}")
+        if not files:
+            raise FileNotFoundError(f"No {suffix} {description} files found: {path}")
+
+        result = {}
+        for file in files:
+            if file.stem in result:
+                raise ValueError(
+                    f"Duplicate {description} stem {file.stem!r}: "
+                    f"{result[file.stem]} and {file}"
+                )
+            result[file.stem] = str(file)
+        return result
+
+    def get_data_list(self):
+        data_list = super().get_data_list()
+        feature_files = self._index_assets(
+            self.dino_feature_path, ".safetensors", "DINO feature"
+        )
+        mapping_files = self._index_assets(
+            self.correspondence_path, ".safetensors", "point-to-patch mapping"
+        )
+
+        missing = []
+        assets = {}
+        for las_path in data_list:
+            stem = Path(las_path).stem
+            missing_assets = []
+            if stem not in feature_files:
+                missing_assets.append("DINO feature")
+            if stem not in mapping_files:
+                missing_assets.append("point-to-patch mapping")
+            if missing_assets:
+                missing.append(f"{stem}: {', '.join(missing_assets)}")
+                continue
+            assets[stem] = (feature_files[stem], mapping_files[stem])
+
+        if missing:
+            preview = "; ".join(missing[:8])
+            if len(missing) > 8:
+                preview += f"; ... and {len(missing) - 8} more"
+            raise FileNotFoundError(
+                "Each LAS/LAZ sample must have same-stem DINO and mapping assets. "
+                + preview
+            )
+
+        self._dino_assets = assets
+        get_root_logger().info(
+            "%s: paired %d LAS/LAZ, DINO and mapping samples.",
+            self.__class__.__name__,
+            len(data_list),
+        )
+        return data_list
+
+    @staticmethod
+    def _metadata_pair(metadata, key, required=True):
+        value = metadata.get(key)
+        if value is None:
+            if required:
+                raise ValueError(f"DINO metadata is missing {key!r}")
+            return None
+        if not isinstance(value, (list, tuple)) or len(value) != 2:
+            raise ValueError(f"DINO metadata {key!r} must contain [width, height]")
+        width, height = (int(value[0]), int(value[1]))
+        if width <= 0 or height <= 0:
+            raise ValueError(f"DINO metadata {key!r} must be positive, got {value}")
+        return width, height
+
+    @staticmethod
+    def _load_dino_feature(path):
+        try:
+            with safe_open(path, framework="pt", device="cpu") as file:
+                if "feature" not in file.keys():
+                    raise ValueError("Safetensors has no 'feature' tensor")
+                feature = file.get_tensor("feature")
+                raw_metadata = (file.metadata() or {}).get("metadata")
+        except Exception as error:
+            raise ValueError(f"Failed to read DINO feature {path}: {error}") from error
+
+        if raw_metadata is None:
+            raise ValueError(f"Safetensors has no DINO metadata: {path}")
+        try:
+            metadata = json.loads(raw_metadata)
+        except json.JSONDecodeError as error:
+            raise ValueError(f"Invalid DINO metadata JSON in {path}: {error}") from error
+
+        if feature.ndim != 2:
+            raise ValueError(
+                f"DINO feature must use PC layout, got shape "
+                f"{tuple(feature.shape)}: {path}"
+            )
+        metadata_shape = metadata.get("feature_shape")
+        if metadata_shape is None or tuple(map(int, metadata_shape)) != tuple(
+            feature.shape
+        ):
+            raise ValueError(
+                f"DINO feature_shape metadata does not match tensor "
+                f"{tuple(feature.shape)}: {path}"
+            )
+        if metadata.get("feature_layout", "PC").upper() != "PC":
+            raise ValueError(f"Only PC DINO features are supported: {path}")
+        return feature.contiguous(), metadata
+
+    def _load_mapping(self, path, num_points):
+        try:
+            with safe_open(path, framework="pt", device="cpu") as file:
+                required = {"pixel_coord", "patch_index", "valid"}
+                missing = required.difference(file.keys())
+                if missing:
+                    raise ValueError(f"missing tensors: {', '.join(sorted(missing))}")
+                pixel_coord = file.get_tensor("pixel_coord")
+                patch_index = file.get_tensor("patch_index")
+                valid = file.get_tensor("valid")
+                observability = (
+                    file.get_tensor("observability")
+                    if "observability" in file.keys()
+                    else None
+                )
+                mapping_metadata = file.metadata() or {}
+        except Exception as error:
+            raise ValueError(f"Failed to read mapping {path}: {error}") from error
+        if pixel_coord.shape != (num_points, 2):
+            raise ValueError(
+                f"pixel_coord shape mismatch for {path}: expected "
+                f"({num_points}, 2), got {tuple(pixel_coord.shape)}"
+            )
+        if patch_index.shape != (num_points,) or valid.shape != (num_points,):
+            raise ValueError(f"patch_index/valid length mismatch for {path}")
+        valid = valid.bool()
+        if observability is None and self.require_observability:
+            raise ValueError(
+                "Mapping has no native 'observability' tensor while "
+                f"require_observability=True: {path}"
+            )
+        if observability is None:
+            observability = valid.float()
+        else:
+            if observability.shape != (num_points,):
+                raise ValueError(f"observability length mismatch for {path}")
+            observability = observability.float()
+            if not torch.isfinite(observability).all():
+                raise ValueError(f"observability contains non-finite values: {path}")
+            if torch.any((observability < 0) | (observability > 1)):
+                raise ValueError(f"observability must be within [0, 1]: {path}")
+        return (
+            pixel_coord.long(),
+            patch_index.long(),
+            valid,
+            observability,
+            mapping_metadata,
+        )
+
+    def get_data(self, idx):
+        data_dict = super().get_data(idx)
+        name = data_dict["name"]
+        feature_path, mapping_path = self._dino_assets[name]
+        feature, metadata = self._load_dino_feature(feature_path)
+        (
+            pixel_coord,
+            patch_index,
+            valid,
+            observability,
+            mapping_metadata,
+        ) = self._load_mapping(mapping_path, data_dict["coord"].shape[0])
+
+        original_width, original_height = self._metadata_pair(
+            metadata, "original_size"
+        )
+        feature_grid_size = metadata.get("feature_grid_size")
+        if not isinstance(feature_grid_size, (list, tuple)) or len(
+            feature_grid_size
+        ) != 2:
+            raise ValueError(f"Invalid feature_grid_size in {feature_path}")
+        grid_width, grid_height = map(int, feature_grid_size)
+        if grid_width * grid_height != feature.shape[0]:
+            raise ValueError(f"Feature grid does not match feature length: {feature_path}")
+        patch_size = int(metadata.get("patch_size", 0))
+        if patch_size <= 0:
+            raise ValueError(f"Invalid patch_size in {feature_path}: {patch_size}")
+        mapping_grid = mapping_metadata.get("feature_grid_size")
+        if mapping_grid is not None and json.loads(mapping_grid) != [
+            grid_width,
+            grid_height,
+        ]:
+            raise ValueError(f"Mapping and DINO feature grid mismatch: {mapping_path}")
+        mapping_patch_size = mapping_metadata.get("patch_size")
+        if mapping_patch_size is not None and int(mapping_patch_size) != patch_size:
+            raise ValueError(f"Mapping and DINO patch_size mismatch: {mapping_path}")
+        mapping_original_size = mapping_metadata.get("original_size")
+        if (
+            mapping_original_size is not None
+            and json.loads(mapping_original_size) != [original_width, original_height]
+        ):
+            raise ValueError(f"Mapping and DINO original_size mismatch: {mapping_path}")
+        padded_size = self._metadata_pair(metadata, "padded_size", required=False)
+        if padded_size is None:
+            padded_width = grid_width * patch_size
+            padded_height = grid_height * patch_size
+        else:
+            padded_width, padded_height = padded_size
+
+        data_dict.update(
+            dino_feature=feature,
+            image_pixel_coord=pixel_coord,
+            image_patch_index=patch_index,
+            image_valid=valid,
+            image_observability=observability,
+            dino_offset=np.asarray([feature.shape[0]], dtype=np.int64),
+            image_original_size=np.asarray(
+                [[original_height, original_width]], dtype=np.int64
+            ),
+            image_padded_size=np.asarray(
+                [[padded_height, padded_width]], dtype=np.int64
+            ),
+            image_feature_size=np.asarray(
+                [[grid_height, grid_width]], dtype=np.int64
+            ),
+            image_patch_size=np.asarray([patch_size], dtype=np.int64),
+        )
+
+        point_keys = list(data_dict.get("index_valid_keys", []))
+        for key in self.IMAGE_POINT_KEYS:
+            if key not in point_keys:
+                point_keys.append(key)
+        data_dict["index_valid_keys"] = point_keys
+        return data_dict
+
+
+@DATASETS.register_module()
+class CVRLLasDataset(LasImageDataset, RRCLLasDataset):
+    """LAS dataset containing complementary visual and return supervision.
+
+    The visual branch inherits same-stem DINO and point-to-patch pairing from
+    :class:`LasImageDataset`. Return roles and their optional S/F/M/L class
+    weights come from :class:`RRCLLasDataset`. Points with missing or invalid
+    return metadata remain available to VPSD with ``return_role=ignore_index``;
+    RRCL losses and context construction ignore them. Raw return numbers are
+    never exposed, and the derived ``echo`` feature is removed to prevent
+    return target leakage into the CVRL backbone input.
+    """
+
+    def get_data(self, idx):
+        data_dict = super().get_data(idx)
+        return_role = data_dict.get("return_role")
+        if return_role is None:
+            # Some photogrammetric/synthetic surface classes have no physical
+            # LiDAR pulse metadata. They still provide valid image-patch
+            # supervision, so retain every point and explicitly mask RRCL.
+            return_role = np.full(
+                data_dict["coord"].shape[0],
+                self.ignore_index,
+                dtype=np.int64,
+            )
+            data_dict["return_role"] = return_role
+
+        # CVRL treats return properties exclusively as supervision. Removing
+        # echo here makes leakage impossible even if a later Collect transform
+        # is accidentally configured with feat_keys containing ``echo``.
+        data_dict.pop("echo", None)
+        point_keys = list(data_dict.get("index_valid_keys", []))
+        point_keys = [key for key in point_keys if key != "echo"]
+        if "return_role" not in point_keys:
+            point_keys.append("return_role")
+        data_dict["index_valid_keys"] = point_keys
+        return data_dict
     

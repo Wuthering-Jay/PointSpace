@@ -5,6 +5,11 @@ import laspy
 from pathlib import Path
 from tqdm import tqdm
 
+try:
+    from .las_io import write_standard_las
+except ImportError:
+    from las_io import write_standard_las
+
 def get_paper_ready_colors(labels):
     """
     为不同的标签分配适合论文发表的高级颜色
@@ -88,7 +93,7 @@ def process_single_file(filepath, output_base_dir):
         os.makedirs(level_out_dir, exist_ok=True)
         out_filepath = os.path.join(level_out_dir, filename)
         
-        las.write(out_filepath)
+        write_standard_las(las, out_filepath)
         
     return True
 

@@ -11,8 +11,8 @@ void interpolation_backward_cuda(int n, int c, int k, at::Tensor grad_output_ten
 extern "C" {
 #endif
 
-void interpolation_forward_cuda_launcher(int n, int c, int k, const float *input, const int *idx, const float *weight, float *output);
-void interpolation_backward_cuda_launcher(int n, int c, int k, const float *grad_output, const int *idx, const float *weight, float *grad_input);
+void interpolation_forward_cuda_launcher(int m, int n, int c, int k, const void *input, const int *idx, const float *weight, void *output, at::ScalarType dtype);
+void interpolation_backward_cuda_launcher(int m, int n, int c, int k, const void *grad_output, const int *idx, const float *weight, void *grad_input, at::ScalarType dtype);
 
 #ifdef __cplusplus
 }

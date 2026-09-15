@@ -5,6 +5,11 @@ import laspy
 from pathlib import Path
 import logging
 
+try:
+    from .las_io import write_standard_las
+except ImportError:
+    from las_io import write_standard_las
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 def process_file(input_file, output_file, keep_ratio, convert_label):
@@ -33,7 +38,7 @@ def process_file(input_file, output_file, keep_ratio, convert_label):
             
     # 更新标签
     las.classification = new_classes
-    las.write(output_file)
+    write_standard_las(las, output_file)
     logging.info(f"Saved to: {output_file}")
 
 

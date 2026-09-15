@@ -1,7 +1,7 @@
 from .default import *
 from .misc import *
-from .observation import *
 from .evaluator import *
+from .cvrl import *
 from .nan_inf_detector import (
     NaNInfDetectorHook,
     NaNInfDetectorTrainerHook, 

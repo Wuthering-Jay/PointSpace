@@ -1,7 +1,12 @@
 import torch
 from torch.autograd import Function
 
-from pointops._C import knn_query_cuda, random_ball_query_cuda, ball_query_cuda
+from pointops._C import (
+    knn_query_cuda,
+    knn_query_idx_cuda,
+    random_ball_query_cuda,
+    ball_query_cuda,
+)
 
 
 class KNNQuery(Function):
@@ -22,6 +27,22 @@ class KNNQuery(Function):
             m, nsample, xyz, new_xyz, offset.int(), new_offset.int(), idx, dist2
         )
         return idx, torch.sqrt(dist2)
+
+
+class KNNQueryIdx(Function):
+    @staticmethod
+    def forward(ctx, nsample, xyz, offset, new_xyz=None, new_offset=None):
+        """Exact KNN indices without allocating or materializing distances."""
+        if new_xyz is None or new_offset is None:
+            new_xyz = xyz
+            new_offset = offset
+        assert xyz.is_contiguous() and new_xyz.is_contiguous()
+        m = new_xyz.shape[0]
+        idx = torch.empty((m, nsample), dtype=torch.int, device=xyz.device)
+        knn_query_idx_cuda(
+            m, nsample, xyz, new_xyz, offset.int(), new_offset.int(), idx
+        )
+        return idx
 
 
 class RandomBallQuery(Function):
@@ -109,5 +130,6 @@ class BallQuery(Function):
 
 
 knn_query = KNNQuery.apply
+knn_query_idx = KNNQueryIdx.apply
 ball_query = BallQuery.apply
 random_ball_query = RandomBallQuery.apply

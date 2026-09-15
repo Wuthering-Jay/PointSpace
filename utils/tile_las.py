@@ -22,6 +22,11 @@ import logging
 import open3d as o3d
 import torch
 
+try:
+    from .las_io import write_standard_las
+except ImportError:
+    from las_io import write_standard_las
+
 # Try to import pointspace logger, fallback to standard logging
 try:
     from pointspace.utils.logger import get_root_logger
@@ -113,7 +118,7 @@ def _compute_sp_for_single_tile(tile_path, sp_params):
 
         # 更新文件
         las.superpoint = sp_idx
-        las.write(tile_path)
+        write_standard_las(las, tile_path)
 
         return {
             'status': 'success',
@@ -826,7 +831,7 @@ class LASTileProcessor:
             
             # 保存文件
             out_path = self.output_dir / f"{base_name}_{i:04d}{ext}"
-            new_las.write(out_path)
+            write_standard_las(new_las, out_path)
         
         self.logger.info(f"  Saved {len(segments)} tiles to {self.output_dir}")
 

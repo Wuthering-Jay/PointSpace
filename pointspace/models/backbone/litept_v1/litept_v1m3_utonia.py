@@ -173,14 +173,15 @@ class PointROPEAttention(PointModule):
 
         qkv = self.qkv(point.feat)[order]
         qkv_dtype = qkv.dtype
-        q, k, v = qkv.half().chunk(3, dim=-1)
+        # Preserve the dtype selected by the surrounding autocast context.
+        q, k, v = qkv.chunk(3, dim=-1)
         q = q.reshape(-1, h, c // h).transpose(0, 1)[None]
         k = k.reshape(-1, h, c // h).transpose(0, 1)[None]
 
         if self.enable_rope:
             pos = self._build_rope_pos(point, order)
-            q = self.rope(q.float(), pos).to(q.dtype)
-            k = self.rope(k.float(), pos).to(k.dtype)
+            q = self.rope(q, pos)
+            k = self.rope(k, pos)
 
         if not self.enable_flash:
             q = q.squeeze(0).transpose(0, 1).reshape(-1, k_patch, h, c // h).permute(

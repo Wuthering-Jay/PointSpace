@@ -9,6 +9,7 @@ Please cite our work if the code is helpful to you.
 
 // forward declaration
 void pointrope_cuda( torch::Tensor tokens, const torch::Tensor pos, const float base, const float fwd );
+torch::Tensor pointrope_bhnd_cuda(const torch::Tensor tokens, const torch::Tensor pos, const float base, const float fwd);
 
 void pointrope_cpu( torch::Tensor tokens, const torch::Tensor positions, const float base, const float fwd )
 {
@@ -66,6 +67,27 @@ void pointrope( torch::Tensor tokens,
         pointrope_cpu( tokens, positions, base, fwd );
 }
 
+torch::Tensor pointrope_bhnd(
+        const torch::Tensor tokens,
+        const torch::Tensor positions,
+        const float base,
+        const float fwd)
+{
+    TORCH_CHECK(tokens.is_cuda() && positions.is_cuda(), "pointrope_bhnd requires CUDA tensors");
+    TORCH_CHECK(tokens.dim() == 4, "tokens must have shape [B, H, N, D]");
+    TORCH_CHECK(positions.dim() == 3, "positions must have shape [B, N, 3]");
+    TORCH_CHECK(tokens.size(0) == positions.size(0), "batch size differs between tokens and positions");
+    TORCH_CHECK(tokens.size(2) == positions.size(1), "token count differs between tokens and positions");
+    TORCH_CHECK(positions.size(2) == 3, "positions.shape[2] must equal 3");
+    TORCH_CHECK(tokens.size(3) % 6 == 0, "head dimension must be a multiple of 6");
+    TORCH_CHECK(positions.scalar_type() == at::kLong, "positions must be int64");
+    TORCH_CHECK(positions.is_contiguous(), "positions must be contiguous");
+    TORCH_CHECK(tokens.get_device() == positions.get_device(), "tokens and positions must use the same CUDA device");
+    TORCH_CHECK(tokens.is_floating_point(), "tokens must have a floating-point dtype");
+    return pointrope_bhnd_cuda(tokens, positions, base, fwd);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("pointrope", &pointrope, "PointROPE forward/backward");
+  m.def("pointrope_bhnd", &pointrope_bhnd, "Out-of-place PointROPE for [B,H,N,D]");
 }

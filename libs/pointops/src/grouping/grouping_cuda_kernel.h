@@ -11,8 +11,8 @@ void grouping_backward_cuda(int m, int nsample, int c, at::Tensor grad_output_te
 extern "C" {
 #endif
 
-void grouping_forward_cuda_launcher(int m, int nsample, int c, const float *input, const int *idx, float *output);
-void grouping_backward_cuda_launcher(int m, int nsample, int c, const float *grad_output, const int *idx, float *grad_input);
+void grouping_forward_cuda_launcher(int n, int m, int nsample, int c, const void *input, const int *idx, void *output, at::ScalarType dtype);
+void grouping_backward_cuda_launcher(int n, int m, int nsample, int c, const void *grad_output, const int *idx, void *grad_input, at::ScalarType dtype);
 
 #ifdef __cplusplus
 }

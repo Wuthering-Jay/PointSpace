@@ -1,3 +1,9 @@
+# On Windows, load PROJ before other dataset extensions. Some native libraries
+# imported by the indoor/outdoor dataset modules expose DLLs with overlapping
+# dependency names; loading them first can make pyproj._context fail even when
+# the pyproj installation itself is valid.
+import pyproj  # noqa: F401
+
 from .defaults import DefaultDataset, DefaultImagePointDataset, ConcatDataset
 from .builder import build_dataset
 from .utils import point_collate_fn, collate_fn
@@ -15,8 +21,7 @@ from .aeo import AEODataset
 from .semantic_kitti import SemanticKITTIDataset
 from .nuscenes import NuScenesDataset
 from .waymo import WaymoDataset
-from .las import LasDataset
-from .las_image import LasImageDataset
+from .las import LasDataset, LasImageDataset, RRCLLasDataset, CVRLLasDataset
 
 # object
 from .modelnet import ModelNetDataset

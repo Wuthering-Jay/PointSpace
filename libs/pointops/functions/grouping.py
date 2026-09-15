@@ -13,7 +13,7 @@ class Grouping(Function):
         """
         assert input.is_contiguous() and idx.is_contiguous()
         m, nsample, n, c = idx.shape[0], idx.shape[1], input.shape[0], input.shape[1]
-        output = torch.zeros((m, nsample, c), dtype=torch.float, device=input.device)
+        output = input.new_empty((m, nsample, c))
         grouping_forward_cuda(m, nsample, c, input, idx, output)
         ctx.n = n
         ctx.save_for_backward(idx)
@@ -27,8 +27,9 @@ class Grouping(Function):
         """
         n = ctx.n
         (idx,) = ctx.saved_tensors
+        grad_output = grad_output.contiguous()
         m, nsample, c = grad_output.shape
-        grad_input = torch.zeros((n, c), dtype=torch.float, device=idx.device)
+        grad_input = grad_output.new_zeros((n, c))
         grouping_backward_cuda(m, nsample, c, grad_output, idx, grad_input)
         return grad_input, None
 
@@ -38,23 +39,24 @@ def grouping(idx, feat, xyz, new_xyz=None, with_xyz=False):
         new_xyz = xyz
     assert xyz.is_contiguous() and feat.is_contiguous()
     m, nsample, c = idx.shape[0], idx.shape[1], feat.shape[1]
-    xyz = torch.cat([xyz, torch.zeros([1, 3]).to(xyz.device)], dim=0)
-    feat = torch.cat([feat, torch.zeros([1, c]).to(feat.device)], dim=0)
-    grouped_feat = feat[idx.view(-1).long(), :].view(
-        m, nsample, c
-    )  # (m, num_sample, c)
+    if feat.is_cuda:
+        idx_cuda = idx.to(device=feat.device, dtype=torch.int32).contiguous()
+        grouped_feat = grouping2(feat, idx_cuda)
+    else:
+        valid = (idx >= 0) & (idx < feat.shape[0])
+        safe_idx = idx.clamp(0, max(feat.shape[0] - 1, 0)).long()
+        grouped_feat = feat[safe_idx] * valid.unsqueeze(-1)
 
     if with_xyz:
         assert new_xyz.is_contiguous()
-        mask = torch.sign(idx + 1)
-        grouped_xyz = xyz[idx.view(-1).long(), :].view(
-            m, nsample, 3
-        ) - new_xyz.unsqueeze(
-            1
-        )  # (m, num_sample, 3)
-        grouped_xyz = torch.einsum(
-            "n s c, n s -> n s c", grouped_xyz, mask
-        )  # (m, num_sample, 3)
+        valid = (idx >= 0) & (idx < xyz.shape[0])
+        if xyz.is_cuda:
+            idx_cuda = idx.to(device=xyz.device, dtype=torch.int32).contiguous()
+            grouped_xyz = grouping2(xyz, idx_cuda) - new_xyz.unsqueeze(1)
+        else:
+            safe_idx = idx.clamp(0, max(xyz.shape[0] - 1, 0)).long()
+            grouped_xyz = xyz[safe_idx] - new_xyz.unsqueeze(1)
+        grouped_xyz = grouped_xyz * valid.to(grouped_xyz.device).unsqueeze(-1)
         return torch.cat((grouped_xyz, grouped_feat), -1)
     else:
         return grouped_feat

@@ -33,16 +33,23 @@ try:
             ctx.save_for_backward(positions)
             ctx.saved_base = base
             ctx.saved_F0 = F0
-            # tokens = tokens.clone() # uncomment this if inplace doesn't work
+            if tokens.is_cuda:
+                return _kernels.pointrope_bhnd(tokens, positions, base, F0)
+            tokens = tokens.transpose(1, 2).contiguous()
             _kernels.pointrope(tokens, positions, base, F0)
-            ctx.mark_dirty(tokens)
-            return tokens
+            return tokens.transpose(1, 2).contiguous()
 
         @staticmethod
         def backward(ctx, grad_res):
             positions, base, F0 = ctx.saved_tensors[0], ctx.saved_base, ctx.saved_F0
-            _kernels.pointrope(grad_res, positions, base, -F0)
-            ctx.mark_dirty(grad_res)
+            if grad_res.is_cuda:
+                grad_res = _kernels.pointrope_bhnd(
+                    grad_res, positions, base, -F0
+                )
+            else:
+                grad_res = grad_res.transpose(1, 2).contiguous()
+                _kernels.pointrope(grad_res, positions, base, -F0)
+                grad_res = grad_res.transpose(1, 2).contiguous()
             return grad_res, None, None, None
 
     class PointROPE(torch.nn.Module):
@@ -52,10 +59,9 @@ try:
             self.F0 = F0
 
         def forward(self, tokens, positions):
-            tokens = tokens.transpose(1, 2).contiguous()
             positions = positions.contiguous()
             tokens = PointROPE_func.apply(tokens, positions, self.base, self.F0)
-            return tokens.transpose(1, 2).contiguous()
+            return tokens
 
 except Exception as e:
     print(
@@ -138,6 +144,7 @@ class PointROPEAttention(PointModule):
         proj_drop=0.0,
         order_index=0,
         enable_flash=True,
+        enable_rope=True,
     ):
         super().__init__()
         assert channels % num_heads == 0
@@ -146,6 +153,7 @@ class PointROPEAttention(PointModule):
         self.scale = qk_scale or (channels // num_heads) ** -0.5
         self.order_index = order_index
         self.enable_flash = enable_flash
+        self.enable_rope = bool(enable_rope)
         if enable_flash:
             assert flash_attn is not None, "Make sure flash_attn is installed."
             self.patch_size = patch_size
@@ -162,7 +170,7 @@ class PointROPEAttention(PointModule):
         self.softmax = torch.nn.Softmax(dim=-1)
 
         # pointrope
-        self.rope = PointROPE(freq=rope_freq)
+        self.rope = PointROPE(freq=rope_freq) if self.enable_rope else None
 
     @torch.no_grad()
     def get_padding_and_inverse(self, point):
@@ -241,24 +249,23 @@ class PointROPEAttention(PointModule):
         qkv = self.qkv(point.feat)[order]  # [N, C]
         qkv_dtype = qkv.dtype
 
-        ## apply pointrope
-        pos = point.grid_coord[order]  # [N, 3]
-
-        if pos.shape[0] % K == 0:
-            pos_patch = pos.reshape(-1, K, 3)
-            pos_patch = pos_patch - pos_patch.amin(dim=1, keepdim=True)
-            pos = pos_patch.reshape(1, -1, 3).contiguous()
-        else:
-            # fallback: 不做 patch-local，避免小样本崩溃
-            pos = pos.reshape(1, -1, 3).contiguous()
-
-        q, k, v = qkv.half().chunk(3, dim=-1)
+        # Preserve the dtype selected by the surrounding autocast context.
+        q, k, v = qkv.chunk(3, dim=-1)
         q = q.reshape(-1, H, C // H).transpose(0, 1)[None]  # [1, H, N, head_dim]
         k = k.reshape(-1, H, C // H).transpose(0, 1)[None]  # [1, H, N, head_dim]
 
-        # workround to make pointrope cuda float32 happy
-        q = self.rope(q.float(), pos).to(q.dtype)  # [1, H, N, head_dim]
-        k = self.rope(k.float(), pos).to(k.dtype)  # [1, H, N, head_dim]
+        if self.enable_rope:
+            pos = point.grid_coord[order]  # [N, 3]
+            if pos.shape[0] % K == 0:
+                pos_patch = pos.reshape(-1, K, 3)
+                pos_patch = pos_patch - pos_patch.amin(dim=1, keepdim=True)
+                pos = pos_patch.reshape(1, -1, 3).contiguous()
+            else:
+                # fallback: 不做 patch-local，避免小样本崩溃
+                pos = pos.reshape(1, -1, 3).contiguous()
+
+            q = self.rope(q, pos)  # [1, H, N, head_dim]
+            k = self.rope(k, pos)  # [1, H, N, head_dim]
 
         if not self.enable_flash:
             q = q.squeeze(0).transpose(0, 1).reshape(-1, K, H, C // H).permute(
@@ -348,6 +355,7 @@ class Block(PointModule):
         enable_attn=True,
         rope_freq=100.0,
         enable_flash=True,
+        enable_rope=True,
     ):
         super().__init__()
         self.channels = channels
@@ -386,6 +394,7 @@ class Block(PointModule):
                 proj_drop=proj_drop,
                 order_index=order_index,
                 enable_flash=enable_flash,
+                enable_rope=enable_rope,
             )
             self.norm2 = PointSequential(norm_layer(channels))
             self.mlp = PointSequential(
@@ -651,6 +660,7 @@ class LitePT(PointModule):
         shuffle_orders=True,
         enc_mode=False,
         enable_flash=True,
+        enable_rope=True,
     ):
         super().__init__()
         self.num_stages = len(enc_depths)
@@ -731,6 +741,7 @@ class LitePT(PointModule):
                         enable_attn=enc_attn[s],
                         rope_freq=enc_rope_freq[s],
                         enable_flash=enable_flash,
+                        enable_rope=enable_rope,
                     ),
                     name=f"block{i}",
                 )
@@ -781,6 +792,7 @@ class LitePT(PointModule):
                             enable_attn=dec_attn[s],
                             rope_freq=dec_rope_freq[s],
                             enable_flash=enable_flash,
+                            enable_rope=enable_rope,
                         ),
                         name=f"block{i}",
                     )

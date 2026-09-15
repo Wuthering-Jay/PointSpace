@@ -8,6 +8,8 @@ Please cite our work if the code is helpful to you.
 #include <torch/extension.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAException.h>
 #include <vector>
 
 #define CHECK_CUDA(tensor) {\
@@ -97,4 +99,68 @@ void pointrope_cuda( torch::Tensor tokens, const torch::Tensor pos, const float 
             pos.data_ptr<int64_t>(), 
             base, fwd); //, N, H, D );
     }));
+}
+
+
+template <typename scalar_t>
+__global__ void pointrope_bhnd_cuda_kernel(
+        const torch::PackedTensorAccessor64<scalar_t,4,torch::RestrictPtrTraits> tokens,
+        torch::PackedTensorAccessor64<scalar_t,4,torch::RestrictPtrTraits> output,
+        const int64_t* __restrict__ pos,
+        const float base,
+        const float fwd)
+{
+    const int B = tokens.size(0);
+    const int H = tokens.size(1);
+    const int N = tokens.size(2);
+    const int D = tokens.size(3);
+    const int Q = D / 6;
+    const int pair = threadIdx.x;
+    if (pair >= D / 2) return;
+
+    const int b = blockIdx.x / N;
+    const int n = blockIdx.x % N;
+    if (b >= B) return;
+    const int axis = pair / Q;
+    const int d = pair % Q;
+    const int u_idx = axis * 2 * Q + d;
+    const int v_idx = u_idx + Q;
+    const float inv_freq = fwd / powf(base, d / float(Q));
+    const float freq = static_cast<float>(pos[(b * N + n) * 3 + axis]) * inv_freq;
+    const float cosine = cosf(freq);
+    const float sine = sinf(freq);
+
+    for (int h = 0; h < H; ++h) {
+        const float u = static_cast<float>(tokens[b][h][n][u_idx]);
+        const float v = static_cast<float>(tokens[b][h][n][v_idx]);
+        output[b][h][n][u_idx] = static_cast<scalar_t>(u * cosine - v * sine);
+        output[b][h][n][v_idx] = static_cast<scalar_t>(v * cosine + u * sine);
+    }
+}
+
+
+torch::Tensor pointrope_bhnd_cuda(
+        const torch::Tensor tokens,
+        const torch::Tensor pos,
+        const float base,
+        const float fwd)
+{
+    const int B = tokens.size(0);
+    const int N = tokens.size(2);
+    const int D = tokens.size(3);
+    auto output = torch::empty(tokens.sizes(), tokens.options());
+    int threads = 32;
+    while (threads < D / 2) threads <<= 1;
+    TORCH_CHECK(threads <= 1024, "PointRoPE head dimension is too large");
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        at::kHalf, at::kBFloat16, tokens.scalar_type(),
+        "pointrope_bhnd_cuda", ([&] {
+            pointrope_bhnd_cuda_kernel<scalar_t><<<B * N, threads, 0, stream>>>(
+                tokens.packed_accessor64<scalar_t,4,torch::RestrictPtrTraits>(),
+                output.packed_accessor64<scalar_t,4,torch::RestrictPtrTraits>(),
+                pos.data_ptr<int64_t>(), base, fwd);
+        }));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
 }

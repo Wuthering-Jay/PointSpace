@@ -6,6 +6,11 @@ from typing import Optional
 import laspy
 import numpy as np
 
+try:
+    from .las_io import write_standard_las
+except ImportError:
+    from las_io import write_standard_las
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -89,7 +94,7 @@ class LASRandomDownsampler:
             logging.warning(f"  -> 文件为空，直接复制为空输出: {output_file}")
             output_file.parent.mkdir(parents=True, exist_ok=True)
             las.update_header()
-            las.write(output_file)
+            write_standard_las(las, output_file)
             return
 
         keep_count = max(1, num_points // self.divisor)
@@ -107,7 +112,7 @@ class LASRandomDownsampler:
         las.update_header()
 
         output_file.parent.mkdir(parents=True, exist_ok=True)
-        las.write(output_file)
+        write_standard_las(las, output_file)
 
         logging.info(
             f"  -> 已保存至: {output_file} "

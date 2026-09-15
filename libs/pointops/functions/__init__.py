@@ -1,4 +1,4 @@
-from .query import knn_query, ball_query, random_ball_query
+from .query import knn_query, knn_query_idx, ball_query, random_ball_query
 from .sampling import farthest_point_sampling
 from .grouping import grouping, grouping2
 from .interpolation import interpolation, interpolation2

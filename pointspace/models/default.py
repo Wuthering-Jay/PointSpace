@@ -200,6 +200,61 @@ class DefaultSegmentorV2(nn.Module):
 
 
 @MODELS.register_module()
+class CVRLLinearProbeSegmentor(DefaultSegmentorV2):
+    """Strict linear probe over a frozen CVRL feature branch.
+
+    The backbone is kept in evaluation mode even while the linear classifier
+    is training, so DropPath, dropout and normalization state cannot alter the
+    fixed representation. The only trainable mapping is ``Linear(C, K)``.
+    """
+
+    def __init__(
+        self,
+        num_classes,
+        backbone_out_channels,
+        backbone,
+        criteria,
+        feature_source="full",
+    ):
+        feature_source = str(feature_source).lower()
+        aliases = {"vpsd": "visual", "rrcl": "return", "cvrl": "full"}
+        feature_source = aliases.get(feature_source, feature_source)
+        if feature_source not in {"visual", "return", "full"}:
+            raise ValueError(
+                "feature_source must be visual/vpsd, return/rrcl, or full/cvrl"
+            )
+        visual_channels = int(backbone.get("visual_channels", 128))
+        return_channels = int(backbone.get("return_channels", 72))
+        expected_channels = {
+            "visual": visual_channels,
+            "return": return_channels,
+            "full": visual_channels + return_channels,
+        }[feature_source]
+        if int(backbone_out_channels) != expected_channels:
+            raise ValueError(
+                f"feature_source='{feature_source}' requires "
+                f"backbone_out_channels={expected_channels}"
+            )
+        backbone = dict(backbone)
+        backbone["mode"] = feature_source
+        super().__init__(
+            num_classes=num_classes,
+            backbone_out_channels=expected_channels,
+            backbone=backbone,
+            criteria=criteria,
+            freeze_backbone=True,
+        )
+        self.feature_source = feature_source
+        if not isinstance(self.seg_head, nn.Linear):
+            raise RuntimeError("CVRL linear probe requires one linear head")
+
+    def train(self, mode=True):
+        super().train(mode)
+        self.backbone.eval()
+        return self
+
+
+@MODELS.register_module()
 class DefaultLORASegmentorV2(nn.Module):
     def __init__(
         self,

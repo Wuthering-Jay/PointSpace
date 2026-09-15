@@ -116,6 +116,8 @@ class IterationTimer(HookBase):
 
 @HOOKS.register_module()
 class InformationWriter(HookBase):
+    _console_hidden_keys = frozenset({"tok", "edge", "patch"})
+
     def __init__(self, interval=1):
         self.interval = interval
         self.curr_iter = 0
@@ -196,6 +198,7 @@ class InformationWriter(HookBase):
         return result
 
     def after_step(self):
+        sparse_diagnostics = []
         if "model_output_dict" in self.trainer.comm_info.keys():
             model_output_dict = self.trainer.comm_info["model_output_dict"]
             self.model_output_keys = []
@@ -206,6 +209,10 @@ class InformationWriter(HookBase):
                     if value.numel() == 1:
                         self.trainer.storage.put_scalar(key, value.item())
                         self.model_output_keys.append(key)
+                        if key.startswith("grad/"):
+                            sparse_diagnostics.append(
+                                (key, self.trainer.storage.history(key).val)
+                            )
                     elif key.startswith("loss"):
                         # Loss tensors are expected to be scalar; fallback to mean for safety.
                         self.trainer.storage.put_scalar(key, value.mean().item())
@@ -214,6 +221,47 @@ class InformationWriter(HookBase):
                     # Already a Python scalar (int/float/bool)
                     self.trainer.storage.put_scalar(key, float(value))
                     self.model_output_keys.append(key)
+                    if key.startswith("grad/"):
+                        sparse_diagnostics.append(
+                            (key, self.trainer.storage.history(key).val)
+                        )
+
+        # Gradient diagnostics are intentionally sparse (for example every
+        # 100 forward passes) and need not align with the normal console
+        # interval. Write them at the producing step; otherwise the next
+        # model output replaces their keys before TensorBoard ever sees them.
+        if sparse_diagnostics:
+            values = "  ".join(
+                f"{key[len('grad/'):]}: {float(value):.4f}"
+                for key, value in sparse_diagnostics
+            )
+            self.trainer.logger.info(
+                "CVRL gradient diagnostic: [%d/%d][%d/%d] %s",
+                self.trainer.epoch + 1,
+                self.trainer.max_epoch,
+                self.trainer.comm_info["iter"] + 1,
+                len(self.trainer.train_loader),
+                values,
+            )
+            if self.trainer.writer is not None:
+                for key, value in sparse_diagnostics:
+                    self.trainer.writer.add_scalar(
+                        "train_batch/" + key, value, self.curr_iter
+                    )
+            if (
+                self.trainer.writer is not None
+                and self.trainer.cfg.enable_wandb
+            ):
+                wandb.log(
+                    {
+                        "Iter": self.curr_iter,
+                        **{
+                            "train_batch/" + key: value
+                            for key, value in sparse_diagnostics
+                        },
+                    },
+                    step=self.curr_iter,
+                )
 
         # Only log every `interval` steps; always accumulate storage for correct avg
         if self.curr_iter % self.interval != 0:
@@ -223,6 +271,7 @@ class InformationWriter(HookBase):
         key_vals = [
             (key, self.trainer.storage.history(key).val)
             for key in self.model_output_keys
+            if key not in self._console_hidden_keys
         ]
         self.trainer.comm_info["iter_info"] += self._format_loss_str(key_vals)
         lr = self.trainer.optimizer.state_dict()["param_groups"][0]["lr"]
@@ -232,6 +281,8 @@ class InformationWriter(HookBase):
         if self.trainer.writer is not None:
             self.trainer.writer.add_scalar("params/lr", lr, self.curr_iter)
             for key in self.model_output_keys:
+                if key.startswith("grad/"):
+                    continue
                 self.trainer.writer.add_scalar(
                     "train_batch/" + key,
                     self.trainer.storage.history(key).val,
@@ -243,6 +294,8 @@ class InformationWriter(HookBase):
                     {"Iter": self.curr_iter, "params/lr": lr}, step=self.curr_iter
                 )
                 for key in self.model_output_keys:
+                    if key.startswith("grad/"):
+                        continue
                     wandb.log(
                         {
                             "Iter": self.curr_iter,
@@ -256,6 +309,7 @@ class InformationWriter(HookBase):
         key_vals = [
             (key, self.trainer.storage.history(key).avg)
             for key in self.model_output_keys
+            if key not in self._console_hidden_keys
         ]
         epoch_info += self._format_loss_str(key_vals)
         self.trainer.logger.info(epoch_info)
@@ -290,7 +344,30 @@ class CheckpointSaver(HookBase):
             if self.trainer.cfg.evaluate:
                 current_metric_value = self.trainer.comm_info["current_metric_value"]
                 current_metric_name = self.trainer.comm_info["current_metric_name"]
-                if current_metric_value > self.trainer.best_metric_value:
+                current_metric_mode = self.trainer.comm_info.get(
+                    "current_metric_mode", "max"
+                )
+                if current_metric_mode not in {"min", "max"}:
+                    raise ValueError(
+                        "current_metric_mode must be either 'min' or 'max'"
+                    )
+                if (
+                    self.trainer.best_metric_name != current_metric_name
+                    or self.trainer.best_metric_mode != current_metric_mode
+                ):
+                    self.trainer.best_metric_value = (
+                        torch.inf
+                        if current_metric_mode == "min"
+                        else -torch.inf
+                    )
+                    self.trainer.best_metric_name = current_metric_name
+                    self.trainer.best_metric_mode = current_metric_mode
+                improved = (
+                    current_metric_value < self.trainer.best_metric_value
+                    if current_metric_mode == "min"
+                    else current_metric_value > self.trainer.best_metric_value
+                )
+                if improved:
                     self.trainer.best_metric_value = current_metric_value
                     is_best = True
                     self.trainer.logger.info(
@@ -320,6 +397,8 @@ class CheckpointSaver(HookBase):
                         else None
                     ),
                     "best_metric_value": self.trainer.best_metric_value,
+                    "best_metric_name": self.trainer.best_metric_name,
+                    "best_metric_mode": self.trainer.best_metric_mode,
                     # Class mapping from the training dataset (remapped ID -> original ID).
                     # Saved here so the test-time writer can inverse-map predictions
                     # back to the original class IDs without rebuilding the dataset.
@@ -359,11 +438,68 @@ class CheckpointSaver(HookBase):
 
 
 @HOOKS.register_module()
+class BackboneCheckpointExporter(HookBase):
+    """Export only ``backbone.*`` weights after successful training.
+
+    The regular checkpoint remains available for resuming RRCL training;
+    this compact companion checkpoint is intended for downstream fine-tuning.
+    """
+
+    def __init__(self, filename="backbone_last.pth"):
+        self.filename = filename
+
+    def after_train(self):
+        if not is_main_process():
+            return
+        state_dict = self.trainer.model.state_dict()
+        backbone_state = OrderedDict(
+            (key, value.detach().cpu())
+            for key, value in state_dict.items()
+            if key.startswith("backbone.") or key.startswith("module.backbone.")
+        )
+        if not backbone_state:
+            raise RuntimeError("Model state_dict contains no backbone.* parameters")
+        filename = os.path.join(
+            self.trainer.cfg.save_path, "model", self.filename
+        )
+        temporary = filename + ".tmp"
+        torch.save(
+            {
+                "state_dict": backbone_state,
+                "source": "backbone-only export",
+            },
+            temporary,
+        )
+        os.replace(temporary, filename)
+        self.trainer.logger.info("Exported backbone checkpoint to: " + filename)
+
+
+@HOOKS.register_module()
 class CheckpointLoader(HookBase):
-    def __init__(self, keywords="", replacement=None, strict=False):
+    def __init__(
+        self,
+        keywords="",
+        replacement=None,
+        strict=False,
+        include_prefixes=None,
+        required=False,
+    ):
         self.keywords = keywords
         self.replacement = replacement if replacement is not None else keywords
         self.strict = strict
+        self.required = bool(required)
+        if isinstance(include_prefixes, str):
+            include_prefixes = (include_prefixes,)
+        self.include_prefixes = tuple(include_prefixes or ())
+
+    def _included(self, key):
+        if not self.include_prefixes:
+            return True
+        unwrapped = key[7:] if key.startswith("module.") else key
+        return any(
+            key.startswith(prefix) or unwrapped.startswith(prefix)
+            for prefix in self.include_prefixes
+        )
 
     def before_train(self):
         self.trainer.logger.info("=> Loading checkpoint & weight ...")
@@ -378,16 +514,27 @@ class CheckpointLoader(HookBase):
                 f"Loading layer weights with keyword: {self.keywords}, "
                 f"replace keyword with: {self.replacement}"
             )
+            if self.include_prefixes:
+                self.trainer.logger.info(
+                    "Loading only checkpoint prefixes: %s",
+                    self.include_prefixes,
+                )
             weight = OrderedDict()
             for key, value in checkpoint["state_dict"].items():
                 if not key.startswith("module."):
                     key = "module." + key  # xxx.xxx -> module.xxx.xxx
+                if not self._included(key):
+                    continue
                 # Now all keys contain "module." no matter DDP or not.
                 if self.keywords in key:
                     key = key.replace(self.keywords, self.replacement, 1)
                 if comm.get_world_size() == 1:
                     key = key[7:]  # module.xxx.xxx -> xxx.xxx
                 weight[key] = value
+            if not weight:
+                raise RuntimeError(
+                    "CheckpointLoader filters selected no checkpoint tensors"
+                )
             load_state_info = self.trainer.model.load_state_dict(
                 weight, strict=self.strict
             )
@@ -398,12 +545,21 @@ class CheckpointLoader(HookBase):
                 )
                 self.trainer.start_epoch = checkpoint["epoch"]
                 self.trainer.best_metric_value = checkpoint["best_metric_value"]
+                self.trainer.best_metric_name = checkpoint.get(
+                    "best_metric_name"
+                )
+                self.trainer.best_metric_mode = checkpoint.get(
+                    "best_metric_mode", "max"
+                )
                 self.trainer.optimizer.load_state_dict(checkpoint["optimizer"])
                 self.trainer.scheduler.load_state_dict(checkpoint["scheduler"])
                 if self.trainer.cfg.enable_amp:
                     self.trainer.scaler.load_state_dict(checkpoint["scaler"])
         else:
-            self.trainer.logger.info(f"No weight found at: {self.trainer.cfg.weight}")
+            message = f"No weight found at: {self.trainer.cfg.weight}"
+            if self.required:
+                raise FileNotFoundError(message)
+            self.trainer.logger.info(message)
 
 
 @HOOKS.register_module()

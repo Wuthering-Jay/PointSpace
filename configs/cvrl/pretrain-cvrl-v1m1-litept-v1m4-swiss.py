@@ -1,0 +1,342 @@
+# Official CVRL-v1m1 with accumulated stage-wise symmetric PCGrad.
+# All runtime, model and dataset parameters are listed explicitly below.
+
+# -----------------------------------------------------------------------------
+# 0. Paths, input and task definition
+# -----------------------------------------------------------------------------
+data_root = r"G:\data\swiss\joint_tiles"
+train_pointcloud_path = r"G:\data\swiss\joint_tiles\pointcloud"
+test_pointcloud_path = r"E:\data\云南遥感中心\精修城区\tile\val"
+dino_feature_path = r"G:\data\swiss\joint_tiles\dino_feature"
+pca_model_path = r"G:\data\swiss\joint_tiles\dino_feature_pca128\dino_pca_model.safetensors"
+feature_output_dir = r"E:\data\云南遥感中心\精修城区\cvrl"
+
+grid_size = 0.5
+feature_keys = ("coord", "intensity")
+in_channels = 4
+
+num_classes = 4
+class_names = ("S", "F", "M", "L")
+ignore_index = -1
+knn_k = 48
+
+# One switch controls both training objectives and exported point features:
+# visual -> 128D, return -> 72D, full -> [128D | 72D] = 200D.
+mode = "full"
+visual_channels = 128
+return_channels = 72
+backbone_out_channels = {
+    "visual": visual_channels,
+    "return": return_channels,
+    "full": visual_channels + return_channels,
+}[mode]
+
+# -----------------------------------------------------------------------------
+# 1. Runtime and resources
+# -----------------------------------------------------------------------------
+# Canonical output path for the official accumulated-PCGrad CVRL-v1m1.
+save_path = f"exp/cvrl/swiss/pretrain-v1m1-litept-v1m4-{mode}"
+weight = f"{save_path}/model/model_last.pth"
+resume = True
+evaluate = False
+test_only = False
+seed = 42
+
+num_worker = 4
+prefetch_factor = 2
+val_prefetch_factor = 1
+persistent_workers = True
+batch_size_train = 20
+batch_size_val = 4
+batch_size_test = 4
+gradient_accumulation_steps = 4
+
+epoch = 50
+clip_grad = 3.0
+sync_bn = False
+enable_amp = True
+amp_dtype = "bfloat16"
+find_unused_parameters = False
+mix_prob = 0.0
+
+enable_wandb = False
+wandb_project = "pointspace-cvrl"
+wandb_key = None
+
+# -----------------------------------------------------------------------------
+# 2. Optimization
+# -----------------------------------------------------------------------------
+base_lr = 1e-3
+optimizer = dict(type="AdamW", lr=base_lr, weight_decay=0.05)
+scheduler = dict(
+    type="OneCycleLR",
+    max_lr=base_lr,
+    pct_start=0.05,
+    anneal_strategy="cos",
+    div_factor=10.0,
+    final_div_factor=1000.0,
+)
+
+# Task heads/projectors use base_lr; LitePT blocks use one tenth of it.
+param_dicts = [dict(keyword="block", lr=1e-4)]
+
+# -----------------------------------------------------------------------------
+# 3. Official CVRL-v1m1 model
+# -----------------------------------------------------------------------------
+# PCA must be fitted globally with normalized native DINO features:
+# target_dim=128, normalize_input=True, whiten=False,
+# svd_solver="randomized", iterated_power=7, n_oversamples=64,
+# power_iteration_normalizer="QR", output_dtype="float32".
+model = dict(
+    type="CVRL-v1m1",
+    mode=mode,
+    backbone_out_channels=backbone_out_channels,
+    visual_channels=visual_channels,
+    return_channels=return_channels,
+    native_teacher_channels=1024,
+    projector_checkpoint=True,
+    return_warmup_ratio=0.1,
+    # First 10%: return warm-up; final 90%: accumulated symmetric PCGrad.
+    pcgrad_start_ratio=0.1,
+    pcgrad_log_interval=100,
+    edge_weight="sqrt_count",
+    sample_balanced=True,
+    validate_mapping=False,
+    aggregate_channel_chunk_size=64,
+    visual_loss_chunk_size=4096,
+    knn_k=knn_k,
+    lambda_vpsd=1.0,
+    lambda_return=1.5,
+    lambda_ctx=1.5,
+    head_dropout=0.1,
+    ignore_index=ignore_index,
+    # RRCL can consume P2/P3/P4 but cannot update these semantic anchors.
+    decoder_detach_stages=(2, 3, 4),
+    backbone=dict(
+        type="CVRL-v1m1-backbone",
+        mode=mode,
+        level_channels=(36, 72, 144, 252, 504),
+        distill_level=2,
+        visual_channels=visual_channels,
+        return_channels=return_channels,
+        native_channels=1024,
+        native_hidden_channels=1024,
+        pca_path=pca_model_path,
+        require_pca=True,
+        pca_output_normalize=True,
+        pca_output_scale=visual_channels**0.5,
+        visual_token_chunk_size=8192,
+        return_backbone=dict(
+            type="LitePT-v1m4",
+            in_channels=in_channels,
+            order=("z", "z-trans", "hilbert", "hilbert-trans"),
+            stride=(2, 2, 2, 2),
+            enc_depths=(2, 2, 2, 6, 2),
+            enc_channels=(36, 72, 144, 252, 504),
+            enc_num_head=(2, 4, 8, 14, 28),
+            enc_patch_size=(192, 192, 192, 192, 192),
+            enc_conv=(True, True, True, False, False),
+            enc_attn=(False, False, False, True, True),
+            enc_rope_freq=(100.0, 100.0, 100.0, 100.0, 100.0),
+            dec_depths=(1, 1, 1, 1),
+            dec_channels=(72, 72, 144, 252),
+            dec_num_head=(4, 4, 8, 14),
+            dec_patch_size=(192, 192, 192, 192),
+            dec_conv=(True, True, True, True),
+            dec_attn=(False, False, False, False),
+            dec_rope_freq=(100.0, 100.0, 100.0, 100.0),
+            dec_rope_enable=True,
+            mlp_ratio=4,
+            qkv_bias=True,
+            qk_scale=None,
+            attn_drop=0.0,
+            proj_drop=0.0,
+            drop_path=0.3,
+            pre_norm=True,
+            shuffle_orders=True,
+            enable_flash=True,
+            traceable=True,
+            mask_token=False,
+            enc_mode=False,
+            freeze_encoder=False,
+            shift_coords=None,
+            jitter_coords=None,
+            rescale_coords=None,
+            checkpoint_mlp=True,
+        ),
+    ),
+    criteria=[
+        dict(
+            type="CrossEntropyLoss",
+            loss_weight=1.0,
+            ignore_index=ignore_index,
+            auto_class_weight=True,
+        )
+    ],
+)
+
+# -----------------------------------------------------------------------------
+# 4. Hooks, trainer and feature export
+# -----------------------------------------------------------------------------
+hooks = [
+    dict(type="CheckpointLoader"),
+    dict(type="RuntimeInfoHook"),
+    dict(type="ModelHook"),
+    dict(type="CVRLTrainingSchedule"),
+    dict(type="IterationTimer", warmup_iter=2),
+    dict(type="InformationWriter", interval=10),
+    dict(type="CacheCleaner", time_multiplier=2.5, step_clean_interval=200),
+    dict(type="CVRLEvaluator", log_interval=10),
+    # Persist the epoch before optional audit work so diagnostics can never
+    # prevent checkpoint recovery.
+    dict(type="CheckpointSaver", save_freq=None),
+    dict(
+        type="CVRLAuditFeatureSaver",
+        output_dir=f"{save_path}/audit_features",
+        num_batches=8,
+        max_points=8192,
+        feature_dtype="float16",
+    ),
+    dict(type="PreciseEvaluator", test_last=True),
+]
+
+train = dict(type="CVRLPCGradTrainer")
+test = dict(type="CVRLFeatureTester", verbose=True)
+
+feature_source = mode
+feature_dtype = "float16"
+normalize_feature = False
+feature_aggregate_on_gpu = False
+feature_overwrite = False
+
+# -----------------------------------------------------------------------------
+# 5. Train/validation transforms
+# -----------------------------------------------------------------------------
+train_transform = [
+    dict(type="ZPercentileCenterShift", percentile=2.0),
+    dict(type="RobustLogIntensity"),
+    dict(type="RandomDropout", dropout_ratio=0.2, dropout_application_ratio=0.2),
+    dict(type="RandomRotate", angle=[-1, 1], axis="z", center=[0, 0, 0], p=0.5),
+    dict(type="RandomScale", scale=[0.9, 1.1]),
+    dict(type="RandomFlip", p=0.5),
+    dict(type="RandomJitter", sigma=0.005, clip=0.02),
+    dict(
+        type="GridSample",
+        grid_size=grid_size,
+        hash_type="fnv",
+        mode="train",
+        return_grid_coord=True,
+    ),
+    dict(type="SphereCrop", point_max=250000, mode="random"),
+]
+if mode in {"visual", "full"}:
+    train_transform.append(dict(type="CompactImagePatches"))
+
+val_transform = [
+    dict(type="ZPercentileCenterShift", percentile=2.0),
+    dict(type="RobustLogIntensity"),
+    dict(
+        type="GridSample",
+        grid_size=grid_size,
+        hash_type="fnv",
+        mode="train",
+        return_grid_coord=True,
+    ),
+    dict(type="SphereCrop", point_max=250000, mode="center"),
+]
+if mode in {"visual", "full"}:
+    val_transform.append(dict(type="CompactImagePatches"))
+
+# segment is retained only for the fixed semantic audit, never as model input.
+pretrain_keys = ["coord", "grid_coord", "segment"]
+if mode in {"visual", "full"}:
+    pretrain_keys.extend(
+        ("dino_feature", "image_patch_index", "image_valid", "dino_offset")
+    )
+if mode in {"return", "full"}:
+    pretrain_keys.append("return_role")
+
+pretrain_post_transform = [
+    dict(type="ToTensor"),
+    dict(
+        type="Collect",
+        keys=tuple(pretrain_keys),
+        feat_keys=feature_keys,
+    ),
+]
+
+if mode == "visual":
+    pretrain_dataset_type = "LasImageDataset"
+elif mode == "return":
+    pretrain_dataset_type = "RRCLLasDataset"
+else:
+    pretrain_dataset_type = "CVRLLasDataset"
+
+# -----------------------------------------------------------------------------
+# 6. Datasets
+# -----------------------------------------------------------------------------
+train_dataset = dict(
+    type=pretrain_dataset_type,
+    split="train",
+    data_root=data_root,
+    data_path=train_pointcloud_path,
+    class_weight="sqrt" if mode in {"return", "full"} else None,
+    weight_sample=0.2,
+    weighted_sampler=False,
+    test_mode=False,
+    loop=1,
+    transform=train_transform,
+    post_transform=pretrain_post_transform,
+)
+
+val_dataset = dict(
+    type=pretrain_dataset_type,
+    split="val",
+    data_root=data_root,
+    data_path=train_pointcloud_path,
+    class_weight=None,
+    weighted_sampler=False,
+    test_mode=False,
+    loop=1,
+    transform=val_transform,
+    post_transform=pretrain_post_transform,
+)
+
+if mode in {"visual", "full"}:
+    train_dataset["dino_feature_path"] = dino_feature_path
+    val_dataset["dino_feature_path"] = dino_feature_path
+
+data = dict(
+    num_classes=num_classes,
+    ignore_index=ignore_index,
+    names=class_names,
+    train=train_dataset,
+    val=val_dataset,
+    test=dict(
+        type="LasDataset",
+        split="test",
+        data_path=test_pointcloud_path,
+        test_mode=True,
+        ignore_index=ignore_index,
+        transform=[
+            dict(type="ZPercentileCenterShift", percentile=2.0),
+            dict(type="RobustLogIntensity"),
+            dict(
+                type="GridSample",
+                grid_size=grid_size,
+                hash_type="fnv",
+                mode="test",
+                return_grid_coord=True,
+                return_inverse=True,
+            ),
+        ],
+        post_transform=[
+            dict(type="ToTensor"),
+            dict(
+                type="Collect",
+                keys=("coord", "grid_coord", "index"),
+                feat_keys=feature_keys,
+            ),
+        ],
+    ),
+)

@@ -344,6 +344,376 @@ class SemSegEvaluator(HookBase):
 
 
 @HOOKS.register_module()
+class RRCLEvaluator(HookBase):
+    """Evaluate return-role classification and KNN context reconstruction."""
+
+    TASK_LABEL = "RRCL"
+
+    def __init__(self, log_interval=10):
+        self.log_interval = max(1, log_interval)
+
+    def before_train(self):
+        if self.trainer.writer is not None and self.trainer.cfg.enable_wandb:
+            wandb.define_metric("val/*", step_metric="Epoch")
+
+    def after_epoch(self):
+        if self.trainer.cfg.evaluate:
+            self.eval()
+
+    def eval(self):
+        self.trainer.logger.info(
+            f">>>>>>>>>>>>>>>> Start {self.TASK_LABEL} Evaluation >>>>>>>>>>>>>>>>"
+        )
+        self.trainer.model.eval()
+        auto_cast = _build_autocast(self.trainer.cfg)
+        intersection = None
+        union = None
+        target_count = None
+        abs_error = None
+        context_count = None
+        context_ce_sum = None
+        context_entropy_sum = None
+        confusion = None
+        loss_sum = None
+        loss_batch_count = None
+
+        for i, input_dict in enumerate(self.trainer.val_loader):
+            for key, value in input_dict.items():
+                if isinstance(value, torch.Tensor):
+                    input_dict[key] = value.cuda(non_blocking=True)
+            with torch.no_grad(), auto_cast():
+                output = self.trainer.model(input_dict)
+
+            role_target = input_dict["return_role"].reshape(-1)
+            role_pred = output["role_logits"].argmax(dim=1)
+            batch_intersection, batch_union, batch_target = (
+                intersection_and_union_gpu(
+                    role_pred,
+                    role_target,
+                    self.trainer.cfg.data.num_classes,
+                    self.trainer.cfg.data.ignore_index,
+                )
+            )
+            valid_role = (
+                (role_target != self.trainer.cfg.data.ignore_index)
+                & (role_target >= 0)
+                & (role_target < self.trainer.cfg.data.num_classes)
+            )
+            batch_confusion = torch.bincount(
+                role_target[valid_role].long() * self.trainer.cfg.data.num_classes
+                + role_pred[valid_role].long(),
+                minlength=(
+                    self.trainer.cfg.data.num_classes
+                    * self.trainer.cfg.data.num_classes
+                ),
+            ).reshape(
+                self.trainer.cfg.data.num_classes,
+                self.trainer.cfg.data.num_classes,
+            ).double()
+            batch_abs_error = torch.zeros(
+                self.trainer.cfg.data.num_classes,
+                dtype=torch.float64,
+                device=role_pred.device,
+            )
+            valid = output["context_valid"]
+            batch_context_ce = torch.zeros(
+                (), dtype=torch.float64, device=role_pred.device
+            )
+            batch_context_entropy = torch.zeros(
+                (), dtype=torch.float64, device=role_pred.device
+            )
+            if valid.any():
+                context_logits = output["context_logits"][valid].float()
+                context_target = output["context_target"][valid].float()
+                context_log_prob = context_logits.log_softmax(dim=-1)
+                context_prob = context_log_prob.exp()
+                batch_abs_error = (
+                    context_prob - context_target
+                ).abs().double().sum(dim=0)
+                batch_context_ce = -(
+                    context_target * context_log_prob
+                ).sum(dim=-1).double().sum()
+                target_log_prob = torch.where(
+                    context_target > 0,
+                    context_target.clamp_min(1e-12).log(),
+                    torch.zeros_like(context_target),
+                )
+                batch_context_entropy = -(
+                    context_target * target_log_prob
+                ).sum(dim=-1).double().sum()
+            batch_context_count = valid.sum().double()
+            batch_loss = output["loss"].detach().double()
+
+            if intersection is None:
+                intersection = batch_intersection.double()
+                union = batch_union.double()
+                target_count = batch_target.double()
+                abs_error = batch_abs_error
+                context_count = batch_context_count
+                context_ce_sum = batch_context_ce
+                context_entropy_sum = batch_context_entropy
+                confusion = batch_confusion
+                loss_sum = batch_loss
+                loss_batch_count = batch_loss.new_ones(())
+            else:
+                intersection += batch_intersection
+                union += batch_union
+                target_count += batch_target
+                abs_error += batch_abs_error
+                context_count += batch_context_count
+                context_ce_sum += batch_context_ce
+                context_entropy_sum += batch_context_entropy
+                confusion += batch_confusion
+                loss_sum += batch_loss
+                loss_batch_count += 1
+
+            self.trainer.storage.put_scalar("val_loss", output["loss"].item())
+            self.trainer.storage.put_scalar(
+                "val_loss_role", output["loss/role"].item()
+            )
+            self.trainer.storage.put_scalar(
+                "val_loss_ctx", output["loss/ctx"].item()
+            )
+            if "loss/vpsd" in output:
+                self.trainer.storage.put_scalar(
+                    "val_loss_vpsd", output["loss/vpsd"].item()
+                )
+            if (i + 1) % self.log_interval == 0 or (i + 1) == len(
+                self.trainer.val_loader
+            ):
+                losses = (
+                    f"Loss {output['loss'].item():.4f} "
+                    f"Role {output['loss/role'].item():.4f} "
+                    f"Context {output['loss/ctx'].item():.4f}"
+                )
+                if "loss/vpsd" in output:
+                    losses += f" VPSD {output['loss/vpsd'].item():.4f}"
+                self.trainer.logger.info(
+                    f"{self.TASK_LABEL} Val: [{i + 1}/"
+                    f"{len(self.trainer.val_loader)}] {losses}"
+                )
+
+        if intersection is None:
+            raise RuntimeError(
+                f"{self.TASK_LABEL} validation loader produced no batches"
+            )
+        if comm.get_world_size() > 1:
+            for statistic in (
+                intersection,
+                union,
+                target_count,
+                abs_error,
+                context_count,
+                context_ce_sum,
+                context_entropy_sum,
+                confusion,
+                loss_sum,
+                loss_batch_count,
+            ):
+                dist.all_reduce(statistic)
+
+        metrics = semantic_segmentation_metrics(
+            intersection.cpu().numpy(),
+            union.cpu().numpy(),
+            target_count.cpu().numpy(),
+        )
+        denom = max(context_count.item(), 1.0)
+        mae_class = abs_error.cpu().numpy() / denom
+        mae = float(mae_class.mean())
+        context_ce = float(context_ce_sum.item() / denom)
+        context_entropy = float(context_entropy_sum.item() / denom)
+        context_kl = max(0.0, context_ce - context_entropy)
+        loss_avg = float(loss_sum.item() / max(loss_batch_count.item(), 1.0))
+        self.last_loss_avg = loss_avg
+        role_names = self.trainer.cfg.data.names
+        self.trainer.logger.info(
+            "{} result: mIoU {:.4f}  mAcc {:.4f}  OA {:.4f}  "
+            "macro-F1 {:.4f}  Context MAE {:.6f}  H(target) {:.6f}  "
+            "KL {:.6f}".format(
+                self.TASK_LABEL,
+                metrics["mIoU"],
+                metrics["mAcc"],
+                metrics["allAcc"],
+                metrics["mF1"],
+                mae,
+                context_entropy,
+                context_kl,
+            )
+        )
+        max_name_len = max(len(name) for name in role_names)
+        for idx, name in enumerate(role_names):
+            self.trainer.logger.info(
+                "  Class {:2d} - {:<{width}} | IoU {:.4f}  Prec {:.4f}  "
+                "Recall {:.4f}  F1 {:.4f}  Context MAE {:.6f}".format(
+                    idx,
+                    name,
+                    metrics["iou_class"][idx],
+                    metrics["precision_class"][idx],
+                    metrics["recall_class"][idx],
+                    metrics["f1_class"][idx],
+                    mae_class[idx],
+                    width=max_name_len,
+                )
+            )
+
+        confusion_np = confusion.cpu().numpy()
+        confusion_normalized = confusion_np / np.maximum(
+            confusion_np.sum(axis=1, keepdims=True), 1.0
+        )
+        label_width = max(7, max_name_len + 3)
+        header = " " * label_width + " ".join(
+            f"{name:>8}" for name in role_names
+        )
+        self.trainer.logger.info(
+            "  Confusion matrix (rows=GT, cols=Pred, row-normalized):"
+        )
+        self.trainer.logger.info(header)
+        for idx, name in enumerate(role_names):
+            values = " ".join(
+                f"{value:8.4f}" for value in confusion_normalized[idx]
+            )
+            self.trainer.logger.info(f"  {name:<{label_width - 2}}{values}")
+
+        epoch = self.trainer.epoch + 1
+        scalar_metrics = {
+            "val/loss_total": loss_avg,
+            "val/loss_role": self.trainer.storage.history("val_loss_role").avg,
+            "val/loss_ctx": self.trainer.storage.history("val_loss_ctx").avg,
+            "val/role_OA": metrics["allAcc"],
+            "val/role_mIoU": metrics["mIoU"],
+            "val/role_mAcc": metrics["mAcc"],
+            "val/role_macro_F1": metrics["mF1"],
+            "val/context_MAE": mae,
+            "val/context_CE": context_ce,
+            "val/context_target_entropy": context_entropy,
+            "val/context_KL": context_kl,
+        }
+        if "loss/vpsd" in output:
+            scalar_metrics["val/loss_vpsd"] = self.trainer.storage.history(
+                "val_loss_vpsd"
+            ).avg
+        for idx, name in enumerate(role_names):
+            scalar_metrics[f"val/role_IoU_{name}"] = metrics["iou_class"][idx]
+            scalar_metrics[f"val/role_Prec_{name}"] = metrics[
+                "precision_class"
+            ][idx]
+            scalar_metrics[f"val/role_Recall_{name}"] = metrics[
+                "recall_class"
+            ][idx]
+            scalar_metrics[f"val/role_F1_{name}"] = metrics["f1_class"][idx]
+            scalar_metrics[f"val/context_MAE_{name}"] = mae_class[idx]
+        if self.trainer.writer is not None:
+            for key, value in scalar_metrics.items():
+                self.trainer.writer.add_scalar(key, value, epoch)
+            if self.trainer.cfg.enable_wandb:
+                wandb.log(
+                    {"Epoch": epoch, **scalar_metrics}, step=wandb.run.step
+                )
+
+        self.trainer.comm_info["current_metric_value"] = metrics["mF1"]
+        self.trainer.comm_info["current_metric_name"] = "role_macro_F1"
+        self.trainer.logger.info(
+            f"<<<<<<<<<<<<<<<< End {self.TASK_LABEL} Evaluation <<<<<<<<<<<<<<<<"
+        )
+
+    def after_train(self):
+        self.trainer.logger.info(
+            "Best role_macro_F1: {:.4f}".format(self.trainer.best_metric_value)
+        )
+
+
+@HOOKS.register_module()
+class CVRLEvaluator(RRCLEvaluator):
+    """Evaluate the active CVRL visual, return, or full pretraining mode."""
+
+    TASK_LABEL = "CVRL"
+
+    def _mode(self):
+        model = self.trainer.model
+        if hasattr(model, "module"):
+            model = model.module
+        return str(getattr(model, "mode", "full")).lower()
+
+    def eval(self):
+        if self._mode() != "visual":
+            super().eval()
+            loss_avg = self.last_loss_avg
+            self.trainer.comm_info["current_metric_value"] = loss_avg
+            self.trainer.comm_info["current_metric_name"] = "val_loss"
+            self.trainer.comm_info["current_metric_mode"] = "min"
+            self.trainer.logger.info(
+                "CVRL checkpoint metric: validation loss %.6f (lower is better)",
+                loss_avg,
+            )
+            return
+
+        self.trainer.logger.info(
+            ">>>>>>>>>>>>>>>> Start CVRL Visual Evaluation >>>>>>>>>>>>>>>>"
+        )
+        self.trainer.model.eval()
+        auto_cast = _build_autocast(self.trainer.cfg)
+        loss_sum = torch.zeros(1, dtype=torch.float64, device="cuda")
+        batch_count = torch.zeros(1, dtype=torch.float64, device="cuda")
+
+        for i, input_dict in enumerate(self.trainer.val_loader):
+            for key, value in input_dict.items():
+                if isinstance(value, torch.Tensor):
+                    input_dict[key] = value.cuda(non_blocking=True)
+            with torch.no_grad(), auto_cast():
+                output = self.trainer.model(input_dict)
+            loss_value = output["loss"].item()
+            loss_sum += loss_value
+            batch_count += 1
+            self.trainer.storage.put_scalar("val_loss", loss_value)
+            self.trainer.storage.put_scalar(
+                "val_loss_vpsd", output["loss/vpsd"].item()
+            )
+            if (i + 1) % self.log_interval == 0 or (i + 1) == len(
+                self.trainer.val_loader
+            ):
+                self.trainer.logger.info(
+                    f"CVRL Visual Val: [{i + 1}/"
+                    f"{len(self.trainer.val_loader)}] Loss {loss_value:.4f}"
+                )
+
+        if batch_count.item() == 0:
+            raise RuntimeError("CVRL visual validation loader produced no batches")
+        if comm.get_world_size() > 1:
+            dist.all_reduce(loss_sum)
+            dist.all_reduce(batch_count)
+        loss_avg = (loss_sum / batch_count).item()
+        self.trainer.logger.info(
+            f"CVRL Visual result: cosine loss {loss_avg:.6f}"
+        )
+        epoch = self.trainer.epoch + 1
+        if self.trainer.writer is not None:
+            self.trainer.writer.add_scalar("val/loss_total", loss_avg, epoch)
+            self.trainer.writer.add_scalar("val/loss_vpsd", loss_avg, epoch)
+            if self.trainer.cfg.enable_wandb:
+                wandb.log(
+                    {
+                        "Epoch": epoch,
+                        "val/loss_total": loss_avg,
+                        "val/loss_vpsd": loss_avg,
+                    },
+                    step=wandb.run.step,
+                )
+        self.trainer.comm_info["current_metric_value"] = loss_avg
+        self.trainer.comm_info["current_metric_name"] = "val_loss"
+        self.trainer.comm_info["current_metric_mode"] = "min"
+        self.trainer.logger.info(
+            "<<<<<<<<<<<<<<<< End CVRL Visual Evaluation <<<<<<<<<<<<<<<<"
+        )
+
+    def after_train(self):
+        self.trainer.logger.info(
+            "Best validation loss: {:.6f}".format(
+                self.trainer.best_metric_value
+            )
+        )
+
+
+@HOOKS.register_module()
 class RegressionEvaluator(HookBase):
     """Validation evaluator for per-point regression tasks.
 

@@ -160,7 +160,61 @@ class NormalizeColor16bit(object):
         if "color" in data_dict.keys():
             data_dict["color"] = data_dict["color"] / 65535
         return data_dict
-    
+
+
+@TRANSFORMS.register_module()
+class EnsureFeature(object):
+    """Create a constant per-point feature when a modality is unavailable.
+
+    ``overwrite=True`` is useful for formats such as LAS, where a standard
+    dimension can exist in the point format even when the source dataset does
+    not define a meaningful value for it.
+    """
+
+    def __init__(
+        self,
+        key,
+        channels=1,
+        value=0.0,
+        overwrite=False,
+        reference_key="coord",
+    ):
+        self.key = str(key)
+        self.channels = int(channels)
+        self.value = float(value)
+        self.overwrite = bool(overwrite)
+        self.reference_key = str(reference_key)
+        if self.channels <= 0:
+            raise ValueError("EnsureFeature channels must be positive")
+
+    def __call__(self, data_dict):
+        if self.key in data_dict and not self.overwrite:
+            return data_dict
+        if self.reference_key not in data_dict:
+            raise KeyError(
+                f"EnsureFeature reference key '{self.reference_key}' is missing"
+            )
+
+        reference = data_dict[self.reference_key]
+        shape = (reference.shape[0], self.channels)
+        if isinstance(reference, torch.Tensor):
+            data_dict[self.key] = torch.full(
+                shape,
+                self.value,
+                dtype=torch.float32,
+                device=reference.device,
+            )
+        elif isinstance(reference, np.ndarray):
+            data_dict[self.key] = np.full(
+                shape, self.value, dtype=np.float32
+            )
+        else:
+            raise TypeError(
+                "EnsureFeature reference must be a numpy array or torch tensor"
+            )
+        return data_dict
+
+
 @TRANSFORMS.register_module()
 class RobustLogIntensity(object):
     """
@@ -1259,16 +1313,44 @@ class GridSample(object):
 
     def __call__(self, data_dict):
         assert "coord" in data_dict.keys()
-        scaled_coord = data_dict["coord"] / np.array(self.grid_size)
-        grid_coord = np.floor(scaled_coord).astype(int)
+        coord = np.asarray(data_dict["coord"])
+        grid_size = np.asarray(self.grid_size, dtype=coord.dtype)
+        # LAS coordinates are float32.  Keep the division in that dtype and
+        # write floor() directly into the integer destination: the former
+        # implementation briefly held float32 floor output plus an int64
+        # [N, 3] array, which is expensive for multi-million-point tiles.
+        scaled_coord = np.divide(coord, grid_size)
+        finite_min = np.nanmin(scaled_coord)
+        finite_max = np.nanmax(scaled_coord)
+        int32_info = np.iinfo(np.int32)
+        grid_dtype = (
+            np.int32
+            if finite_min >= int32_info.min and finite_max <= int32_info.max
+            else np.int64
+        )
+        grid_coord = np.empty(scaled_coord.shape, dtype=grid_dtype)
+        np.floor(scaled_coord, out=grid_coord, casting="unsafe")
         min_coord = grid_coord.min(0)
         grid_coord -= min_coord
-        scaled_coord -= min_coord
-        min_coord = min_coord * np.array(self.grid_size)
+        if self.return_displacement:
+            scaled_coord -= min_coord
+        else:
+            # Release ~12 bytes/point before hashing and sorting.
+            del scaled_coord
+            scaled_coord = None
+        min_coord = min_coord * grid_size
         key = self.hash(grid_coord)
         idx_sort = np.argsort(key)
         key_sort = key[idx_sort]
-        _, inverse, count = np.unique(key_sort, return_inverse=True, return_counts=True)
+        del key
+        if self.return_inverse:
+            _, inverse, count = np.unique(
+                key_sort, return_inverse=True, return_counts=True
+            )
+        else:
+            _, count = np.unique(key_sort, return_counts=True)
+            inverse = None
+        del key_sort
         if self.mode == "train":  # train mode
             idx_select = (
                 np.cumsum(np.insert(count, 0, 0)[0:-1])
@@ -1371,15 +1453,15 @@ class GridSample(object):
         FNV64-1A
         """
         assert arr.ndim == 2
-        # Floor first for negative coordinates
-        arr = arr.copy()
-        arr = arr.astype(np.uint64, copy=False)
         hashed_arr = np.uint64(14695981039346656037) * np.ones(
             arr.shape[0], dtype=np.uint64
         )
         for j in range(arr.shape[1]):
             hashed_arr *= np.uint64(1099511628211)
-            hashed_arr = np.bitwise_xor(hashed_arr, arr[:, j])
+            # Convert one coordinate column at a time.  Converting the full
+            # [N, 3] matrix to uint64 created another 24 bytes/point peak.
+            column = arr[:, j].astype(np.uint64, copy=False)
+            np.bitwise_xor(hashed_arr, column, out=hashed_arr)
         return hashed_arr
     
 def partition_voxels_for_test(idx_sort, count, max_test_loops):
@@ -2111,9 +2193,16 @@ class SphereCrop(object):
                     center = np.mean(given_coord, axis=0)
             else:
                 raise NotImplementedError
-            idx_crop = np.argsort(np.sum(np.square(data_dict["coord"] - center), 1))[
-                :point_max
-            ]
+            coord = data_dict["coord"]
+            # Build one 1-D distance buffer instead of materializing two
+            # [N, 3] temporaries.  argpartition selects the same nearest-point
+            # set without sorting all N entries; only the retained subset is
+            # sorted to preserve the previous distance-ordered output.
+            distance = np.square(coord[:, 0] - center[0])
+            for axis in range(1, coord.shape[1]):
+                distance += np.square(coord[:, axis] - center[axis])
+            idx_crop = np.argpartition(distance, point_max - 1)[:point_max]
+            idx_crop = idx_crop[np.argsort(distance[idx_crop])]
             data_dict = index_operator(data_dict, idx_crop)
         return data_dict
 
