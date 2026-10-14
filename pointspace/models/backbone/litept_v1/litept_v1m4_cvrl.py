@@ -1,5 +1,7 @@
 """LitePT variant exposing a reusable hierarchy for VPSD and CVRL."""
 
+import spconv.pytorch as spconv
+
 from pointspace.models.builder import MODELS
 from pointspace.models.utils.structure import Point
 
@@ -46,6 +48,25 @@ class LitePTV1M4(LitePTM3):
 
     def __init__(self, *args, enc_mode=True, **kwargs):
         super().__init__(*args, enc_mode=enc_mode, **kwargs)
+        if self.freeze_encoder and not self.enc_mode:
+            self.separate_decoder_indice_keys()
+
+    def separate_decoder_indice_keys(self):
+        """Prevent a trainable decoder reusing forward-only encoder caches.
+
+        This is required both by constructor-time ``freeze_encoder`` and by
+        gradual downstream freezing.  It changes cache names only; parameters
+        and convolution results are unchanged.
+        """
+        if self.enc_mode:
+            return
+        for module in self.dec.modules():
+            if (
+                isinstance(module, spconv.SubMConv3d)
+                and module.indice_key
+                and not module.indice_key.startswith("decoder_")
+            ):
+                module.indice_key = "decoder_" + module.indice_key
 
     def train(self, mode=True):
         super().train(mode)

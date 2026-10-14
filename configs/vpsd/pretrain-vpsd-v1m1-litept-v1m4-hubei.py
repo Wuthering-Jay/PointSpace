@@ -5,6 +5,7 @@
 # 0. 数据路径与点输入特征
 # -------------------------------------------------------
 data_root = r"E:\data\湖北\joint_tiles"
+pca_model_path = rf"{data_root}\dino_feature_pca128\dino_pca_model.safetensors"
 pointcloud_path = r"E:\data\云南\data\tile"
 feature_output_dir = r"E:\data\云南\vpsd_feature\vpsd_v1m1_litept_v1m4"
 grid_size = 0.5  # 训练体素及测试 fragment 划分使用相同空间分辨率
@@ -83,9 +84,10 @@ test = dict(type="VPSDFeatureTester", verbose=True)
 # -------------------------------------------------------
 # 5. VPSD 测试特征导出
 # -------------------------------------------------------
-# projected：导出 concat 层级表示投影后的 DINO 对齐 1024 维特征；
+# visual/projected：默认导出固定 PCA 后的 128 维永久视觉表征；
+# visual_native：导出 PCA 前的 DINO 对齐 1024 维审计特征；
 # backbone：导出投影前的 concat 层级表示。
-feature_source = "projected"
+feature_source = "visual"
 feature_dtype = "float16"  # Safetensors 输出类型，仅支持 float16/float32
 normalize_feature = True  # fragment 合并后再次执行 L2 归一化
 feature_aggregate_on_gpu = False  # GPU index_add 更快，但会占用 N*C*4 字节
@@ -102,6 +104,11 @@ model = dict(
     level_channels=(36, 72, 144, 252, 504),
     # 保持 DINOv3 ViT-L 原生通道，不预先使用 PCA 压缩 teacher。
     teacher_channels=1024,
+    visual_channels=128,
+    pca_path=pca_model_path,
+    require_pca=True,
+    pca_output_normalize=True,
+    pca_output_scale=128**0.5,
     # 一个 token-patch edge 可能由多个点支持，sqrt_count 可抑制密度偏置。
     edge_weight="sqrt_count",
     # 每个 tile 先独立平均 patch loss，再在 batch 内对 tile 等权平均。

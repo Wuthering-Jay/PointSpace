@@ -26,6 +26,7 @@ class RRCL(nn.Module):
         criteria=None,
         knn_k=32,
         lambda_ctx=1.0,
+        objective="full",
         head_dropout=0.1,
         ignore_index=-1,
     ):
@@ -34,9 +35,18 @@ class RRCL(nn.Module):
         self.criteria = build_criteria(criteria)
         self.knn_k = int(knn_k)
         self.lambda_ctx = float(lambda_ctx)
+        if objective not in {"full", "role", "context"}:
+            raise ValueError("RRCL objective must be 'full', 'role', or 'context'")
+        self.objective = objective
         self.ignore_index = int(ignore_index)
-        self.role_head = self._build_head(backbone_out_channels, head_dropout)
-        self.context_head = self._build_head(backbone_out_channels, head_dropout)
+        self.role_head = (
+            self._build_head(backbone_out_channels, head_dropout)
+            if objective in {"full", "role"} else None
+        )
+        self.context_head = (
+            self._build_head(backbone_out_channels, head_dropout)
+            if objective in {"full", "context"} else None
+        )
 
     @staticmethod
     def _build_head(channels, dropout):
@@ -64,6 +74,15 @@ class RRCL(nn.Module):
         """Return decoder features in the current fragment's input order."""
         point = Point(input_dict)
         feat = self._unwind_point(self.backbone(point))
+        feature_point_mask = input_dict.get("feature_point_mask")
+        if feature_point_mask is not None:
+            feature_point_mask = feature_point_mask.reshape(-1).bool()
+            if feature_point_mask.numel() != feat.shape[0]:
+                raise ValueError(
+                    "feature_point_mask length does not match RRCL features: "
+                    f"{feature_point_mask.numel()} != {feat.shape[0]}"
+                )
+            feat = feat[feature_point_mask]
         if normalize:
             feat = F.normalize(feat.float(), dim=-1, eps=1e-12)
         return feat
@@ -88,49 +107,54 @@ class RRCL(nn.Module):
         if "return_role" not in input_dict:
             raise KeyError("RRCL requires the supervision key 'return_role'")
         role_target = input_dict["return_role"].reshape(-1).long()
-        # Build targets before the backbone so temporary [N, K] KNN indices
-        # are released before activation memory reaches its peak.
-        context_target, context_valid = build_knn_return_context(
-            coord=input_dict["coord"],
-            offset=input_dict["offset"],
-            return_role=role_target,
-            k=self.knn_k,
-            ignore_index=self.ignore_index,
-        )
+        # Only context/full need KNN; role-only must not pay for this target.
+        if self.context_head is not None:
+            # Build before the backbone so temporary [N, K] indices are freed
+            # before activation memory reaches its peak.
+            context_target, context_valid = build_knn_return_context(
+                coord=input_dict["coord"],
+                offset=input_dict["offset"],
+                return_role=role_target,
+                k=self.knn_k,
+                ignore_index=self.ignore_index,
+            )
         point = Point(input_dict)
         feat = self._unwind_point(self.backbone(point))
-        role_logits = self.role_head(feat)
-        context_logits = self.context_head(feat)
-        role_valid = role_target != self.ignore_index
-        if role_valid.any():
-            loss_role = self.criteria(role_logits, role_target)
-        else:
-            loss_role = role_logits.sum() * 0.0
-        # RRCL exposes task-level sub-losses below. Suppress the
-        # trainer's generic per-criterion ``cross_entropy`` duplicate, also
-        # clearing stale entries when a malformed batch has no valid roles.
+        output = {}
+        loss = feat.sum() * 0.0
+        if self.role_head is not None:
+            role_logits = self.role_head(feat)
+            role_valid = role_target != self.ignore_index
+            loss_role = (
+                self.criteria(role_logits, role_target)
+                if role_valid.any() else role_logits.sum() * 0.0
+            )
+            loss = loss + loss_role
+            output["loss/role"] = loss_role.detach()
+        # Suppress the trainer's generic cross_entropy duplicate and clear
+        # stale criterion logging when the role objective is inactive.
         self.criteria._last_individual_losses.clear()
-        if context_valid.any():
-            log_prob = F.log_softmax(
-                context_logits[context_valid].float(), dim=-1
-            )
-            loss_ctx = -(
-                context_target[context_valid] * log_prob
-            ).sum(dim=-1).mean()
-        else:
-            loss_ctx = context_logits.sum() * 0.0
-        loss = loss_role + self.lambda_ctx * loss_ctx
-
-        output = {
-            "loss": loss,
-            "loss/role": loss_role.detach(),
-            "loss/ctx": loss_ctx.detach(),
-        }
+        if self.context_head is not None:
+            context_logits = self.context_head(feat)
+            if context_valid.any():
+                log_prob = F.log_softmax(
+                    context_logits[context_valid].float(), dim=-1
+                )
+                loss_ctx = -(
+                    context_target[context_valid] * log_prob
+                ).sum(dim=-1).mean()
+            else:
+                loss_ctx = context_logits.sum() * 0.0
+            loss = loss + self.lambda_ctx * loss_ctx
+            output["loss/ctx"] = loss_ctx.detach()
+        output["loss"] = loss
         if not self.training:
-            output.update(
-                role_logits=role_logits,
-                context_logits=context_logits,
-                context_target=context_target,
-                context_valid=context_valid,
-            )
+            if self.role_head is not None:
+                output["role_logits"] = role_logits
+            if self.context_head is not None:
+                output.update(
+                    context_logits=context_logits,
+                    context_target=context_target,
+                    context_valid=context_valid,
+                )
         return output

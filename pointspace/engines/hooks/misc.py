@@ -445,20 +445,23 @@ class BackboneCheckpointExporter(HookBase):
     this compact companion checkpoint is intended for downstream fine-tuning.
     """
 
-    def __init__(self, filename="backbone_last.pth"):
+    def __init__(self, filename="backbone_last.pth", source_prefix="backbone."):
         self.filename = filename
+        self.source_prefix = source_prefix
 
     def after_train(self):
         if not is_main_process():
             return
         state_dict = self.trainer.model.state_dict()
-        backbone_state = OrderedDict(
-            (key, value.detach().cpu())
-            for key, value in state_dict.items()
-            if key.startswith("backbone.") or key.startswith("module.backbone.")
-        )
+        backbone_state = OrderedDict()
+        for key, value in state_dict.items():
+            unwrapped = key[7:] if key.startswith("module.") else key
+            if unwrapped.startswith(self.source_prefix):
+                backbone_state["backbone." + unwrapped[len(self.source_prefix):]] = value.detach().cpu()
         if not backbone_state:
-            raise RuntimeError("Model state_dict contains no backbone.* parameters")
+            raise RuntimeError(
+                f"Model state_dict contains no {self.source_prefix} parameters"
+            )
         filename = os.path.join(
             self.trainer.cfg.save_path, "model", self.filename
         )
@@ -493,6 +496,11 @@ class CheckpointLoader(HookBase):
         self.include_prefixes = tuple(include_prefixes or ())
 
     def _included(self, key):
+        # Fine-tuning configs often restrict an initial pretrained import to
+        # backbone.*. A training resume must instead restore every parameter,
+        # including the task head, from model_last.pth.
+        if getattr(self.trainer.cfg, "resume", False):
+            return True
         if not self.include_prefixes:
             return True
         unwrapped = key[7:] if key.startswith("module.") else key
@@ -562,12 +570,445 @@ class CheckpointLoader(HookBase):
             self.trainer.logger.info(message)
 
 
+class _BatchNormMoments:
+    """Accumulate exact, sample-weighted moments from selected BatchNorm inputs."""
+
+    def __init__(self, modules):
+        self.modules = dict(modules)
+        self.sums = {}
+        self.square_sums = {}
+        self.counts = {name: 0 for name in self.modules}
+        self.calls = {name: 0 for name in self.modules}
+        self.handles = [
+            module.register_forward_pre_hook(self._collect(name))
+            for name, module in self.modules.items()
+        ]
+
+    def _collect(self, name):
+        def hook(_module, inputs):
+            value = inputs[0].detach().float()
+            if value.ndim < 2:
+                raise ValueError(
+                    f"BatchNorm input {name!r} has invalid shape "
+                    f"{tuple(value.shape)}"
+                )
+            reduce_dims = tuple(i for i in range(value.ndim) if i != 1)
+            batch_sum = value.sum(dim=reduce_dims)
+            batch_square_sum = value.square().sum(dim=reduce_dims)
+            count = value.numel() // value.shape[1]
+            if name not in self.sums:
+                self.sums[name] = batch_sum
+                self.square_sums[name] = batch_square_sum
+            else:
+                self.sums[name].add_(batch_sum)
+                self.square_sums[name].add_(batch_square_sum)
+            self.counts[name] += int(count)
+            self.calls[name] += 1
+
+        return hook
+
+    def finalize(self):
+        total_values = 0
+        for name, module in self.modules.items():
+            count = self.counts[name]
+            if count < 2:
+                raise RuntimeError(
+                    f"Precise BN module {name!r} collected only {count} values"
+                )
+            mean = self.sums[name] / count
+            centered_sum = self.square_sums[name] - count * mean.square()
+            variance = (centered_sum / (count - 1)).clamp_min_(0.0)
+            module.running_mean.copy_(mean.to(module.running_mean.dtype))
+            module.running_var.copy_(variance.to(module.running_var.dtype))
+            module.num_batches_tracked.fill_(self.calls[name])
+            total_values += count
+        return total_values
+
+    def close(self):
+        for handle in self.handles:
+            handle.remove()
+
+
+@HOOKS.register_module()
+class PreciseBatchNormHook(HookBase):
+    """Re-estimate BN buffers on clean downstream training samples.
+
+    This hook is intentionally placed before the validation evaluator.  It
+    changes only running_mean/running_var/num_batches_tracked; parameters are
+    never updated.  ``scope='decoder'`` is useful for decoder probes whose
+    decoder starts from random initialization, while ``scope='all'`` is the
+    corresponding diagnostic for full fine-tuning.
+    """
+
+    def __init__(
+        self,
+        data,
+        scope="all",
+        num_batches=64,
+        batch_size=8,
+        num_workers=2,
+        seed=42,
+        interval=1,
+        enabled=True,
+    ):
+        if scope not in {"all", "decoder"}:
+            raise ValueError("PreciseBatchNormHook scope must be all or decoder")
+        self.data_cfg = data
+        self.scope = scope
+        self.num_batches = int(num_batches)
+        self.batch_size = int(batch_size)
+        self.num_workers = int(num_workers)
+        self.seed = int(seed)
+        self.interval = int(interval)
+        self.enabled = bool(enabled)
+        self.loader = None
+
+    def before_train(self):
+        if not self.enabled:
+            return
+        from pointspace.datasets import build_dataset, point_collate_fn
+
+        dataset = build_dataset(self.data_cfg)
+        requested = self.num_batches * self.batch_size
+        if requested < len(dataset):
+            generator = torch.Generator().manual_seed(self.seed)
+            indices = torch.randperm(len(dataset), generator=generator)[:requested]
+            dataset = torch.utils.data.Subset(dataset, indices.tolist())
+        self.loader = torch.utils.data.DataLoader(
+            dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            collate_fn=point_collate_fn,
+            pin_memory=True,
+            drop_last=False,
+            persistent_workers=self.num_workers > 0,
+            prefetch_factor=1 if self.num_workers > 0 else None,
+        )
+
+    def _selected_modules(self, model):
+        selected = {}
+        for name, module in model.named_modules():
+            if not isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
+                continue
+            if self.scope == "decoder" and not name.startswith("backbone.dec."):
+                continue
+            selected[name] = module
+        if not selected:
+            raise RuntimeError(
+                f"PreciseBatchNormHook found no BatchNorm modules for "
+                f"scope={self.scope!r}"
+            )
+        return selected
+
+    def after_epoch(self):
+        if (
+            not self.enabled
+            or not self.trainer.cfg.evaluate
+            or (self.trainer.epoch + 1) % self.interval != 0
+        ):
+            return
+        model = (
+            self.trainer.model.module
+            if hasattr(self.trainer.model, "module")
+            else self.trainer.model
+        )
+        selected = self._selected_modules(model)
+        was_training = model.training
+        model.eval()
+        for module in selected.values():
+            module.train()
+            module.reset_running_stats()
+
+        moments = _BatchNormMoments(selected.items())
+        batch_count = 0
+        point_count = 0
+        amp_dtype = {
+            "float16": torch.float16,
+            "bfloat16": torch.bfloat16,
+        }.get(str(self.trainer.cfg.amp_dtype), torch.float32)
+        try:
+            for batch_count, input_dict in enumerate(self.loader, start=1):
+                if batch_count > self.num_batches:
+                    batch_count -= 1
+                    break
+                for key, value in list(input_dict.items()):
+                    if isinstance(value, torch.Tensor):
+                        input_dict[key] = value.cuda(non_blocking=True)
+                # The segmentor must take its inference path: this pass is
+                # solely for activation statistics and computes no criterion.
+                input_dict.pop("segment", None)
+                input_dict.pop("origin_segment", None)
+                point_count += int(input_dict["coord"].shape[0])
+                with torch.inference_mode(), torch.amp.autocast(
+                    "cuda",
+                    enabled=bool(self.trainer.cfg.enable_amp),
+                    dtype=amp_dtype,
+                ):
+                    model(input_dict)
+            activation_count = moments.finalize()
+        finally:
+            moments.close()
+            model.train(was_training)
+
+        self.trainer.logger.info(
+            "Precise BN: scope=%s modules=%d batches=%d points=%s "
+            "activation_values=%s",
+            self.scope,
+            len(selected),
+            batch_count,
+            f"{point_count:,}",
+            f"{activation_count:,}",
+        )
+
+
+@HOOKS.register_module()
+class GradualUnfreezeHook(HookBase):
+    """Warm up newly initialized task modules before unfreezing an encoder.
+
+    Parameters remain present in the optimizer throughout training; this hook
+    only toggles ``requires_grad`` and module train/eval state.  Consequently,
+    unfreezing does not rebuild the optimizer or discard its state.
+    """
+
+    def __init__(self, module_prefixes, frozen_epochs=1, enabled=True):
+        if isinstance(module_prefixes, str):
+            module_prefixes = (module_prefixes,)
+        self.module_prefixes = tuple(module_prefixes)
+        self.frozen_epochs = int(frozen_epochs)
+        self.enabled = bool(enabled)
+        if not self.module_prefixes:
+            raise ValueError("GradualUnfreezeHook requires module_prefixes")
+        if self.frozen_epochs < 0:
+            raise ValueError("frozen_epochs must be non-negative")
+        self._frozen = None
+
+    def _model(self):
+        return (
+            self.trainer.model.module
+            if hasattr(self.trainer.model, "module")
+            else self.trainer.model
+        )
+
+    def _matches(self, name):
+        return any(
+            name == prefix or name.startswith(prefix + ".")
+            for prefix in self.module_prefixes
+        )
+
+    def _set_frozen(self, frozen):
+        model = self._model()
+        if frozen:
+            backbone = getattr(model, "backbone", None)
+            separate_keys = getattr(
+                backbone, "separate_decoder_indice_keys", None
+            )
+            if callable(separate_keys):
+                separate_keys()
+        parameters = [
+            parameter
+            for name, parameter in model.named_parameters()
+            if self._matches(name)
+        ]
+        modules = [
+            module
+            for name, module in model.named_modules()
+            if self._matches(name)
+        ]
+        if not parameters or not modules:
+            raise RuntimeError(
+                "GradualUnfreezeHook matched no modules/parameters for "
+                f"prefixes={self.module_prefixes}"
+            )
+        for parameter in parameters:
+            parameter.requires_grad_(not frozen)
+            if frozen:
+                parameter.grad = None
+        for module in modules:
+            module.eval() if frozen else module.train()
+        if frozen != self._frozen:
+            action = "frozen" if frozen else "unfrozen"
+            self.trainer.logger.info(
+                "Gradual unfreeze: %s %d parameters under %s at epoch %d",
+                action,
+                sum(parameter.numel() for parameter in parameters),
+                self.module_prefixes,
+                self.trainer.epoch + 1,
+            )
+        self._frozen = frozen
+
+    def before_train(self):
+        if self.enabled:
+            self._set_frozen(self.trainer.start_epoch < self.frozen_epochs)
+
+    def before_epoch(self):
+        if self.enabled:
+            # Trainer.model.train() runs immediately before this hook, so the
+            # eval state must be re-applied during the frozen warm-up epoch.
+            self._set_frozen(self.trainer.epoch < self.frozen_epochs)
+
+
+@HOOKS.register_module()
+class FreezeBatchNormStatsHook(HookBase):
+    """Keep selected BatchNorm layers in evaluation mode during training.
+
+    Running statistics are frozen while affine parameters remain trainable by
+    default, separating BN-statistic drift from ordinary encoder adaptation.
+    """
+
+    def __init__(self, module_prefixes, freeze_affine=False, enabled=True):
+        if isinstance(module_prefixes, str):
+            module_prefixes = (module_prefixes,)
+        self.module_prefixes = tuple(module_prefixes)
+        self.freeze_affine = bool(freeze_affine)
+        self.enabled = bool(enabled)
+        if not self.module_prefixes:
+            raise ValueError("FreezeBatchNormStatsHook requires module_prefixes")
+        self._selected = None
+
+    def _model(self):
+        return (
+            self.trainer.model.module
+            if hasattr(self.trainer.model, "module")
+            else self.trainer.model
+        )
+
+    def _matches(self, name):
+        return any(
+            name == prefix or name.startswith(prefix + ".")
+            for prefix in self.module_prefixes
+        )
+
+    def _select(self):
+        self._selected = [
+            (name, module)
+            for name, module in self._model().named_modules()
+            if self._matches(name)
+            and isinstance(module, torch.nn.modules.batchnorm._BatchNorm)
+        ]
+        if not self._selected:
+            raise RuntimeError(
+                "FreezeBatchNormStatsHook matched no BatchNorm modules for "
+                f"prefixes={self.module_prefixes}"
+            )
+
+    def _apply(self):
+        if self._selected is None:
+            self._select()
+        for _, module in self._selected:
+            module.eval()
+            if self.freeze_affine and module.affine:
+                module.weight.requires_grad_(False)
+                module.bias.requires_grad_(False)
+
+    def before_train(self):
+        if not self.enabled:
+            return
+        self._apply()
+        self.trainer.logger.info(
+            "Frozen BatchNorm statistics: modules=%d prefixes=%s "
+            "freeze_affine=%s",
+            len(self._selected),
+            self.module_prefixes,
+            self.freeze_affine,
+        )
+
+    def before_epoch(self):
+        if self.enabled:
+            # Trainer.model.train() resets all descendants before this hook.
+            self._apply()
+
+
+@HOOKS.register_module()
+class FreezeStochasticModulesHook(HookBase):
+    """Disable Dropout/DropPath noise in selected trainable modules.
+
+    Only the stochastic submodules are kept in evaluation mode.  Their parent
+    encoder remains in training mode and all encoder parameters remain
+    trainable, so this isolates train/eval feature noise from weight updates
+    and BatchNorm adaptation.
+    """
+
+    def __init__(self, module_prefixes, enabled=True):
+        if isinstance(module_prefixes, str):
+            module_prefixes = (module_prefixes,)
+        self.module_prefixes = tuple(module_prefixes)
+        self.enabled = bool(enabled)
+        if not self.module_prefixes:
+            raise ValueError("FreezeStochasticModulesHook requires module_prefixes")
+        self._selected = None
+
+    def _model(self):
+        return (
+            self.trainer.model.module
+            if hasattr(self.trainer.model, "module")
+            else self.trainer.model
+        )
+
+    def _matches(self, name):
+        return any(
+            name == prefix or name.startswith(prefix + ".")
+            for prefix in self.module_prefixes
+        )
+
+    @staticmethod
+    def _is_stochastic(module):
+        return isinstance(module, torch.nn.modules.dropout._DropoutNd) or (
+            module.__class__.__name__ == "DropPath"
+        )
+
+    def _select(self):
+        self._selected = [
+            (name, module)
+            for name, module in self._model().named_modules()
+            if self._matches(name) and self._is_stochastic(module)
+        ]
+        if not self._selected:
+            raise RuntimeError(
+                "FreezeStochasticModulesHook matched no Dropout/DropPath "
+                f"modules for prefixes={self.module_prefixes}"
+            )
+
+    def _apply(self):
+        if self._selected is None:
+            self._select()
+        for _, module in self._selected:
+            module.eval()
+
+    def before_train(self):
+        if not self.enabled:
+            return
+        self._apply()
+        drop_path_count = sum(
+            module.__class__.__name__ == "DropPath"
+            for _, module in self._selected
+        )
+        self.trainer.logger.info(
+            "Disabled encoder stochastic modules: total=%d DropPath=%d "
+            "prefixes=%s",
+            len(self._selected),
+            drop_path_count,
+            self.module_prefixes,
+        )
+
+    def before_epoch(self):
+        if self.enabled:
+            # Trainer.model.train() resets all descendants before this hook.
+            self._apply()
+
+
 @HOOKS.register_module()
 class PreciseEvaluator(HookBase):
-    def __init__(self, test_last=False):
+    def __init__(self, test_last=False, enabled=True):
         self.test_last = test_last
+        self.enabled = enabled
 
     def after_train(self):
+        if not self.enabled or not getattr(
+            self.trainer.cfg, "precise_evaluate", True
+        ):
+            return
+
         from pointspace.engines.test import TESTERS
 
         self.trainer.logger.info(

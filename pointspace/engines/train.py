@@ -59,6 +59,8 @@ class TrainerBase:
         self.max_epoch = 0
         self.max_iter = 0
         self.comm_info = dict()
+        self.stop_training_requested = False
+        self.stop_training_reason = None
         self.data_iterator: Iterator = enumerate([])
         self.storage: EventStorage
         self.writer: SummaryWriter
@@ -73,6 +75,11 @@ class TrainerBase:
             # See http://engineering.hearsaysocial.com/2013/06/16/circular-references-in-python/
             h.trainer = weakref.proxy(self)
         self.hooks.extend(hooks)
+
+    def request_stop(self, reason="requested by hook") -> None:
+        """Request a clean stop after the current epoch finishes its hooks."""
+        self.stop_training_requested = True
+        self.stop_training_reason = str(reason)
 
     def train(self):
         with EventStorage() as self.storage:
@@ -94,6 +101,8 @@ class TrainerBase:
                     self.after_step()
                 # => after epoch
                 self.after_epoch()
+                if self.stop_training_requested:
+                    break
             # => after train
             self.after_train()
 
@@ -164,12 +173,25 @@ class Trainer(TrainerBase):
         self.logger.info("=> Building hooks ...")
         self.register_hooks(self.cfg.hooks)
         self._gradient_accumulation_counter = 0
+        self.max_train_steps = getattr(cfg, "max_train_steps", None)
+        if self.max_train_steps is not None:
+            self.max_train_steps = int(self.max_train_steps)
+            if self.max_train_steps <= 0:
+                raise ValueError("max_train_steps must be positive when provided")
+            if self.max_train_steps % self.cfg.gradient_accumulation_steps != 0:
+                raise ValueError(
+                    "max_train_steps must be divisible by "
+                    "gradient_accumulation_steps so a diagnostic run does not "
+                    "finish with unapplied gradients"
+                )
+        self._train_steps_completed = 0
 
     def train(self):
         with EventStorage() as self.storage, ExceptionWriter():
             # => before train
             self.before_train()
             self.logger.info(">>>>>>>>>>>>>>>> Start Training >>>>>>>>>>>>>>>>")
+            stop_training = False
             for self.epoch in range(self.start_epoch, self.max_epoch):
                 # => before epoch
                 if comm.get_world_size() > 1:
@@ -188,8 +210,31 @@ class Trainer(TrainerBase):
                     self.run_step()
                     # => after_step
                     self.after_step()
+                    self._train_steps_completed += 1
+                    if (
+                        self.max_train_steps is not None
+                        and self._train_steps_completed >= self.max_train_steps
+                    ):
+                        self.logger.info(
+                            "Reached diagnostic max_train_steps=%d after %d "
+                            "optimizer updates; stopping cleanly.",
+                            self.max_train_steps,
+                            self._train_steps_completed
+                            // self.cfg.gradient_accumulation_steps,
+                        )
+                        stop_training = True
+                        break
                 # => after epoch
                 self.after_epoch()
+                if self.stop_training_requested:
+                    stop_training = True
+                    self.logger.info(
+                        "Training stop requested after epoch %d: %s",
+                        self.epoch + 1,
+                        self.stop_training_reason,
+                    )
+                if stop_training:
+                    break
             # => after train
             self.after_train()
 
@@ -657,6 +702,7 @@ class CVRLPCGradTrainer(Trainer):
         self._pcgrad_metric_count = 0
 
     def run_step(self):
+        self._optimizer_step_succeeded = False
         if version.parse(torch.__version__) >= version.parse("2.4"):
             auto_cast = partial(torch.amp.autocast, device_type="cuda")
         else:
@@ -751,6 +797,7 @@ class CVRLPCGradTrainer(Trainer):
                 self.scaler.update()
                 if scale <= self.scaler.get_scale():
                     self.scheduler.step()
+                    self._optimizer_step_succeeded = True
             else:
                 if self.cfg.clip_grad is not None:
                     torch.nn.utils.clip_grad_norm_(
@@ -758,6 +805,7 @@ class CVRLPCGradTrainer(Trainer):
                     )
                 self.optimizer.step()
                 self.scheduler.step()
+                self._optimizer_step_succeeded = True
             self._gradient_accumulation_counter = 0
             self._pcgrad_window_active = False
             self._pcgrad_visual_accum = None

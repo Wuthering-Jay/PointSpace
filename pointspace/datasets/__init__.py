@@ -21,7 +21,8 @@ from .aeo import AEODataset
 from .semantic_kitti import SemanticKITTIDataset
 from .nuscenes import NuScenesDataset
 from .waymo import WaymoDataset
-from .las import LasDataset, LasImageDataset, RRCLLasDataset, CVRLLasDataset
+from .las import LasDataset, LasImageDataset, RRCLLasDataset, CVRLLasDataset, MSCLasPairDataset, SonataLasPairDataset, ConcertoLasPairDataset
+from .sparse_las import SparseLabelLasDataset
 
 # object
 from .modelnet import ModelNetDataset

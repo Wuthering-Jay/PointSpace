@@ -10,6 +10,7 @@ from torch.utils.checkpoint import checkpoint
 from pointspace.models.builder import MODELS
 
 from .hierarchy import build_encoder_hierarchy
+from .projection import FixedPCAReduction
 from .common import (
     VisibilityAwarePatchSetDistillerBase,
     TokenPatchEdges,
@@ -273,12 +274,18 @@ class VisibilityAwarePatchSetDistiller(VisibilityAwarePatchSetDistillerBase):
         aggregate_channel_chunk_size=64,
         projector_patch_chunk_size=8192,
         normalize_dtype="amp",
+        visual_channels=128,
+        pca_path=None,
+        require_pca=True,
+        pca_output_normalize=True,
+        pca_output_scale=None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self.aggregate_channel_chunk_size = int(aggregate_channel_chunk_size)
         self.projector_patch_chunk_size = int(projector_patch_chunk_size)
         self.normalize_dtype = str(normalize_dtype).lower()
+        self.visual_channels = int(visual_channels)
         if self.aggregate_channel_chunk_size <= 0:
             raise ValueError("aggregate_channel_chunk_size must be positive")
         if self.projector_patch_chunk_size <= 0:
@@ -287,6 +294,14 @@ class VisibilityAwarePatchSetDistiller(VisibilityAwarePatchSetDistillerBase):
             raise ValueError(
                 "normalize_dtype must be amp, float32, bfloat16, or float16"
             )
+        self.visual_projection = FixedPCAReduction(
+            input_channels=self.teacher_channels,
+            output_channels=self.visual_channels,
+            pca_path=pca_path,
+            require_pca=require_pca,
+            output_normalize=pca_output_normalize,
+            output_scale=pca_output_scale,
+        )
 
     def _encode_compact(self, input_dict):
         point = self.backbone(input_dict)
@@ -384,18 +399,33 @@ class VisibilityAwarePatchSetDistiller(VisibilityAwarePatchSetDistillerBase):
     def extract_point_feature(
         self,
         input_dict,
-        feature_source="projected",
+        feature_source="visual",
         normalize=True,
     ):
         compact, level_features = self._encode_compact(input_dict)
         target_feature = self._fused_target_feature(compact, level_features)
-        if feature_source == "projected":
+        if feature_source in {"visual", "projected"}:
+            native_feature = self.student_projector(target_feature)
+            token_feature = self.visual_projection(native_feature)
+        elif feature_source == "visual_native":
             token_feature = self.student_projector(target_feature)
         elif feature_source == "backbone":
             token_feature = target_feature
         else:
-            raise ValueError("feature_source must be 'projected' or 'backbone'")
-        point_feature = token_feature[compact.input_to_target]
+            raise ValueError(
+                "feature_source must be visual/projected, visual_native, or backbone"
+            )
+        input_to_target = compact.input_to_target
+        feature_point_mask = input_dict.get("feature_point_mask")
+        if feature_point_mask is not None:
+            if (
+                feature_point_mask.ndim != 1
+                or feature_point_mask.shape[0] != input_to_target.shape[0]
+                or feature_point_mask.dtype != torch.bool
+            ):
+                raise ValueError("feature_point_mask must be a point-aligned bool tensor")
+            input_to_target = input_to_target[feature_point_mask]
+        point_feature = token_feature[input_to_target]
         if normalize:
             dtype = self._resolve_normalize_dtype(point_feature)
             point_feature = F.normalize(
@@ -461,3 +491,74 @@ class VisibilityAwarePatchSetDistiller(VisibilityAwarePatchSetDistillerBase):
                 compact.point, expected_levels=len(self.level_channels)
             )
         return result
+
+
+@MODELS.register_module("VPSD-v1m1-backbone")
+class VisibilityAwarePatchSetBackbone(VisibilityAwarePatchSetDistiller):
+    """Downstream backbone exposing VPSD's compact point representation.
+
+    The pretraining module normally enters its DINO distillation path when
+    called directly.  Downstream semantic segmentation has no image teacher,
+    so this adapter makes the retained 128-D visual representation the normal
+    ``forward`` output while preserving all pretrained parameter names below
+    the adapter.  It is intentionally used for strict VPSD linear probing;
+    decoder probing and full fine-tuning transfer the VPSD encoder into the
+    native LitePT encoder-decoder instead.
+    """
+
+    def __init__(self, *args, feature_source="visual", normalize=False, **kwargs):
+        super().__init__(*args, **kwargs)
+        if feature_source not in {"visual", "projected", "visual_native", "backbone"}:
+            raise ValueError("Unsupported VPSD downstream feature_source")
+        self.feature_source = feature_source
+        self.normalize = bool(normalize)
+        self.out_channels = {
+            "visual": self.visual_channels,
+            "projected": self.visual_channels,
+            "visual_native": self.teacher_channels,
+            "backbone": self.projector_in_channels,
+        }[feature_source]
+
+    def _encode_compact(self, input_dict):
+        """Use the encoder hierarchy while retaining a configured decoder.
+
+        Downstream configs intentionally instantiate the same complete LitePT
+        encoder-decoder for every method.  VPSD's visual feature is defined on
+        P2/P3/P4, however, so strict linear probing must not route it through
+        the randomly initialized downstream decoder.
+        """
+        deepest, _ = self.backbone.encode(input_dict)
+        compact = build_compact_hierarchy(
+            deepest,
+            target_level=self.distill_level,
+            expected_levels=len(self.level_channels),
+            validate_mapping=self.validate_mapping,
+        )
+        selected_points = compact.points[self.distill_level :]
+        expected_channels = (
+            self.level_channels[self.distill_level :]
+            if self.fuse_deeper_features
+            else self.level_channels[self.distill_level : self.distill_level + 1]
+        )
+        if not self.fuse_deeper_features:
+            selected_points = selected_points[:1]
+            compact = CompactHierarchy(
+                point=compact.point,
+                points=compact.points,
+                input_to_target=compact.input_to_target,
+                target_to_levels=(None,),
+            )
+        for point_level, channels in zip(selected_points, expected_channels):
+            if point_level.feat.ndim != 2 or point_level.feat.shape[1] != channels:
+                raise ValueError(
+                    f"Encoder feature shape {tuple(point_level.feat.shape)} "
+                    f"does not match configured channels {channels}"
+                )
+        return compact, tuple(point_level.feat for point_level in selected_points)
+
+    def forward(self, input_dict):
+        return self.extract_point_feature(
+            input_dict,
+            feature_source=self.feature_source,
+            normalize=self.normalize,
+        )

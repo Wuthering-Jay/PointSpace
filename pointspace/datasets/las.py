@@ -58,6 +58,8 @@ class LasDataset(DefaultDataset):
         "echo",  # Combined first/last return info (2D: is_first, is_last)
         "return_role",  # RRCL target: single/first/middle/last -> 0/1/2/3
         "normal",  # Normal vectors (normal_x, normal_y, normal_z extra dims)
+        "local_shape",  # Six offline XYZ-derived geometry descriptors
+        "geom_valid",  # Offline geometry target reliability mask
         "superpoint",  # Superpoint segment ID
         "segment",
         "instance",
@@ -246,6 +248,19 @@ class LasDataset(DefaultDataset):
                 normal[:, 1] = ny
                 normal[:, 2] = nz
                 data_dict["normal"] = normal
+
+        shape_dimensions = (
+            "geom_linearity", "geom_planarity", "geom_scattering",
+            "geom_curvature", "geom_anisotropy", "geom_verticality",
+        )
+        if set(shape_dimensions).issubset(dim_names):
+            data_dict["local_shape"] = np.column_stack(
+                [self._read_extra_dimension(las, name) for name in shape_dimensions]
+            ).astype(np.float32, copy=False)
+        if "geom_valid" in dim_names:
+            data_dict["geom_valid"] = self._read_extra_dimension(
+                las, "geom_valid", dtype=np.uint8
+            ).astype(bool, copy=False)
 
         if "superpoint" in dim_names:
             superpoint = self._read_extra_dimension(las, "superpoint", dtype=np.int64)
@@ -690,6 +705,7 @@ class LasDataset(DefaultDataset):
                 data_list = sorted(
                     f for f in _glob.glob(os.path.join(path, "*"))
                     if os.path.splitext(f)[1].lower() in {".las", ".laz"}
+                    and not os.path.basename(f).startswith(".")
                 )
                 logger.info(
                     f"LasDataset: found {len(data_list)} LAS/LAZ files "
@@ -711,6 +727,7 @@ class LasDataset(DefaultDataset):
             data_list = [
                 f for f in data_list
                 if os.path.splitext(f)[1].lower() in valid_extensions
+                and not os.path.basename(f).startswith(".")
             ]
             if len(data_list) < original_count:
                 filtered = original_count - len(data_list)
@@ -1062,30 +1079,38 @@ class LasImageDataset(LasDataset):
     def _index_assets(path, suffix, description):
         path = Path(path)
         if path.is_file():
-            files = [path]
+            if path.suffix.lower() != suffix:
+                raise ValueError(f"Expected {suffix} {description}: {path}")
+            files = [(path.stem, str(path))]
         elif path.is_dir():
+            # ``Path.iterdir`` followed by ``is_file`` is exceptionally slow
+            # for large asset folders on Windows because it performs a Python
+            # Path allocation and may issue an extra metadata query per entry.
+            # scandir reuses the directory enumeration metadata and reduces
+            # 10k+ DINO/mapping index construction from roughly a minute to
+            # seconds without changing the stem-pairing semantics.
             files = sorted(
-                file
-                for file in path.iterdir()
-                if file.is_file() and file.suffix.lower() == suffix
+                (
+                    os.path.splitext(entry.name)[0], entry.path
+                )
+                for entry in os.scandir(path)
+                if entry.is_file()
+                and os.path.splitext(entry.name)[1].lower() == suffix
             )
         else:
             raise FileNotFoundError(f"{description} path does not exist: {path}")
 
-        wrong_suffix = [file for file in files if file.suffix.lower() != suffix]
-        if wrong_suffix:
-            raise ValueError(f"Expected {suffix} {description}: {wrong_suffix[0]}")
         if not files:
             raise FileNotFoundError(f"No {suffix} {description} files found: {path}")
 
         result = {}
-        for file in files:
-            if file.stem in result:
+        for stem, file_path in files:
+            if stem in result:
                 raise ValueError(
-                    f"Duplicate {description} stem {file.stem!r}: "
-                    f"{result[file.stem]} and {file}"
+                    f"Duplicate {description} stem {stem!r}: "
+                    f"{result[stem]} and {file_path}"
                 )
-            result[file.stem] = str(file)
+            result[stem] = file_path
         return result
 
     def get_data_list(self):
@@ -1339,4 +1364,136 @@ class CVRLLasDataset(LasImageDataset, RRCLLasDataset):
             point_keys.append("return_role")
         data_dict["index_valid_keys"] = point_keys
         return data_dict
+
+
+@DATASETS.register_module()
+class MSCLasPairDataset(LasDataset):
+    """Two independently augmented views of one unlabeled Swiss LAS tile.
+
+    `origin_coord` remains in the common pre-augmentation frame so MSC can
+    match points after independent sampling. LAS labels and return metadata
+    are removed before either view is transformed.
+    """
+
+    def __init__(
+        self, view1_transform, view2_transform, base_transform=None, **kwargs
+    ):
+        if kwargs.get("test_mode", False):
+            raise ValueError("MSCLasPairDataset is training-only")
+        if kwargs.get("class_weight") is not None or kwargs.get("weighted_sampler", False):
+            raise ValueError("MSC views must not use LAS semantic class weights")
+        super().__init__(transform=None, post_transform=None, **kwargs)
+        self.base_transform = Compose(base_transform)
+        self.view1_transform = Compose(view1_transform)
+        self.view2_transform = Compose(view2_transform)
+
+    def prepare_train_data(self, idx):
+        source = self.get_data(idx)
+        point_keys = [key for key in ("coord", "intensity") if key in source]
+        source = {key: source[key] for key in point_keys}
+        source["index_valid_keys"] = point_keys
+        source = self.base_transform(source)
+        view1 = self.view1_transform(deepcopy(source))
+        view2 = self.view2_transform(deepcopy(source))
+        required = {"origin_coord", "coord", "grid_coord", "feat", "offset"}
+        for number, view in ((1, view1), (2, view2)):
+            missing = required.difference(view)
+            if missing:
+                raise ValueError(f"MSC view {number} is missing {sorted(missing)}")
+        return {
+            **{"view1_" + key: value for key, value in view1.items()},
+            **{"view2_" + key: value for key, value in view2.items()},
+        }
+
+
+@DATASETS.register_module()
+class SonataLasPairDataset(MSCLasPairDataset):
+    """Two global and optionally four local views in one common XYZ frame."""
+
+    def __init__(self, local_transform=None, num_local_views=0, **kwargs):
+        super().__init__(**kwargs)
+        self.local_transform = Compose(local_transform) if local_transform else None
+        self.num_local_views = int(num_local_views)
+        if self.num_local_views and self.local_transform is None:
+            raise ValueError("local_transform is required for local Sonata views")
+
+    def prepare_train_data(self, idx):
+        source = self.get_data(idx)
+        source = {key: source[key] for key in ("coord", "intensity") if key in source}
+        source["index_valid_keys"] = list(source)
+        source = self.base_transform(source)
+        views = [self.view1_transform(deepcopy(source)),
+                 self.view2_transform(deepcopy(source))]
+        result = {}
+        for number, view in enumerate(views, 1):
+            if {"origin_coord", "coord", "grid_coord", "feat", "offset"}.difference(view):
+                raise ValueError(f"Sonata global view {number} is incomplete")
+            result.update({f"view{number}_{key}": value for key, value in view.items()})
+        for number in range(self.num_local_views):
+            view = self.local_transform(deepcopy(source))
+            if {"origin_coord", "coord", "grid_coord", "feat", "offset"}.difference(view):
+                raise ValueError(f"Sonata local view {number + 1} is incomplete")
+            result.update({f"local{number + 1}_{key}": value for key, value in view.items()})
+        return result
+
+
+@DATASETS.register_module()
+class ConcertoLasPairDataset(LasImageDataset):
+    """Two ALS views; only the first carries offline patch supervision.
+
+    DINO features are not copied into the second view and never appear among
+    ``feat_keys``. Semantic and return metadata are discarded before cropping.
+    """
+
+    def __init__(self, view1_transform, view2_transform,
+                 base_transform=None, local_transform=None,
+                 num_local_views=0, **kwargs):
+        if kwargs.get("test_mode", False):
+            raise ValueError("ConcertoLasPairDataset is training-only")
+        if kwargs.get("class_weight") is not None or kwargs.get("weighted_sampler", False):
+            raise ValueError("Concerto views must not use LAS semantic weights")
+        super().__init__(transform=None, post_transform=None, **kwargs)
+        self.base_transform = Compose(base_transform)
+        self.view1_transform = Compose(view1_transform)
+        self.view2_transform = Compose(view2_transform)
+        self.local_transform = Compose(local_transform) if local_transform else None
+        self.num_local_views = int(num_local_views)
+        if self.num_local_views and self.local_transform is None:
+            raise ValueError("local_transform is required for local Concerto views")
+
+    def prepare_train_data(self, idx):
+        raw = self.get_data(idx)
+        required = ("coord", "intensity", "dino_feature",
+                    "image_patch_index", "image_valid")
+        missing = set(required).difference(raw)
+        if missing:
+            raise KeyError(f"Concerto LAS sample lacks {sorted(missing)}")
+        source = {key: raw[key] for key in required}
+        source["index_valid_keys"] = [
+            "coord", "intensity", "image_patch_index", "image_valid"
+        ]
+        source = self.base_transform(source)
+        first = self.view1_transform(deepcopy(source))
+        second_source = {key: source[key] for key in ("coord", "intensity")}
+        second_source["index_valid_keys"] = ["coord", "intensity"]
+        second = self.view2_transform(deepcopy(second_source))
+        visual_keys = ("dino_feature", "image_patch_index",
+                       "image_valid", "dino_offset")
+        for key in visual_keys:
+            if key not in first:
+                raise KeyError(f"Concerto first view lacks {key}")
+        for number, view in ((1, first), (2, second)):
+            missing = {"origin_coord", "coord", "grid_coord", "feat", "offset"}.difference(view)
+            if missing:
+                raise ValueError(f"Concerto view {number} lacks {sorted(missing)}")
+        result = {"view1_" + key: value for key, value in first.items()
+                  if key not in visual_keys}
+        result.update({"view2_" + key: value for key, value in second.items()})
+        result.update({key: first[key] for key in visual_keys})
+        for number in range(self.num_local_views):
+            view = self.local_transform(deepcopy(second_source))
+            if {"origin_coord", "coord", "grid_coord", "feat", "offset"}.difference(view):
+                raise ValueError(f"Concerto local view {number + 1} is incomplete")
+            result.update({f"local{number + 1}_{key}": value for key, value in view.items()})
+        return result
     

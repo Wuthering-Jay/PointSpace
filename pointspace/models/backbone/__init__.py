@@ -5,6 +5,12 @@ from .deeplanet import *
 from .litept_v1 import *
 from .vpsd import *
 from .rrcl import *
+from .geometry_ssl import *
+from .point_m2ae import *
+from .msc import *
+from .sonata import *
+from .d_ditr import *
+from .concerto import *
 from .cvrl import *
 
 from .utonia import *

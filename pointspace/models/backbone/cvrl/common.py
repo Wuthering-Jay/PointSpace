@@ -36,7 +36,9 @@ def _mode_branches(mode):
 class VisualReturnBackboneBase(nn.Module):
     """Persistent ``[visual | return]`` backbone used after pretraining."""
 
-    FEATURE_SOURCES = frozenset({"backbone", "full", "visual", "return"})
+    FEATURE_SOURCES = frozenset(
+        {"backbone", "full", "visual", "visual_native", "return"}
+    )
 
     def __init__(
         self,
@@ -273,6 +275,15 @@ class VisualReturnBackboneBase(nn.Module):
         mode = self.mode if feature_source == "backbone" else feature_source
         point = self.forward(input_dict, mode=mode)
         feature = point.feat
+        feature_point_mask = input_dict.get("feature_point_mask")
+        if feature_point_mask is not None:
+            if (
+                feature_point_mask.ndim != 1
+                or feature_point_mask.shape[0] != feature.shape[0]
+                or feature_point_mask.dtype != torch.bool
+            ):
+                raise ValueError("feature_point_mask must be a point-aligned bool tensor")
+            feature = feature[feature_point_mask]
         if normalize:
             feature = F.normalize(feature.float(), dim=-1, eps=1e-12)
         return feature

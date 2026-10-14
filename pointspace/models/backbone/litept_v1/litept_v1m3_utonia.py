@@ -397,6 +397,7 @@ class LitePT(PointModule):
         dec_attn=(False, False, False, False),
         dec_rope_freq=(100.0, 100.0, 100.0, 100.0),
         dec_rope_enable=True,
+        dec_norm="batch",
         mlp_ratio=4,
         qkv_bias=True,
         qk_scale=None,
@@ -440,6 +441,29 @@ class LitePT(PointModule):
         bn_layer = partial(nn.BatchNorm1d, eps=1e-3, momentum=0.01)
         ln_layer = nn.LayerNorm
         act_layer = nn.GELU
+
+        if dec_norm == "batch":
+            dec_norm_layer = bn_layer
+        elif dec_norm == "batch_no_stats":
+            # Frozen-encoder decoder probes can exhibit a severe train/eval
+            # gap under cross-domain transfer: decoder BN learns with current
+            # batch statistics but evaluation switches to running statistics
+            # that do not capture large tile-to-tile encoder feature offsets.
+            # Keep the native BN affine transform and training-time formula,
+            # while consistently using current feature statistics at inference.
+            dec_norm_layer = partial(
+                nn.BatchNorm1d,
+                eps=1e-3,
+                momentum=0.01,
+                track_running_stats=False,
+            )
+        elif dec_norm == "layer":
+            dec_norm_layer = ln_layer
+        else:
+            raise ValueError(
+                "dec_norm must be one of {'batch', 'batch_no_stats', 'layer'}, "
+                f"got {dec_norm!r}"
+            )
 
         self.embedding = Embedding(
             in_channels=in_channels,
@@ -519,7 +543,7 @@ class LitePT(PointModule):
                         in_channels=dec_channels[s + 1],
                         skip_channels=enc_channels[s],
                         out_channels=dec_channels[s],
-                        norm_layer=bn_layer,
+                        norm_layer=dec_norm_layer,
                         act_layer=act_layer,
                         traceable=traceable,
                     ),

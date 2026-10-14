@@ -3149,6 +3149,20 @@ class ClassFilter(object):
 
 
 @TRANSFORMS.register_module()
+class SparseLabelMask(object):
+    """Hide unselected labels while retaining every point as geometry."""
+
+    def __init__(self, ignore_index=-1):
+        self.ignore_index = ignore_index
+
+    def __call__(self, data_dict):
+        keep = data_dict.pop("sparse_keep")
+        data_dict["segment"][~keep] = self.ignore_index
+        data_dict["index_valid_keys"].remove("sparse_keep")
+        return data_dict
+
+
+@TRANSFORMS.register_module()
 class GridCoordinate(object):
     """Compute integer grid coordinates without downsampling.
 

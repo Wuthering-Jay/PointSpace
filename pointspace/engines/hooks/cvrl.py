@@ -106,6 +106,7 @@ class CVRLAuditFeatureSaver(HookBase):
         }
         if active_mode in {"visual", "full"}:
             collected["z_visual"] = []
+            collected["z_visual_native"] = []
         if active_mode in {"return", "full"}:
             collected["z_return"] = []
         if active_mode == "full":
@@ -175,6 +176,24 @@ class CVRLAuditFeatureSaver(HookBase):
                 if active_mode in {"visual", "full"}:
                     visual = branches["visual_feature"][selected]
                     collected["z_visual"].append(visual.to(dtype).cpu())
+                    # Project only the P2 tokens referenced by the fixed audit
+                    # rows. This exposes the 1024D pre-PCA representation
+                    # without materializing native features for every point.
+                    compact = branches["compact"]
+                    fused = backbone.fuse_token_hierarchy(
+                        compact, branches["level_features"]
+                    )
+                    token_index, token_inverse = torch.unique(
+                        compact.input_to_target[selected],
+                        sorted=True,
+                        return_inverse=True,
+                    )
+                    native = backbone.semantic_projector(fused[token_index])[
+                        token_inverse
+                    ]
+                    collected["z_visual_native"].append(
+                        native.to(dtype).cpu()
+                    )
                 if active_mode in {"return", "full"}:
                     return_feature = branches["return_feature"][selected]
                     collected["z_return"].append(return_feature.to(dtype).cpu())
@@ -229,8 +248,10 @@ class CVRLAuditFeatureSaver(HookBase):
             "epoch": str(self.trainer.epoch + 1),
             "feature_dtype": self.feature_dtype,
             "feature_layout": (
-                "z_visual|z_return=z_full"
+                "z_visual_native->PCA=z_visual;z_visual|z_return=z_full"
                 if active_mode == "full"
+                else "z_visual_native->PCA=z_visual"
+                if active_mode == "visual"
                 else f"z_{active_mode}"
             ),
             "fixed_subset": "deterministic_validation_prefix",

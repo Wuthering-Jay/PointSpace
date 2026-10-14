@@ -8,5 +8,6 @@ from .nan_inf_detector import (
     NaNInfDetector,
     detect_nan_inf
 )
+from .early_stopping import EarlyStoppingHook
 
 from .builder import build_hooks

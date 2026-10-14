@@ -20,6 +20,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 import torch.utils.data
 from safetensors.torch import save_file as save_safetensors
+from safetensors import safe_open
 from scipy.spatial import ConvexHull
 from matplotlib.path import Path
 
@@ -222,7 +223,8 @@ class VPSDFeatureTester(TesterBase):
     关键配置：
 
     - ``feature_output_dir``：Safetensors 输出目录；
-    - ``feature_source``：``projected`` 为 DINO 对齐 1024 维特征，
+    - ``feature_source``：``visual``/``projected`` 为固定 PCA 后的 128D
+      永久视觉表征，``visual_native`` 为 PCA 前的 DINO 对齐 1024D 特征，
       ``backbone`` 为投影前的层级融合特征；
     - ``feature_dtype``：磁盘张量类型，支持 float16/float32；
     - ``normalize_feature``：fragment 合并后是否再次归一化；
@@ -234,8 +236,10 @@ class VPSDFeatureTester(TesterBase):
     来源、归一化状态和 distill level，不记录可变路径。
     """
 
-    FEATURE_SOURCES = frozenset({"projected", "backbone"})
-    DEFAULT_FEATURE_SOURCE = "projected"
+    FEATURE_SOURCES = frozenset(
+        {"visual", "projected", "visual_native", "backbone"}
+    )
+    DEFAULT_FEATURE_SOURCE = "visual"
     FEATURE_LABEL = "VPSD"
     DEFAULT_DISTILL_LEVEL = 2
     SHOW_DISTILL_LEVEL = True
@@ -294,6 +298,10 @@ class VPSDFeatureTester(TesterBase):
         aggregate_on_gpu = bool(
             getattr(self.cfg, "feature_aggregate_on_gpu", True)
         )
+        feature_index_dir = getattr(self.cfg, "feature_index_dir", None)
+        feature_index_key = str(
+            getattr(self.cfg, "feature_index_key", "audit_index")
+        )
         dtype_map = {"float16": torch.float16, "float32": torch.float32}
         if output_dtype not in dtype_map:
             raise ValueError("feature_dtype must be 'float16' or 'float32'")
@@ -342,6 +350,33 @@ class VPSDFeatureTester(TesterBase):
             # LasDataset 即使没有类别也会生成与原始点数等长的占位 segment，
             # 因此这里仅借其长度确定最终输出 N，不使用类别值。
             num_points = int(np.asarray(data_dict["segment"]).shape[0])
+            selected_index = None
+            if feature_index_dir is not None:
+                index_path = (
+                    FilePath(feature_index_dir) / f"{data_name}.safetensors"
+                )
+                if not index_path.is_file():
+                    raise FileNotFoundError(
+                        f"Feature subset index does not exist: {index_path}"
+                    )
+                with safe_open(str(index_path), framework="pt", device="cpu") as handle:
+                    if feature_index_key not in handle.keys():
+                        raise KeyError(
+                            f"{index_path} has no '{feature_index_key}' tensor"
+                        )
+                    selected_index = handle.get_tensor(feature_index_key).long()
+                if selected_index.ndim != 1 or selected_index.numel() == 0:
+                    raise ValueError(
+                        f"{index_path}:{feature_index_key} must be non-empty 1D"
+                    )
+                selected_index = torch.unique(selected_index, sorted=True)
+                if int(selected_index.min()) < 0 or int(selected_index.max()) >= num_points:
+                    raise ValueError(
+                        f"Feature subset index exceeds point range for {data_name}"
+                    )
+                aggregate_points = int(selected_index.numel())
+            else:
+                aggregate_points = num_points
             output_path = output_dir / f"{data_name}.safetensors"
             if output_path.exists() and not overwrite:
                 logger.info(
@@ -356,6 +391,7 @@ class VPSDFeatureTester(TesterBase):
             # 通道数不同，分别可能是 C3 或 Cd=1024。
             feature_sum = None
             feature_count = None
+            selected_index_device = None
             for start_idx in range(0, len(fragment_list), batch_size_test):
                 end_idx = min(start_idx + batch_size_test, len(fragment_list))
                 input_dict = collate_fn(fragment_list[start_idx:end_idx])
@@ -375,6 +411,29 @@ class VPSDFeatureTester(TesterBase):
                     raise RuntimeError(
                         f"Fragment index exceeds source point range for {data_name}"
                     )
+                aggregation_index = point_index
+                if selected_index is not None:
+                    if selected_index_device is None:
+                        selected_index_device = selected_index.to(
+                            point_index.device, non_blocking=True
+                        )
+                    # ``selected_index`` is sorted.  searchsorted avoids a dense
+                    # ``num_source_points`` lookup table for very large LAS tiles.
+                    selected_row = torch.searchsorted(
+                        selected_index_device, point_index
+                    )
+                    safe_row = selected_row.clamp_max(aggregate_points - 1)
+                    keep = (selected_row < aggregate_points) & (
+                        selected_index_device[safe_row] == point_index
+                    )
+                    if not torch.any(keep):
+                        continue
+                    aggregation_index = selected_row[keep]
+                    # Let the model keep the complete fragment as spatial
+                    # context, but only expand target-token features back to
+                    # the requested audit rows.  This is essential for native
+                    # 1024D export on multi-million-point source tiles.
+                    input_dict["feature_point_mask"] = keep
                 # VPSD 的导出路径只运行三维 encoder 和可选 student projector，
                 # 不读取 DINO teacher，也不会构建 token-patch correspondence。
                 with torch.no_grad(), auto_cast():
@@ -385,21 +444,22 @@ class VPSDFeatureTester(TesterBase):
                         normalize_feature=normalize_feature,
                     )["point_feature"]
                 point_feature = point_feature.detach().float()
-                if point_feature.shape[0] != point_index.shape[0]:
+                if point_feature.shape[0] != aggregation_index.shape[0]:
                     raise RuntimeError(
                         f"Feature/index length mismatch for {data_name}: "
-                        f"{point_feature.shape[0]} != {point_index.shape[0]}"
+                        f"{point_feature.shape[0]} != {aggregation_index.shape[0]}"
                     )
+                point_index = aggregation_index
 
                 if feature_sum is None:
                     storage_device = point_feature.device if aggregate_on_gpu else "cpu"
                     feature_sum = torch.zeros(
-                        (num_points, point_feature.shape[1]),
+                        (aggregate_points, point_feature.shape[1]),
                         dtype=torch.float32,
                         device=storage_device,
                     )
                     feature_count = torch.zeros(
-                        num_points, dtype=torch.float32, device=storage_device
+                        aggregate_points, dtype=torch.float32, device=storage_device
                     )
                 if not aggregate_on_gpu:
                     point_feature = point_feature.cpu()
@@ -438,7 +498,12 @@ class VPSDFeatureTester(TesterBase):
             temporary_path = output_path.with_name(
                 f".{output_path.name}.{uuid4().hex}.tmp"
             )
-            save_safetensors({"feature": feature}, str(temporary_path), metadata)
+            output_tensors = {"feature": feature}
+            if selected_index is not None:
+                output_tensors["point_index"] = selected_index.contiguous()
+                metadata["subset_index_key"] = feature_index_key
+                metadata["num_source_points"] = str(num_points)
+            save_safetensors(output_tensors, str(temporary_path), metadata)
             os.replace(temporary_path, output_path)
             logger.info(
                 "Feature: [%d/%d] %s, points=%d, dim=%d, fragments=%d, %.3fs",
@@ -498,10 +563,121 @@ class RRCLFeatureTester(VPSDFeatureTester):
 
 
 @TESTERS.register_module()
+class GeometryFeatureTester(RRCLFeatureTester):
+    """Export the same 72D backbone layout for geometric P1 controls."""
+
+    FEATURE_LABEL = "GeometrySSL"
+
+    def _feature_metadata(
+        self, feature, output_dtype, feature_source, normalize_feature,
+        configured_feature_dim,
+    ):
+        metadata = super()._feature_metadata(
+            feature, output_dtype, feature_source, normalize_feature,
+            configured_feature_dim,
+        )
+        metadata["model_family"] = "GeometrySSL"
+        return metadata
+
+
+@TESTERS.register_module()
+class PointM2AEFeatureTester(RRCLFeatureTester):
+    """Export unmasked LitePT features from the Point-M2AE adaptation."""
+
+    FEATURE_LABEL = "PointM2AE-LitePT"
+
+    def _feature_metadata(
+        self, feature, output_dtype, feature_source, normalize_feature,
+        configured_feature_dim,
+    ):
+        metadata = super()._feature_metadata(
+            feature, output_dtype, feature_source, normalize_feature,
+            configured_feature_dim,
+        )
+        metadata["model_family"] = "PointM2AE-LitePT"
+        return metadata
+
+
+@TESTERS.register_module()
+class MSCFeatureTester(RRCLFeatureTester):
+    """Export unmasked LitePT features from the MSC adaptation."""
+
+    FEATURE_LABEL = "MSC-LitePT"
+
+    def _feature_metadata(
+        self, feature, output_dtype, feature_source, normalize_feature,
+        configured_feature_dim,
+    ):
+        metadata = super()._feature_metadata(
+            feature, output_dtype, feature_source, normalize_feature,
+            configured_feature_dim,
+        )
+        metadata["model_family"] = "MSC-LitePT"
+        return metadata
+
+
+@TESTERS.register_module()
+class SonataFeatureTester(RRCLFeatureTester):
+    """Export the full-resolution, unmasked Sonata LitePT representation."""
+
+    FEATURE_LABEL = "Sonata-LitePT"
+    FEATURE_SOURCES = frozenset({"backbone", "student", "teacher"})
+
+    def _feature_metadata(
+        self, feature, output_dtype, feature_source, normalize_feature,
+        configured_feature_dim,
+    ):
+        metadata = super()._feature_metadata(
+            feature, output_dtype, feature_source, normalize_feature,
+            configured_feature_dim,
+        )
+        metadata["model_family"] = "Sonata-LitePT"
+        return metadata
+
+
+@TESTERS.register_module()
+class DDITRFeatureTester(RRCLFeatureTester):
+    """Export the D-DITR student LitePT backbone without its regression head."""
+
+    FEATURE_LABEL = "D-DITR-LitePT"
+
+    def _feature_metadata(
+        self, feature, output_dtype, feature_source, normalize_feature,
+        configured_feature_dim,
+    ):
+        metadata = super()._feature_metadata(
+            feature, output_dtype, feature_source, normalize_feature,
+            configured_feature_dim,
+        )
+        metadata["model_family"] = "D-DITR-LitePT"
+        return metadata
+
+
+@TESTERS.register_module()
+class ConcertoFeatureTester(SonataFeatureTester):
+    """Export the point-only student/teacher LitePT representation."""
+
+    FEATURE_LABEL = "Concerto-LitePT"
+
+    def _feature_metadata(
+        self, feature, output_dtype, feature_source, normalize_feature,
+        configured_feature_dim,
+    ):
+        metadata = super()._feature_metadata(
+            feature, output_dtype, feature_source, normalize_feature,
+            configured_feature_dim,
+        )
+        metadata["model_family"] = "Concerto-LitePT"
+        return metadata
+
+
+@TESTERS.register_module()
 class CVRLFeatureTester(RRCLFeatureTester):
     """Export CVRL point features and describe dual-branch feature layouts."""
 
-    FEATURE_SOURCES = frozenset({"backbone", "full", "visual", "return"})
+    FEATURE_SOURCES = frozenset(
+        {"backbone", "full", "visual", "visual_native", "return"}
+    )
     FEATURE_LABEL = "CVRL"
 
     def _feature_metadata(
@@ -546,6 +722,9 @@ class CVRLFeatureTester(RRCLFeatureTester):
                 metadata["return_slice"] = (
                     f"{visual_channels}:{visual_channels + return_channels}"
                 )
+            elif feature_source == "visual_native":
+                metadata["feature_layout"] = "visual_native"
+                metadata["native_visual_channels"] = str(feature.shape[1])
             else:
                 metadata["feature_layout"] = feature_source
         return metadata

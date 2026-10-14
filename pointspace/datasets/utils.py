@@ -64,6 +64,24 @@ def collate_fn(batch):
                     patch_start += int(sample["dino_feature"].shape[0])
                 result[key] = collate_fn(adjusted)
                 continue
+
+            # GridSample inverse maps each original point to a sampled point
+            # index local to its source item.  Offset it when several items
+            # are concatenated so validation can safely restore predictions
+            # to the original point population.
+            if key == "inverse":
+                adjusted = []
+                point_start = 0
+                for sample, item in zip(batch, items):
+                    item = (
+                        item.clone()
+                        if isinstance(item, torch.Tensor)
+                        else torch.as_tensor(item).clone()
+                    )
+                    adjusted.append(item + point_start)
+                    point_start += int(sample["coord"].shape[0])
+                result[key] = collate_fn(adjusted)
+                continue
             
             # Special handling for 'sub' Cluster dict - needs CSR-style merging
             if key == "sub" and isinstance(items[0], dict) and "pointer" in items[0]:

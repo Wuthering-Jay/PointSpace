@@ -58,6 +58,8 @@ class ClsEvaluator(HookBase):
         self.trainer.logger.info(">>>>>>>>>>>>>>>> Start Evaluation >>>>>>>>>>>>>>>>")
         self.trainer.model.eval()
         auto_cast = _build_autocast(self.trainer.cfg)
+        loss_sum = 0.0
+        loss_count = 0
         from pointspace.engines.hooks.misc import CacheCleaner
         _cache_cleaner = next(
             (h for h in self.trainer.hooks if isinstance(h, CacheCleaner)), None
@@ -93,6 +95,8 @@ class ClsEvaluator(HookBase):
             self.trainer.storage.put_scalar("val_union", union)
             self.trainer.storage.put_scalar("val_target", target)
             self.trainer.storage.put_scalar("val_loss", loss.item())
+            loss_sum += loss.item()
+            loss_count += 1
             if (i + 1) % self.log_interval == 0 or (i + 1) == len(self.trainer.val_loader):
                 self.trainer.logger.info(
                     "Val: [{iter}/{max_iter}] "
@@ -105,7 +109,12 @@ class ClsEvaluator(HookBase):
                     time.perf_counter() - _iter_start,
                     f"val iter {i + 1}/{len(self.trainer.val_loader)}",
                 )
-        loss_avg = self.trainer.storage.history("val_loss").avg
+        loss_stats = torch.tensor(
+            [loss_sum, loss_count], dtype=torch.float64, device=output.device
+        )
+        if comm.get_world_size() > 1:
+            dist.all_reduce(loss_stats)
+        loss_avg = (loss_stats[0] / loss_stats[1].clamp_min(1)).item()
         intersection = self.trainer.storage.history("val_intersection").total
         union = self.trainer.storage.history("val_union").total
         target = self.trainer.storage.history("val_target").total
@@ -118,8 +127,9 @@ class ClsEvaluator(HookBase):
         m_acc = metrics["mAcc"]
         all_acc = metrics["allAcc"]
         self.trainer.logger.info(
-            "Val result: mIoU {:.4f}  mAcc {:.4f}  OA {:.4f}  "
+            "Val result: loss {:.4f}  mIoU {:.4f}  mAcc {:.4f}  OA {:.4f}  "
             "mF1 {:.4f}  fwIoU {:.4f}  Kappa {:.4f}".format(
+                loss_avg,
                 m_iou,
                 m_acc,
                 all_acc,
@@ -188,6 +198,12 @@ class SemSegEvaluator(HookBase):
         self.trainer.logger.info(">>>>>>>>>>>>>>>> Start Evaluation >>>>>>>>>>>>>>>>")
         self.trainer.model.eval()
         auto_cast = _build_autocast(self.trainer.cfg)
+        num_classes = self.trainer.cfg.data.num_classes
+        intersection_sum = np.zeros(num_classes, dtype=np.float64)
+        union_sum = np.zeros(num_classes, dtype=np.float64)
+        target_sum = np.zeros(num_classes, dtype=np.float64)
+        loss_sum = 0.0
+        loss_count = 0
         from pointspace.engines.hooks.misc import CacheCleaner
         _cache_cleaner = next(
             (h for h in self.trainer.hooks if isinstance(h, CacheCleaner)), None
@@ -218,8 +234,22 @@ class SemSegEvaluator(HookBase):
                 if segment.dim() > 1:
                     segment = segment[:, :self.trainer.cfg.data.num_classes].argmax(dim=1)
 
+            elif (
+                "origin_segment" in input_dict.keys()
+                and "inverse" in input_dict.keys()
+            ):
+                # Grid-sampled validation: evaluate on exactly the same
+                # original-point population as fragment testing.  collate_fn
+                # has already converted each sample-local inverse map to the
+                # concatenated prediction index space.
+                pred = pred[input_dict["inverse"]]
+                segment = input_dict["origin_segment"]
+                if segment.dim() > 1:
+                    segment = segment[
+                        :, : self.trainer.cfg.data.num_classes
+                    ].argmax(dim=1)
             else:
-                # Fallback: no origin_segment, use voxel-level segment
+                # No inverse mapping: evaluate at the model output resolution.
                 if segment.dim() > 1:
                     # Histogram label format [N, C+1] -> hard label [N]
                     segment = segment[:, :self.trainer.cfg.data.num_classes].argmax(dim=1)
@@ -239,6 +269,11 @@ class SemSegEvaluator(HookBase):
                 union.cpu().numpy(),
                 target.cpu().numpy(),
             )
+            intersection_sum += intersection
+            union_sum += union
+            target_sum += target
+            loss_sum += loss.item()
+            loss_count += 1
             # Here there is no need to sync since sync happened in dist.all_reduce
             self.trainer.storage.put_scalar("val_intersection", intersection)
             self.trainer.storage.put_scalar("val_union", union)
@@ -260,10 +295,15 @@ class SemSegEvaluator(HookBase):
                     time.perf_counter() - _iter_start,
                     f"val iter {i + 1}/{len(self.trainer.val_loader)}",
                 )
-        loss_avg = self.trainer.storage.history("val_loss").avg
-        intersection = self.trainer.storage.history("val_intersection").total
-        union = self.trainer.storage.history("val_union").total
-        target = self.trainer.storage.history("val_target").total
+        loss_stats = torch.tensor(
+            [loss_sum, loss_count], dtype=torch.float64, device=output.device
+        )
+        if comm.get_world_size() > 1:
+            dist.all_reduce(loss_stats)
+        loss_avg = (loss_stats[0] / loss_stats[1].clamp_min(1)).item()
+        intersection = intersection_sum
+        union = union_sum
+        target = target_sum
         metrics = semantic_segmentation_metrics(intersection, union, target)
         iou_class = metrics["iou_class"]
         acc_class = metrics["recall_class"]
@@ -273,8 +313,9 @@ class SemSegEvaluator(HookBase):
         m_acc = metrics["mAcc"]
         all_acc = metrics["allAcc"]
         self.trainer.logger.info(
-            "Val result: mIoU {:.4f}  mAcc {:.4f}  OA {:.4f}  "
+            "Val result: loss {:.4f}  mIoU {:.4f}  mAcc {:.4f}  OA {:.4f}  "
             "mF1 {:.4f}  fwIoU {:.4f}  Kappa {:.4f}".format(
+                loss_avg,
                 m_iou,
                 m_acc,
                 all_acc,

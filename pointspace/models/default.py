@@ -255,6 +255,63 @@ class CVRLLinearProbeSegmentor(DefaultSegmentorV2):
 
 
 @MODELS.register_module()
+class LitePTLinearProbeSegmentor(DefaultSegmentorV2):
+    """Strict one-layer probe for a frozen pretrained LitePT representation.
+
+    ``DefaultSegmentorV2(freeze_backbone=True)`` freezes parameters but its
+    ordinary ``train()`` would still update normalization buffers and enable
+    DropPath. This subclass also keeps the feature extractor in eval mode.
+    """
+
+    def __init__(self, num_classes, backbone_out_channels, backbone, criteria):
+        if backbone.get("type") != "LitePT-v1m4" or backbone.get("enc_mode") is not False:
+            raise ValueError("LitePTLinearProbeSegmentor requires full LitePT-v1m4")
+        if backbone_out_channels != backbone["dec_channels"][0]:
+            raise ValueError("Linear probe width must equal LitePT P0 width")
+        super().__init__(
+            num_classes=num_classes,
+            backbone_out_channels=backbone_out_channels,
+            backbone=backbone,
+            criteria=criteria,
+            freeze_backbone=True,
+        )
+        if not isinstance(self.seg_head, nn.Linear):
+            raise RuntimeError("LitePT linear probe requires one linear head")
+
+    def train(self, mode=True):
+        super().train(mode)
+        self.backbone.eval()
+        return self
+
+
+@MODELS.register_module()
+class FrozenBackboneLinearProbeSegmentor(DefaultSegmentorV2):
+    """Strict linear probe for a generic frozen point-feature backbone.
+
+    This is used when the retained representation is not the native LitePT
+    decoder output (for example VPSD's compact 128-D visual representation).
+    Keeping the backbone in eval mode also freezes normalization buffers,
+    dropout and DropPath, so the sole learned mapping is ``Linear(C, K)``.
+    """
+
+    def __init__(self, num_classes, backbone_out_channels, backbone, criteria):
+        super().__init__(
+            num_classes=num_classes,
+            backbone_out_channels=backbone_out_channels,
+            backbone=backbone,
+            criteria=criteria,
+            freeze_backbone=True,
+        )
+        if not isinstance(self.seg_head, nn.Linear):
+            raise RuntimeError("Generic linear probe requires one linear head")
+
+    def train(self, mode=True):
+        super().train(mode)
+        self.backbone.eval()
+        return self
+
+
+@MODELS.register_module()
 class DefaultLORASegmentorV2(nn.Module):
     def __init__(
         self,

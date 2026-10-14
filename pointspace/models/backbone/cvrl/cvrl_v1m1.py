@@ -1,12 +1,7 @@
 """CVRL-v1m1: complementary visual-return learning with accumulated PCGrad."""
 
-from math import sqrt
-from pathlib import Path
-
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-from safetensors import safe_open
 from torch.utils.checkpoint import checkpoint
 
 from pointspace.models.backbone.vpsd.vpsd_v1m1 import (
@@ -16,127 +11,16 @@ from pointspace.models.backbone.vpsd.vpsd_v1m1 import (
     aggregate_hierarchy_to_patches,
     build_token_patch_edges_compact,
 )
+from pointspace.models.backbone.vpsd.projection import (
+    FixedPCAReduction,
+    NativeDINOProjector,
+)
 from pointspace.models.builder import MODELS
 
 from .common import (
     ComplementaryVisualReturnLearningBase,
     VisualReturnBackboneBase,
 )
-
-
-class NativeDINOProjector(nn.Module):
-    """Map the configured concatenated hierarchy to native DINO space."""
-
-    def __init__(self, in_channels, hidden_channels=1024, out_channels=1024):
-        super().__init__()
-        self.projector = nn.Sequential(
-            nn.LayerNorm(int(in_channels)),
-            nn.Linear(int(in_channels), int(hidden_channels)),
-            nn.GELU(),
-            nn.Linear(int(hidden_channels), int(out_channels)),
-        )
-
-    def forward(self, feature):
-        return self.projector(feature)
-
-
-class FixedPCAReduction(nn.Module):
-    """Apply the shared sklearn PCA transform to normalized DINO features.
-
-    PCA tensors are persistent buffers, so a CVRL checkpoint is self-contained.
-    ``require_pca=False`` only exists for synthetic tests; production configs
-    should always load a fitted PCA model.
-    """
-
-    def __init__(
-        self,
-        input_channels=1024,
-        output_channels=128,
-        pca_path=None,
-        require_pca=True,
-        output_normalize=True,
-        output_scale=None,
-    ):
-        super().__init__()
-        self.input_channels = int(input_channels)
-        self.output_channels = int(output_channels)
-        self.output_normalize = bool(output_normalize)
-        self.output_scale = (
-            sqrt(self.output_channels)
-            if output_scale is None
-            else float(output_scale)
-        )
-        if min(self.input_channels, self.output_channels) <= 0:
-            raise ValueError("PCA channel counts must be positive")
-        if self.output_channels > self.input_channels:
-            raise ValueError("PCA output_channels cannot exceed input_channels")
-
-        if pca_path is None:
-            if require_pca:
-                raise ValueError("pca_path is required for CVRL visual mode")
-            mean = torch.zeros(self.input_channels, dtype=torch.float32)
-            components = torch.eye(
-                self.output_channels, self.input_channels, dtype=torch.float32
-            )
-        else:
-            mean, components = self._load_pca(pca_path)
-        self.register_buffer("mean", mean.contiguous(), persistent=True)
-        self.register_buffer(
-            "components", components.contiguous(), persistent=True
-        )
-
-    def _load_pca(self, pca_path):
-        path = Path(pca_path)
-        if not path.is_file():
-            raise FileNotFoundError(f"PCA model does not exist: {path}")
-        with safe_open(str(path), framework="pt", device="cpu") as handle:
-            keys = set(handle.keys())
-            if not {"mean", "components"}.issubset(keys):
-                raise ValueError(
-                    "PCA model must contain 'mean' and 'components' tensors"
-                )
-            mean = handle.get_tensor("mean").float()
-            components = handle.get_tensor("components").float()
-            metadata = dict(handle.metadata() or {})
-        if tuple(mean.shape) != (self.input_channels,):
-            raise ValueError(
-                f"PCA mean shape {tuple(mean.shape)} does not match "
-                f"({self.input_channels},)"
-            )
-        expected = (self.output_channels, self.input_channels)
-        if tuple(components.shape) != expected:
-            raise ValueError(
-                f"PCA components shape {tuple(components.shape)} does not "
-                f"match {expected}"
-            )
-        if metadata.get("normalize_input", "").lower() != "true":
-            raise ValueError(
-                "CVRL requires PCA fitted with normalize_input=True"
-            )
-        if metadata.get("whiten", "").lower() != "false":
-            raise ValueError("CVRL requires PCA fitted with whiten=False")
-        return mean, components
-
-    def project_normalized(self, normalized_feature, output_dtype=None):
-        # Centering is sensitive under BF16/FP16. Keep this small fixed transform
-        # in FP32 while preserving gradients to the native prediction.
-        with torch.autocast(
-            device_type=normalized_feature.device.type, enabled=False
-        ):
-            feature = normalized_feature.float() - self.mean
-            reduced = F.linear(feature, self.components)
-            if self.output_normalize:
-                reduced = F.normalize(reduced, dim=-1, eps=1e-12)
-                reduced = reduced * self.output_scale
-        return reduced.to(
-            normalized_feature.dtype if output_dtype is None else output_dtype
-        )
-
-    def forward(self, feature):
-        output_dtype = feature.dtype
-        with torch.autocast(device_type=feature.device.type, enabled=False):
-            normalized = F.normalize(feature.float(), dim=-1, eps=1e-12)
-        return self.project_normalized(normalized, output_dtype=output_dtype)
 
 
 @MODELS.register_module("CVRL-v1m1-backbone")
@@ -187,6 +71,47 @@ class NativeVisualReturnBackbone(VisualReturnBackboneBase):
         visual_token = torch.cat(visual_chunks, dim=0)
         visual_point = visual_token[compact.input_to_target]
         return visual_token, visual_point
+
+    def project_native_visual_tokens(
+        self, compact, level_features, feature_point_mask=None
+    ):
+        """Return the pre-PCA 1024D visual representation for audits only."""
+        fused = self.fuse_token_hierarchy(compact, level_features)
+        native_chunks = []
+        for start in range(0, fused.shape[0], self.visual_token_chunk_size):
+            end = min(start + self.visual_token_chunk_size, fused.shape[0])
+            native_chunks.append(self.semantic_projector(fused[start:end]))
+        native_token = torch.cat(native_chunks, dim=0)
+        input_to_target = compact.input_to_target
+        if feature_point_mask is not None:
+            input_to_target = input_to_target[feature_point_mask]
+        return native_token, native_token[input_to_target]
+
+    def extract_point_feature(
+        self, input_dict, feature_source="backbone", normalize=False
+    ):
+        if feature_source != "visual_native":
+            return super().extract_point_feature(
+                input_dict,
+                feature_source=feature_source,
+                normalize=normalize,
+            )
+        self.assert_mode_available("visual")
+        _, compact, level_features = self.encode_hierarchy(input_dict)
+        feature_point_mask = input_dict.get("feature_point_mask")
+        if feature_point_mask is not None:
+            if (
+                feature_point_mask.ndim != 1
+                or feature_point_mask.shape[0] != compact.input_to_target.shape[0]
+                or feature_point_mask.dtype != torch.bool
+            ):
+                raise ValueError("feature_point_mask must be a point-aligned bool tensor")
+        _, feature = self.project_native_visual_tokens(
+            compact, level_features, feature_point_mask=feature_point_mask
+        )
+        if normalize:
+            feature = F.normalize(feature.float(), dim=-1, eps=1e-12)
+        return feature
 
 
 @MODELS.register_module("CVRL-v1m1")

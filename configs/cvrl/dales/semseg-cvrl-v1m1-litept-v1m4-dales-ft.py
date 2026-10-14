@@ -49,7 +49,7 @@ num_worker = 4
 prefetch_factor = 1
 val_prefetch_factor = 1
 persistent_workers = False
-gradient_accumulation_steps = 2
+gradient_accumulation_steps = 1
 
 epoch = 10
 clip_grad = 3.0

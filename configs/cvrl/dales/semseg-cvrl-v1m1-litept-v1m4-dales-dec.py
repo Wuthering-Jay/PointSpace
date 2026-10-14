@@ -49,7 +49,7 @@ num_worker = 4
 prefetch_factor = 1
 val_prefetch_factor = 1
 persistent_workers = False
-gradient_accumulation_steps = 2
+gradient_accumulation_steps = 1
 
 epoch = 10
 clip_grad = None
@@ -82,13 +82,13 @@ model = dict(
         enc_conv=(True, True, True, False, False),
         enc_attn=(False, False, False, True, True),
         enc_rope_freq=(100.0, 100.0, 100.0, 100.0, 100.0),
-        # Only GridUnpooling projections are retained: this is the lightweight
-        # native decoder, with no extra decoder blocks.
-        dec_depths=(0, 0, 0, 0),
+        # Match CVRL's return decoder: one convolution block per stage.
+        # LitePT-v1m4 isolates its indice cache from the frozen eval encoder.
+        dec_depths=(1, 1, 1, 1),
         dec_channels=(72, 72, 144, 252),
         dec_num_head=(4, 4, 8, 14),
         dec_patch_size=(192, 192, 192, 192),
-        dec_conv=(False, False, False, False),
+        dec_conv=(True, True, True, True),
         dec_attn=(False, False, False, False),
         dec_rope_freq=(100.0, 100.0, 100.0, 100.0),
         dec_rope_enable=False,

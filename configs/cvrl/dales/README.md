@@ -31,9 +31,10 @@ CVRL-v1m1 checkpoint：
 
 只从 CVRL checkpoint 加载并冻结
 `return_backbone.embedding + return_backbone.enc`。新建的 LitePT 原生
-GridUnpooling decoder 和 `Linear(72, 8)` 分割头参与训练。配置将
-`dec_depths` 设为全零，因此 decoder 只保留逐级反池化投影，是轻量 decoder
-probe，而不是完整 backbone fine-tuning。
+GridUnpooling decoder 和 `Linear(72, 8)` 分割头参与训练。配置使用
+`dec_depths=(1,1,1,1)`、`dec_conv=(True,True,True,True)`，与 CVRL return
+decoder 的规模一致。冻结 encoder 的前向索引缓存与可训练 decoder 的索引
+缓存使用独立名称，避免 spconv 反向复用缺少 backward indices 的 eval 缓存。
 
 ## 3. Full Fine-Tuning
 

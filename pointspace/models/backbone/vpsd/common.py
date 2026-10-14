@@ -360,7 +360,7 @@ class VisibilityAwarePatchSetDistillerBase(nn.Module):
         input_dict,
         return_point=False,
         return_point_feature=False,
-        feature_source="projected",
+        feature_source="visual",
         normalize_feature=True,
     ):
         """根据 ``return_point_feature`` 在训练蒸馏和测试导出路径间切换。
